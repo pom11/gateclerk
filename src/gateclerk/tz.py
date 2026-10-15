@@ -157,8 +157,13 @@ def parse_isapi_xml(payload: str) -> ET.Element:
         raise IsapiPayloadError(
             f"ISAPI XML body exceeds {MAX_ISAPI_XML_BYTES} bytes — refusing to parse"
         )
-    head = payload[: MAX_ISAPI_XML_BYTES // 4]
-    if "<!DOCTYPE" in head or "<!ENTITY" in head:
+    # Whole payload, not a head window: the first version scanned only the first 16 kB and
+    # a `<!-- 20 kB of padding -->` before the DTD walked straight past it into
+    # `ET.fromstring`, which then EXPANDED the internal entities (measured: a 4x4x4 bomb
+    # declared at offset 20 000 parsed and expanded). ElementTree resolves no *external*
+    # entities, but internal-entity expansion is real, so the DTD refusal has to be
+    # complete. Scanning 64 kB with `in` is not a cost worth negotiating for that.
+    if "<!DOCTYPE" in payload or "<!ENTITY" in payload:
         raise IsapiPayloadError("ISAPI XML body declares a DTD or entity — refusing to parse")
     try:
         # S314 is suppressed on the line below. defusedxml's controls are DTD/entity
@@ -183,11 +188,44 @@ def _xml_text(root: ET.Element, name: str) -> str | None:
 # --- the one string parser ---------------------------------------------------------
 
 #: `2026-10-15T07:46:48`, `...+03:00`, `...Z`, `...+0300`, `....123`, space or `T`.
-#: py3.12 `fromisoformat` handles all of these (probed), so no third-party parser.
+#: Hour/minute/second accept ONE or two digits (`...T7:46:48`): a punch must not become
+#: `unresolved` over a formatting quirk — that failure mode is invisible downstream, it
+#: just silently shrinks the payroll set. Range validation is NOT lost: the components are
+#: zero-padded and re-validated by `fromisoformat`, so `...T25:00:00` is still refused
+#: (pinned by test_out_of_range_components_are_still_unresolved).
 _TIME_RE = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2})[T ](?P<time>\d{2}:\d{2}(?::\d{2})?(?:\.\d{1,6})?)"
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[T ]"
+    r"(?P<h>\d{1,2}):(?P<m>\d{1,2})(?::(?P<s>\d{1,2}))?(?:\.(?P<frac>\d{1,6}))?"
     r"(?P<off>[Zz]|[+-]\d{2}:?\d{2})?$"
 )
+
+
+def _normalize_time_string(text: str) -> str:
+    """Rewrite matched components as the zero-padded ISO form `fromisoformat` requires.
+
+    Load-bearing, not cosmetic: `datetime.fromisoformat('2026-10-15T7:46:48')` raises
+    ValueError on py3.12 (measured — see
+    test_fromisoformat_alone_cannot_take_an_unpadded_time), so relaxing the regex WITHOUT
+    padding first would hand it a string it rejects and leave the punch `unresolved` all
+    the same. The padding is purely textual (`7` -> `07`, `9` -> `09`); nothing is
+    re-interpreted, and the verbatim device string is unaffected because callers keep
+    `raw` separately from what they parse. Seconds are emitted only when the input had
+    them, so `HH:MM` keeps meaning `HH:MM:00` exactly as `fromisoformat` reads it.
+
+    Raises ValueError when the text does not match: `_parse_time_string` catches exactly
+    that and turns it into an `unresolved` reason, so a non-matching string can never be
+    silently parsed. (An `assert` would be stripped by `python -O` and let it through.)
+    """
+    m = _TIME_RE.match(text)
+    if m is None:
+        raise ValueError(f"{text!r} is not a recognizable timestamp")
+    parts = m.groupdict()
+    time_part = f"{int(parts['h']):02d}:{int(parts['m']):02d}"
+    if parts["s"] is not None:
+        time_part += f":{int(parts['s']):02d}"
+    if parts["frac"]:
+        time_part += f".{parts['frac']}"  # the regex already caps this at 6 digits
+    return f"{parts['date']}T{time_part}{parts['off'] or ''}"
 
 
 def _parse_time_string(
@@ -204,7 +242,8 @@ def _parse_time_string(
     if _TIME_RE.match(text) is None:
         return None, None, f"{field} {raw!r} is not 'YYYY-MM-DDTHH:MM:SS[±HH:MM]'"
     try:
-        parsed = datetime.fromisoformat(text)
+        # Padded form first — fromisoformat itself refuses 'T7:46:48' (see normalizer).
+        parsed = datetime.fromisoformat(_normalize_time_string(text))
     except ValueError as exc:
         # Reachable for strings that match the shape but are not real, e.g.
         # '2026-13-45T99:99:99' or '...+99:99'. Crashing here would lose the punch.

@@ -13,6 +13,7 @@ pins the premise so a future tzdb move fails loudly instead of quietly neutering
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -837,3 +838,199 @@ def test_public_surface_is_what_the_downstream_cards_need() -> None:
 def test_default_site_tz_matches_the_card_and_config_plan() -> None:
     assert DEFAULT_SITE_TZ == "Europe/Bucharest"
     assert TimeResolver().site_tz == DEFAULT_SITE_TZ
+
+
+# --- 9. unpadded clock components (review #1 on PR #2) -----------------------------
+#
+# `2026-10-15T7:46:48` used to land as `unresolved` purely because of a zero-padding
+# quirk. OBSERVED.md has never *seen* unpadded output, so this is defensive — but the
+# failure mode is the one we cannot see later: a payroll gap that presents as
+# `tz_source=unresolved` and silently shrinks the set. Relaxing the shape test is only
+# half the fix; the second half (padding before `fromisoformat`) is pinned below,
+# because without it the relaxation changes nothing.
+
+
+def test_fromisoformat_alone_cannot_take_an_unpadded_time() -> None:
+    """Why `_normalize_time_string` exists: the stdlib parser is stricter than we are.
+
+    `datetime.fromisoformat` accepts `2026-10-15T07:46:48` and raises ValueError on
+    `2026-10-15T7:46:48` (measured on the CI interpreter, py3.12). So widening `_TIME_RE`
+    without padding first would hand the string to a parser that rejects it and leave the
+    punch `unresolved` all the same — the one-line fix this review asked for is a no-op
+    without the padding step. If CPython ever relaxes this, the test still passes: it only
+    pins that *we* never hand it an unpadded value.
+    """
+    with pytest.raises(ValueError):
+        datetime.fromisoformat("2026-10-15T7:46:48")
+    # And the padded form is fine — the difference is padding, not the wall time.
+    assert datetime.fromisoformat("2026-10-15T07:46:48") == naive(2026, 10, 15, 7, 46, 48)
+
+
+def test_unpadded_hour_is_not_an_unresolved_punch(resolver: TimeResolver) -> None:
+    """The operator's exact specimen must resolve, with the site offset applied."""
+    resolved = resolver.resolve("2026-10-15T7:46:48+02:00")
+    assert resolved.resolved is True, resolved.reason
+    assert resolved.tz_source is TzSource.SITE_TZ
+    assert resolved.offset_minutes == 180  # 15 Oct is EEST (+03)
+    assert resolved.utc == datetime(2026, 10, 15, 4, 46, 48, tzinfo=UTC)
+    assert resolved.device_offset_minutes == 120, "the claim is still recorded"
+
+
+def test_unpadded_forms_agree_with_the_padded_form(resolver: TimeResolver) -> None:
+    """One wall time, one instant — padding is a rendering detail, never a reading."""
+    padded = resolver.resolve("2026-10-15T07:46:48+02:00")
+    for form in (
+        "2026-10-15T7:46:48+02:00",
+        "2026-10-15T7:46:48",
+        "2026-10-15 7:46:48",
+        "2026-10-15T7:46:48.000+02:00",
+        "2026-10-15T07:46:48.0+02:00",
+    ):
+        resolved = resolver.resolve(form)
+        assert resolved.resolved is True, (form, resolved.reason)
+        assert resolved.utc == padded.utc, form
+    # Minutes and seconds go either way too, and HH:MM still means :00 seconds.
+    assert resolver.resolve("2026-10-15T7:6:5").utc == datetime(2026, 10, 15, 4, 6, 5, tzinfo=UTC)
+    assert resolver.resolve("2026-10-15T7:6").utc == datetime(2026, 10, 15, 4, 6, tzinfo=UTC)
+
+
+def test_unpadded_components_never_shift_a_reading(resolver: TimeResolver) -> None:
+    """`7:46` is 07:46, not a re-reading of the field. Guarded per digit, not by trust.
+
+    Padding is `int(x)` then `%02d`, so a single digit cannot land in the neighbouring
+    field ('7:6' -> 07:06). Asserting each component separately keeps a future
+    normalizer rewrite from passing on a wrong-but-plausible instant.
+    """
+    resolved = resolver.resolve("2026-10-15T7:6:5+03:00")
+    assert resolved.utc is not None
+    as_utc = resolved.utc
+    assert (as_utc.hour, as_utc.minute, as_utc.second) == (4, 6, 5)
+    assert resolved.device_local == "2026-10-15T7:6:5+03:00", "verbatim, unpadded as sent"
+
+
+def test_fractional_seconds_survive_the_padding(resolver: TimeResolver) -> None:
+    """Padding touches h/m/s only — the fraction is passed through untouched."""
+    assert resolver.resolve("2026-10-15T7:46:48.25+02:00").utc == datetime(
+        2026, 10, 15, 4, 46, 48, 250000, tzinfo=UTC
+    )
+    assert resolver.resolve("2026-10-15T7:46:48.000123+02:00").utc == datetime(
+        2026, 10, 15, 4, 46, 48, 123, tzinfo=UTC
+    )
+
+
+def test_out_of_range_components_are_still_unresolved(resolver: TimeResolver) -> None:
+    r"""Loosening the SHAPE must not loosen the RANGES — fromisoformat still validates.
+
+    Without this, `\d{1,2}` plus sloppy padding could quietly start accepting `25:00`
+    or `12:99` as a punch. They stay `unresolved`, for the *value* reason, not the
+    shape reason.
+    """
+    for bad in (
+        "2026-10-15T25:00:00",
+        "2026-10-15T12:60:00",
+        "2026-10-15T12:00:60",
+        "2026-13-01T07:00:00",
+        "2026-10-32T07:00:00",
+    ):
+        resolved = resolver.resolve(bad)
+        assert resolved.tz_source is TzSource.UNRESOLVED, (bad, resolved.utc)
+        assert resolved.utc is None, bad
+        assert "valid timestamp" in (resolved.reason or ""), (bad, resolved.reason)
+
+
+def test_unpadded_golden_corpus_resolves_to_the_same_instants(resolver: TimeResolver) -> None:
+    """Every recorded punch, with leading zeros stripped, means the same instant.
+
+    Built from the golden rows rather than a hand-written example, so a firmware that
+    ever emits `9:08:22` or `14:8:22` cannot cost us a payroll row. Rows whose components
+    are all two-digit (14:18:36) have nothing to strip and are asserted unchanged; the
+    coverage guard below proves the unpadded path really is exercised by this corpus.
+    """
+    events = EVENTS["AcsEvent"]["InfoList"]
+    assert len(events) == 30
+    # Rebuild h/m/s through int() so a leading zero is dropped and nothing else moves.
+    # Deliberately NOT a blanket '0' strip: the same pattern would eat the offset
+    # ('+02:00' -> '+02:0') and test a string shape no firmware emits.
+    shape = re.compile(
+        r"^(?P<date>\d{4}-\d{2}-\d{2})(?P<sep>[T ])"
+        r"(?P<h>\d{1,2}):(?P<m>\d{1,2}):(?P<s>\d{1,2})(?P<rest>.*)$"
+    )
+    exercised = 0
+    mangled_rows = []
+    for event in events:
+        raw = event["time"]  # e.g. 2026-05-21T14:08:22+02:00
+        want = resolver.resolve(raw)
+        assert want.utc is not None, raw
+        match = shape.match(raw)
+        assert match is not None, raw
+        parts = match.groupdict()
+        mangled = (
+            f"{parts['date']}{parts['sep']}"
+            f"{int(parts['h'])}:{int(parts['m'])}:{int(parts['s'])}{parts['rest']}"
+        )
+        if mangled != raw:
+            exercised += 1
+            mangled_rows.append(mangled)
+        got = resolver.resolve(mangled)
+        assert got.utc == want.utc, (raw, mangled, got.reason)
+        assert got.device_local == mangled, "the row keeps the string the device sent"
+    assert exercised > 0, "the corpus must actually exercise the unpadded path"
+    # A named specimen rather than a magic count: the first golden row has minute '08',
+    # so it is guaranteed to be one of the rewritten ones. Pinning the row survives a
+    # corpus swap without hardcoding how many rows happen to have a leading zero.
+    assert "2026-05-21T14:8:22+02:00" in mangled_rows
+
+
+def test_cli_accepts_an_unpadded_window_bound() -> None:
+    """The CLI uses the same parser, so `--since 2026-10-15T7:00` works too.
+
+    It was a hard `TimestampInputError` before (typo-or-not is undecidable in a flag),
+    which would have made the operator's own command line fail on a value that is not a
+    typo. The spring-gap rejection still wins over leniency.
+    """
+    parsed = parse_user_timestamp("2026-10-15T7:46:48")
+    assert parsed.value.astimezone(UTC) == datetime(2026, 10, 15, 4, 46, 48, tzinfo=UTC)
+    assert parsed.source is TzSource.SITE_TZ
+    with pytest.raises(TimestampInputError):
+        parse_user_timestamp("2026-03-29T3:30:00")  # still the DST gap, still refused
+
+
+def test_window_for_device_survives_unpadded_bounds() -> None:
+    """A window built from unpadded input still goes out in the device's padded form."""
+    since = parse_user_timestamp("2026-10-15T7:00:00")
+    until = parse_user_timestamp("2026-10-15T23:59:59")
+    window = window_for_device(since, until)
+    assert window.since_device_local == "2026-10-15T07:00:00"
+    assert window.since_site_iso == "2026-10-15T07:00:00+03:00"
+
+
+# --- 10. the XML guard has to be complete (reviewer finding on PR #2) ---------------
+
+
+def test_xml_guard_catches_a_dtd_past_the_head_window() -> None:
+    """A DTD after 16 kB of padding used to walk straight into the parser.
+
+    The first version scanned `payload[:MAX//4]` for `<!DOCTYPE`/`<!ENTITY` and the
+    reviewer's probe put the bomb at offset 20 000: it passed the guard and ElementTree
+    EXPANDED the internal entities (a 4x4x4 nesting came back as 64 characters, so the
+    expansion is real, not theoretical). The scan is now over the whole payload; this is
+    the regression pin.
+    """
+    bomb = (
+        '<!DOCTYPE Time [<!ENTITY a "aaaa">'
+        '<!ENTITY b "&a;&a;&a;&a;"><!ENTITY c "&b;&b;&b;&b;">]>'
+        "<Time><x>&c;</x></Time>"
+    )
+    for pad_len in (0, 5_000, 20_000, 60_000):
+        payload = f'<?xml version="1.0"?><!--{"p" * pad_len}-->{bomb}'
+        assert len(payload) < 64 * 1024, pad_len
+        with pytest.raises(IsapiPayloadError) as exc:
+            parse_isapi_xml(payload)
+        assert "DTD or entity" in str(exc.value), pad_len
+
+
+def test_read_system_time_refuses_a_padded_dtd_payload() -> None:
+    """Same wall, one level up: the System/time reader must not parse it either."""
+    payload = f'<?xml version="1.0"?><!--{"p" * 20_000}--><!DOCTYPE Time><Time/>'
+    with pytest.raises(IsapiPayloadError):
+        read_system_time(payload)
