@@ -7,6 +7,16 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+.ruff_cache/
 *.sqlite
 *.db
 .DS_Store
+# build artefacts
+dist/
+build/
+*.egg-info/
+# local-only stores (the P2 agent's sqlite checkpoints, never in git)
+*.sqlite3
+local-store/
+# git worktrees live here (kanban worker checkouts)
+.worktrees/

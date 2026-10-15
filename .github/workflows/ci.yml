@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Belt and braces for the "CI never touches a device" rule: no live suite can run
+  # here even if someone adds a stray -m live to the workflow, and no proxy trickery
+  # can reach a site LAN. The tests themselves also block sockets (tests/conftest.py).
+  GATECLERK_LIVE: "0"
+
+jobs:
+  check:
+    name: lint + test (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Provision Python 3.12 (uv-managed, not the runner's python)
+        run: uv python install 3.12
+
+      - name: Sync locked dependencies (base install — what a fresh clone gets)
+        run: uv sync --frozen
+
+      - name: Ruff (lint)
+        run: uv run --frozen ruff check --output-format=github .
+
+      - name: Ruff (format check)
+        run: uv run --frozen ruff format --check .
+
+      - name: Pytest on the base install (no orjson; offline)
+        run: uv run --frozen pytest -v
+
+      - name: Pytest with the optional [fast] extra (orjson path)
+        run: |
+          uv sync --frozen --extra fast
+          # --no-sync so this step runs against exactly the env synced above, with no
+          # implicit re-resolve between the sync and the test.
+          uv run --frozen --no-sync pytest -q
+          uv run --frozen --no-sync python -c "import orjson, gateclerk.output; print('orjson path ok')"
+
+      - name: Console scripts are importable from a fresh env
+        run: |
+          uv run --frozen gateclerk --version
+          uv run --frozen python -c "import gateclerk, gateclerk.cli, gateclerk.endpoints, gateclerk.output"
