@@ -3,8 +3,11 @@
 Goal: read punch events (who / when / in-or-out) off Hikvision access terminals and land
 them in Business Central as timesheet data. `gateclerk` = time attendance (RO).
 
-Status: **P1 — read-only connector to one device.** BC mapping is deliberately not
-designed yet (open questions below).
+Status: **P1 only — read-only connector + CLI, device side** (owner scope-lock,
+2026-10-15): prove we can connect and pull events correctly from the real device.
+**Out of scope until P1 is proven working on the device:** anything Business Central
+— no design, no cards, no endpoint choices; it stays exactly one open question below.
+P2 (site agent) is a sketch only, kept to keep P1's seams honest — not scheduled.
 
 **Device-verified facts live in [OBSERVED.md](OBSERVED.md)** (probe of site-a
 DS-K1T341AMF-S, 2026-10-15: capabilities, paging quirks, the time-offset bug, the
@@ -31,6 +34,11 @@ disagree, OBSERVED.md wins — it was read off the box. Deep background research
   we don't guess.
 
 ## Architecture
+
+Target-state sketch only — the agent/push layers are **not scheduled and not carded**
+(owner locked current scope to the device-side connector; see Phase plan). It's drawn
+here so P1's seams (credential callable, normalized record, capability cache) don't
+paint the future into a corner.
 
 ```
 [site A LAN]                    [site B LAN]                    [site C LAN]
@@ -288,12 +296,11 @@ nonce, serial or employee name (fixtures mask them — see tests/fixtures/README
 
 ## Open questions
 
-1. **P3 / BC** — deferred on purpose, do not design until asked. Shape we already know
-  we'll need: the BC table/page + fields for a punch, and how a Hikvision
-  `employeeNoString` maps to the BC employee key (BC employee no.? payroll no.? a
-  mapping table we maintain?). Device employee numbers are auto-assigned small ints
-  ("1".."4" on site-a) and the device roster (4 users) proves they are NOT BC-safe ids —
-  a mapping table is certain; question is who owns it (HR/BC admin?).
+1. **P3 / BC — OUT OF SCOPE (owner, 2026-10-15) until P1 is proven on the real
+  device.** No design, no cards, no ingestion/auth/mapping work. Kept as a question
+  only, for when it becomes in-scope: which BC table/page + fields receive a punch, and
+  who owns the `employeeNoString` (auto-assigned "1".."4" on site-a, so not BC-safe) →
+  BC employee mapping. Answering it is the owner's go-signal, not a task.
 2. **Attendance mode** — device-confirmed null today → see "in/out: the two real
   options" above (A = owner enables attendance mode per site, recommended; B = infer in
   BC). Owner decision, per site, with a door-side test pass. Not blocking P1.
@@ -329,13 +336,14 @@ bounded retries, capability discovery), `gateclerk device info`, `gateclerk devi
 Exit: reads a full day of punches off `192.0.2.10`, correct UTC, idempotent re-run
 adds zero rows, `docs/OBSERVED.md` records the real event-code table.
 
-**P2 — site agent + local store.** sqlite store keyed `(device_serial, serial_no)`,
-checkpoint + overlap, systemd/launchd unit, outbound pusher with retry + dead-letter,
-config for N devices per site (the 3 sites are one codebase + 3 configs, not 3 forks),
-`/healthz`, metrics, alerting on clock skew and auth failure. Optional `alertStream`.
+**P2 — site agent + local store (SKETCH ONLY — not scheduled, not carded).** Listed
+so P1's seams stay honest; becomes cards only after P1 is demonstrated working on
+site-a: sqlite store keyed `(device_serial, serial_no)`, checkpoint + overlap,
+systemd/launchd unit, outbound pusher with retry + dead-letter, config for N devices
+per site (3 sites = 1 codebase + 3 configs, not 3 forks), `/healthz`, metrics, alerts
+on clock skew and auth failure. Optional `alertStream` later.
 
-**P3 — Business Central side.** Only after open Q1 is answered. Expect: an ingestion
-endpoint + auth, an employee-mapping table, a BC AL extension or a direct API/batch
-writer, and reconciliation (what happens to a punch that arrives after a timesheet is
-approved). This is where the real ambiguity lives; P1's job is to make the raw side
-boring and trustworthy so P3 has one clean input to design against.
+**P3 — Business Central side (OUT OF SCOPE, owner-decided).** No design and no cards
+until the owner has seen P1 working end-to-end on the real device. The only artifact
+kept anywhere is open question 1. P1's entire job is making the raw side boring and
+trustworthy — nothing beyond it is ours to pre-decide.
