@@ -28,7 +28,12 @@ with the Keychain account (`user=admin`). One digest session reused across reque
 | `GET /ISAPI/AccessControl/UserInfo/Count?format=json` | JSON | `{"UserInfoCount":{"userNumber":4}}`; GET only |
 | `POST /ISAPI/AccessControl/UserInfo/Search?format=json` | JSON | works; response contains a `password` key per user (hash) — **strip it, never store** |
 | `POST /ISAPI/AccessControl/AcsEvent?format=json` | JSON | works |
-| `POST /ISAPI/AccessControl/AcsEvent/Total` | — | **NOT supported**: `400 {"statusCode":4,"statusString":"Invalid Operation","subStatusCode":"notSupport"}`. Do not use for counting; page instead. |
+| `POST /ISAPI/AccessControl/AcsEvent/Total` | — | **NOT supported**: `400 subStatusCode:notSupport`. |
+| `POST /ISAPI/AccessControl/AcsEventTotalNum?format=json` | JSON | **THE count endpoint** (correct name): `{"AcsEventTotalNumCond":{"major":5,"minor":0,"startTime":…,"endTime":…}}` → `{"AcsEventTotalNum":{"totalNum":30}}` (VERIFIED; equals the 30 major=5 we paged). Advisory cross-check only — research reports int-vs-string/nested shape drift across fw; never a loop bound. |
+| `GET /ISAPI/System/time/timeType` | 404 notSupport | absent on this fw |
+| `GET /ISAPI/System/time/timeZone` | XML raw string | bare POSIX-ish rule string (no wrapper) — same value as System/time `<timeZone>` |
+| `GET /ISAPI/AccessControl/attendanceStatusModeCfg` | 404 notSupport | this model has no attendance-status-mode config via ISAPI (T&A-mode doc applies to other lines) |
+| `GET /ISAPI/Security/encryption/capabilities` | 404 notSupport | no encryption scheme on this fw — matches plaintext names observed |
 
 ## AcsEvent capabilities (what the device advertises)
 
@@ -92,6 +97,21 @@ Paging envelope observed:
 0-based; advance by `numOfMatches`; `timeReverseOrder:true` honored (newest first).
 Empty window → `{"responseStatusStrg":"NO MATCH","totalMatches":0,"numOfMatches":0}` and
 the `InfoList` key is **absent** (not empty list) — handle both.
+
+## Server-side filter truth (probe 2026-10-15, second round) — filter CLIENT-side
+
+`AcsEventCond.employeeNo` (no suffix) is **SILENTLY IGNORED** on this fw:
+`employeeNo:"1"` returned totalMatches=30 (everything). `employeeNoString:"1"` works
+(→15, exactly employee 1's events). `eventAttribute:"attendance"` is accepted but also
+ignored (returns all 30) — consistent with it being absent from capabilities. Long
+searchID (64 chars) is tolerated despite sibling models rejecting >20 with
+`badParameters` — but stay ≤64 and stable per search anyway.
+
+**Policy (payroll-grade): never trust a server-side filter you have not probed.**
+The connector filters by employee/eventAttribute CLIENT-side; only
+`startTime/endTime/major/minor/employeeNoString` are trusted server filters on this fw.
+A silently-ignored filter is the worst bug class: it looks like data, isn't filtered,
+and nobody notices until payroll is wrong.
 
 ## attendanceStatus: field exists, values null → terminal is NOT in attendance mode
 
