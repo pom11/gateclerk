@@ -118,6 +118,21 @@ def reader(fake: FakeSecurity) -> KeychainReader:
     return KeychainReader(runner=fake)
 
 
+@pytest.fixture(autouse=True)
+def pretend_no_security_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make this whole file behave the same on a Mac and on Linux CI.
+
+    CI runs on ubuntu-latest, where `/usr/bin/security` does not exist. Every test here
+    injects a fake runner, so none of them needs the binary — but if the product code ever
+    consults `shutil.which` before the injected runner, the suite passes on macOS and
+    fails on CI. Forcing `which` to return None pins that platform independence in, rather
+    than leaving it to the developer's laptop.
+    """
+    import gateclerk.config as cfg
+
+    monkeypatch.setattr(cfg.shutil, "which", lambda _path: None)
+
+
 def resolve(**over: Any) -> Credentials:
     """Resolve against a fake keychain; env defaults to empty so the keychain rung is live."""
     params: dict[str, Any] = {"env": {}}

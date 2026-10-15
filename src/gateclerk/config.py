@@ -365,7 +365,13 @@ class KeychainReader:
         self._binary = binary
 
     def read(self, target: DeviceTarget, *, with_comment: bool = True) -> KeychainItem:
-        if shutil.which(self._binary) is None:
+        # The availability guard protects against a confusing OSError from spawning a
+        # nonexistent binary on a non-macOS host. It is therefore a property of the REAL
+        # subprocess: when a runner is injected, no OS process is involved and the guard
+        # must not preempt it — otherwise every injected-runner keychain test passes on a
+        # Mac and fails on Linux CI, which has no /usr/bin/security. (That is exactly the
+        # CI-only failure this line used to cause.)
+        if self._runner is None and shutil.which(self._binary) is None:
             raise CredentialUnavailable(
                 f"no credential found for {target.host!r} in the environment, and the macOS "
                 f"Keychain is unavailable here ({self._binary} not found). "
