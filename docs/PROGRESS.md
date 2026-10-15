@@ -29,6 +29,35 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+### 2026-10-16 00:15 — first review cycle (PR #2 + PR #3)
+- **PR #3 (p1-06b tz dialect) reviewed + merged** → main `b1c7bd6`. Verified on the
+  worktree, not from the PR body: 99 tests green, ruff clean, and all four dialects decode
+  to the offsets OBSERVED.md records (`CST-2:00:00DST01:00:00`→+120/+180, `CST-8`→+480,
+  `Etc/GMT-2`→+120 POSIX-inverted, `GTB Standard Time`→+120/+180); IANA/empty → Unknown
+  with a reason (never a confidently wrong number). Diagnostics-only rule (DESIGN item 5)
+  is *mechanically* pinned by an ast+tokenize test — good pattern, reused elsewhere.
+- **CI format gate was red on main for every PR** since the docs merge (ruff-format on
+  python blocks inside `docs/references/isapi-client-gotchas.md`). Reproduced on a clean
+  `origin/main` worktree before blaming the branch; fix landed as the worker's own
+  whitespace-only commit (78b0b6e). If CI is red, check it against main first.
+- **PR #2 (p1-06 tz core) = changes requested, NOT merged.** Policy is correct: all five
+  DESIGN.md "Time handling" points implemented + pinned; the device-naive query window
+  (`window_for_device`) kills a bug p1-05 would have shipped silently (UTC windows drop
+  ~1h of summer punches per boundary). Two asks: (1) scope — 1,526 lines vs the ~100
+  ceiling, five concerns in one card; (2) `_TIME_RE` requires a zero-padded hour, so an
+  unpadded fw string lands as `unresolved` (safe but an invisible payroll gap).
+- **Split handled by ownership, not by moving code**: I deliberately did NOT create
+  carve-out cards (a branch that rewrites a merged PR + five new branches = merge pain).
+  Instead each piece has a named owner in a card comment — `parse_isapi_xml`/
+  `read_system_time`→p1-03 (import, don't reimplement a 2nd XML security policy),
+  `window_for_device`→p1-05, `as_record()` keys→p1-07, `compute_skew`→p1-08. p1-06c/d
+  re-linked as children of p1-06 so nothing claims against the resolver.
+- **Sizing warning (2nd card in a row over budget: 330, then 1,526 lines)**: workers
+  overshoot when a card names a *concern* instead of a file+function. Card smaller still.
+- **Board**: p1-06b done; p1-06 running (worker addressing review, heartbeats alive);
+  p1-02 claimed 23:59; p1-03 `ready` but *stranded* 1.5h — not a dead dispatcher, a
+  concurrency cap (it claimed p1-02 the moment a slot freed).
+
 ### 2026-10-15 late — research folded in (second probe round)
 - The two research briefs (docs/references/) corrected three of my own claims, each
   re-verified against the live device before writing: **AcsEventTotalNum** is the real
