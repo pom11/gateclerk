@@ -66,7 +66,6 @@ __all__ = [
     "find_site",
     "host_env_prefix",
     "load_sites",
-    "load_sites_if_present",
     "parse_sites",
     "resolve_credentials",
     "safe_line",
@@ -573,16 +572,6 @@ def load_sites(path: Path | str = DEFAULT_SITES_FILE) -> dict[str, SiteConfig]:
     return parse_sites(raw, origin=str(file))
 
 
-def load_sites_if_present(path: Path | str = DEFAULT_SITES_FILE) -> dict[str, SiteConfig]:
-    """As `load_sites`, but an absent file means "no sites configured", not an error."""
-    try:
-        return load_sites(path)
-    except ConfigError as exc:
-        if "not found" in str(exc):
-            return {}
-        raise
-
-
 def parse_sites(raw: bytes, *, origin: str = "<bytes>") -> dict[str, SiteConfig]:
     """Parse the TOML bytes of a sites file.
 
@@ -626,22 +615,22 @@ def site_from_args(
     port: int = DEFAULT_PORT,
     config_path: Path | str | None = None,
 ) -> SiteConfig:
-    """`--site NAME` reads that block; `--host` builds a one-off; neither, one site wins.
+    """`--site NAME` reads that block from sites.toml; `--host` builds a one-off.
 
-    A single `[[site]]` block is used implicitly so the one-device case needs no ceremony,
-    while `--site` becomes required the moment a second site exists — guessing which door
-    controller to poll is not a default anybody should have.
+    There is deliberately **no implicit default site**, even when sites.toml holds exactly
+    one block. A connector for door hardware must never guess which door to talk to: the
+    file can be a leftover from another directory, and P1's config carries a real site
+    address. Exactly one of the two flags is required.
     """
+    if site is not None and host is not None:
+        raise ConfigError("--site and --host are mutually exclusive — pick one device")
     if site is not None:
         return find_site(load_sites(config_path or DEFAULT_SITES_FILE), site)
     if host is not None:
-        return SiteConfig(name=host, host=host, port=port)
-    sites = load_sites_if_present(config_path or DEFAULT_SITES_FILE)
-    if len(sites) == 1:
-        return next(iter(sites.values()))
-    configured = ", ".join(sorted(sites)) or "none configured"
+        return SiteConfig(name=site or host, host=host, port=port)
     raise ConfigError(
-        f"no device given: pass --host HOST (or --site NAME with sites.toml). Sites: {configured}"
+        "no device given: pass --host HOST or --site NAME (sites.toml is only read for "
+        "--site; this tool never guesses which device to poll)."
     )
 
 

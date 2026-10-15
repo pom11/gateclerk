@@ -40,7 +40,6 @@ from gateclerk.config import (
     find_site,
     host_env_prefix,
     load_sites,
-    load_sites_if_present,
     parse_sites,
     resolve_credentials,
     safe_line,
@@ -226,18 +225,35 @@ def test_constructor_validates_too_so_no_unvalidated_path_exists() -> None:
 def test_load_sites_reports_a_missing_file_as_actionable(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="not found"):
         load_sites(tmp_path / "nope.toml")
-    assert load_sites_if_present(tmp_path / "nope.toml") == {}
 
 
 def test_load_sites_reads_a_real_file(tmp_path: Path) -> None:
     path = tmp_path / "sites.toml"
     path.write_text(SITE_A_TOML, encoding="utf-8")
     assert find_site(load_sites(path), "site-a").host == HOST
-    # A real parse failure must NOT be swallowed by load_sites_if_present.
+    # A malformed file is a hard error, never silently treated as "no sites".
     bad = tmp_path / "bad.toml"
     bad.write_text("= no", encoding="utf-8")
     with pytest.raises(ConfigError, match="not valid TOML"):
-        load_sites_if_present(bad)
+        load_sites(bad)
+
+
+def test_the_shipped_example_config_actually_parses() -> None:
+    """Docs drift silently; this makes `sites.toml.example` executable documentation.
+
+    The file is the one a human copies when wiring a site, so a wrong key name in it is a
+    broken first experience — and it must stay TEST-NET like every other committed address.
+    """
+    from gateclerk.config import DEFAULT_PORT, DEFAULT_TIMEOUT_S
+
+    example = Path(__file__).resolve().parents[1] / "sites.toml.example"
+    site = find_site(load_sites(example), "site-a")
+    assert site.port == DEFAULT_PORT == 80
+    assert site.timeout_s == DEFAULT_TIMEOUT_S
+    assert site.iana_tz == "Europe/Bucharest"
+    assert site.keychain_service == DEFAULT_KEYCHAIN_SERVICE
+    assert site.isapi_user == DEFAULT_ISAPI_USER
+    assert site.host in {"192.0.2.10"}, "the example must not name a real device"
 
 
 def test_find_site_names_what_is_configured() -> None:
@@ -251,17 +267,19 @@ def test_find_site_names_what_is_configured() -> None:
         find_site({}, "anything")
 
 
-def test_site_from_args_prefers_site_then_host_then_the_only_site(tmp_path: Path) -> None:
+def test_site_from_args_requires_an_explicit_device(tmp_path: Path) -> None:
     path = tmp_path / "sites.toml"
     path.write_text(SITE_A_TOML, encoding="utf-8")
     assert site_from_args(site="site-a", config_path=path).host == HOST
     assert site_from_args(host="192.0.2.99", config_path=path).host == "192.0.2.99"
-    # Neither flag, exactly one block: no ceremony.
-    assert site_from_args(config_path=path).host == HOST
-    two = tmp_path / "two.toml"
-    two.write_text(SITE_A_TOML + '\n[[site]]\nname = "site-b"\nhost = "192.0.2.11"\n', "utf-8")
+    # --site and --host cannot both name a device.
+    with pytest.raises(ConfigError, match="mutually exclusive"):
+        site_from_args(site="site-a", host="192.0.2.99", config_path=path)
+    # NEITHER flag: refused even though exactly one site is configured. The connector must
+    # never resolve to a device the user did not name — a stale sites.toml in the cwd that
+    # happens to carry a real site address must not become the default target.
     with pytest.raises(ConfigError, match="no device given"):
-        site_from_args(config_path=two)
+        site_from_args(config_path=path)
     with pytest.raises(ConfigError, match="no device given"):
         site_from_args(config_path=tmp_path / "absent.toml")
 
