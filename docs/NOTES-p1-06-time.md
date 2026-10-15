@@ -83,6 +83,17 @@ states both numbers side by side.
   caps body size; `ElementTree` resolves no external entities itself. S314 is suppressed
   at the one call with that reasoning. (Also the shared entry point p1-03 wants for
   `deviceInfo`, which this firmware returns as XML despite `?format=json`.)
+  The DTD/ENTITY scan runs over the **whole** payload, not a head window — the first
+  version scanned 16 kB and the reviewer's probe put an entity bomb behind 20 kB of
+  padding, where it was parsed and *expanded*. Pinned by
+  `test_xml_guard_catches_a_dtd_past_the_head_window`.
+* **Unpadded clock components are accepted** (`2026-10-15T7:46:48`, review round on
+  PR #2). A punch must not become `unresolved` over a zero-padding quirk — that failure
+  presents as a payroll gap and is invisible later. The relaxation is only half the fix:
+  `datetime.fromisoformat` itself raises on an unpadded time (py3.12, measured), so
+  `_normalize_time_string` re-pads the matched components before the stdlib parser sees
+  them. Padding is textual only — the verbatim device string is untouched, and
+  `fromisoformat` still validates ranges, so `25:00`/`12:60` stay `unresolved`.
 
 ## Split out of this card (created as children of it)
 
@@ -102,8 +113,12 @@ p1-03 owns the transport. No device contact, ever, from this card.
 
 ## Test bar
 
-`tests/test_tz.py` — 88 tests. Golden pairs are
+`tests/test_tz.py` — 99 tests. Golden pairs are
 `tests/fixtures/recorded/site-a-ds-k1t341amf-s/{system_time.xml,events_major5_page1.json}`;
 all 30 punches resolve, all 30 show claimed `+02:00` against used `+03:00`, and the first
 and last punch are pinned to concrete UTC instants (sorting alone cannot catch an offset
 error, so the anchors matter).
+
+Both fixes added in the PR #2 review round are mutation-tested: bypassing
+`_normalize_time_string` fails 7 tests, and re-introducing the 16 kB head window fails
+both XML-guard tests.
