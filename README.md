@@ -78,7 +78,8 @@ or upgrades.
 | `src/gateclerk/exceptions.py` | p1-01 | shared ISAPI error vocabulary |
 | `src/gateclerk/config.py` | p1-02 | config + credential resolution (Keychain/env/flags) |
 | `src/gateclerk/isapi.py` | p1-03 | httpx digest transport, retries, error envelope |
-| `src/gateclerk/time.py` | p1-06 | Hikvision tz dialect → UTC (payroll-critical) |
+| `src/gateclerk/tz_dialect.py` | p1-06b | Hikvision tz dialect → **diagnostic** offsets only (never UTC math) |
+| `src/gateclerk/time.py` | p1-06 | site-tz resolver: naive device wall time + site IANA zone → UTC |
 | `src/gateclerk/models.py` | p1-07 | `EventRecord` / `UserRecord` — the output contract |
 
 ## Status
