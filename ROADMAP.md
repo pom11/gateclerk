@@ -22,4 +22,4 @@ P2 stays a sketch.
 
 ## Hard rules
 - read-only against devices; no writes/reboots ever unless explicitly ordered
-- no creds in the repo (`.env` gitignored; password lives in macOS Keychain, service `gateclerk-hikvision`)
+- no secrets in commits/chat (repo private: keychain default, gitignored `.env` fine; no hygiene machinery)

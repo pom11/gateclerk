@@ -23,7 +23,6 @@ Mask map (real names → `User E<n>`) is deliberately **not** in this repo; it l
 in the operator's local capture (`~/.hermes/.../device-probe/raw_capture.json`). If the
 un-masked values are ever needed for reconciliation, the operator holds them.
 
-CI leak guard (see p1-09): grep fixtures for the real-name strings and the device
-serial/MAC prefixes (kept out of band, deliberately not written here) — must find
-nothing. Adding fixtures here requires a masking pass + `LEAK CHECK: CLEAN` note in
-the PR.
+CI note (policy 2026-10-15): no leak-guard machinery is built — fixtures stay masked
+because masked is simply the right default (staff names are PII), not because CI has
+to police it. If you add fixtures, mask names/serial/mac and move on.

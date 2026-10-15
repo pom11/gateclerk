@@ -23,11 +23,16 @@ disagree, OBSERVED.md wins — it was read off the box. Deep background research
   verb; enforced by a test that walks the client's endpoint table and asserts method
   ∈ {GET, search POSTs}. If we ever need a write path, it gets its own flag + its own
   review — not folded into the connector.
-- **No credentials in the repo, ever.** `.env` is gitignored from commit 1 (already is).
-  Device password comes from macOS Keychain (`security find-generic-password -s
-  gateclerk-hikvision -a <host>`); for the site agents in P2 it comes from an env var or
-  a systemd credential — the connector takes a *callable* that returns the password, so
-  the credential source is never baked into the ISAPI code.
+- **Credentials: keychain default, gitignored `.env` fine (private repo, owner
+  relaxed 2026-10-15).** Never paste creds into chat, code, docs, or commit anything
+  secret — but no ceremony beyond that: `.env` (gitignored since commit 1) is a valid
+  source when it's simpler than keychain. Device password default: macOS Keychain
+  (`security find-generic-password -s gateclerk-hikvision -a <host>`); P2 site agents
+  take an env var / systemd credential — the connector takes a *callable* that returns
+  the password, so the credential source is never baked into the ISAPI code. No
+  dedicated secret-hygiene work (guards, scanners, ceremonies): hygiene stays a
+  side-effect of normal engineering (redaction in repr/logs, masked fixtures), never
+  a card.
 - **Timestamps are payroll data.** Every event keeps the device's original local string,
   the resolved UTC instant, and the device tz/offset we used to resolve it. We never
   discard the raw. If we can't resolve a timestamp unambiguously we store it and flag it,

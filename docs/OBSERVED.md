@@ -135,4 +135,4 @@ hour. Do not `str.replace("GMT","")`; map site names (IANA) in config instead.
 - p1-05: clamp `maxResults` to 30 (advertised cap); terminate on `responseStatusStrg` normalized ∈ {ok, "no match"}; handle missing `InfoList`; advance by `numOfMatches`; checkpoint = `max(serialNo)` device-wide (noise included) + overlap window.
 - p1-06: site-tz policy + `tz_offset_mismatch` flag; fixture `system_time.xml` + `events_major5_page1.json` are the golden pairs.
 - p1-07: `verify_mode` verbatim `cardOrFaceOrFp`; `attendanceStatus` null → `direction=unknown`; strip `password` key from UserInfo records before storing; employee_no = `employeeNoString` as string.
-- p1-09: fixtures under `tests/fixtures/recorded/site-a-ds-k1t341amf-s/` are the corpus (masked: names→`User E<n>`, serial→`MASKED-SER-1`, mac zeroed, password keys removed, nonce masked); keep the leak-check grep in CI.
+- p1-09: fixtures under `tests/fixtures/recorded/site-a-ds-k1t341amf-s/` are the corpus (masked: names→`User E<n>`, serial→`MASKED-SER-1`, mac zeroed, password keys removed, nonce masked). No CI leak-guard — build FakeDevice scenarios on these, nothing hygiene-related.
