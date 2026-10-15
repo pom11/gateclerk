@@ -76,7 +76,8 @@ heal gaps.
 | `/ISAPI/AccessControl/UserInfo/Search` | POST (JSON body) | employee roster, paged. Records carry a `password` hash key — strip before storing |
 | `/ISAPI/AccessControl/AcsEvent` | POST (JSON body) | events, paged |
 | `/ISAPI/AccessControl/AcsEvent/capabilities` | GET | **the important one** — see below |
-| `/ISAPI/AccessControl/AcsEvent/Total` | — | **not supported on site-a fw (400 notSupport)** — implemented nowhere; page instead |
+| `/ISAPI/AccessControl/AcsEventTotalNum` | POST (JSON body) | the real count endpoint (works: `totalNum` int); advisory cross-check vs `totalMatches`, never a loop bound |
+| `/ISAPI/AccessControl/AcsEvent/Total` | — | **not supported on site-a fw (400 notSupport)** — implemented nowhere |
 
 Everything returns `401 + WWW-Authenticate: Digest qop="auth"` unauthenticated,
 confirmed on `192.0.2.10` (realm `DS-39DED0D1`, `Server: webs`). So: HTTP digest,
@@ -212,6 +213,17 @@ came back `2026-10-15T16:39:32+02:00` at real wall time 16:39 **+03:00** — the
 is fine; the label on it is not. So the device's self-reported offset is **never
 trusted**:
 
+> Note on the common advice ("trust the payload's own offset, quarantine naive") —
+> it's the right general rule, and it is *wrong for this device*: the offset is
+> present, well-formed, and off by an hour half the year. We deviate **because we
+> measured it** (device wall vs NTP-disciplined clock at probe time), not as a guess.
+> Research confirms the general hazard zoo: Hikvision emits at least three
+> incompatible tz encodings, some fw stamp `+00:00` on local time, `Etc/GMT-2` carries
+> the POSIX-inverted sign (it means UTC+2 — "fixing" the sign breaks the clock), and
+> Bucharest flips +02/+03 (the naive "Romania=+2" is wrong ~8 months a year). Site-tz +
+> wall clock is immune to all of it *provided the wall clock itself is right* — hence
+> the skew monitor below.
+
 1. **Primary policy:** take the naive wall-clock part of the timestamp
    (`YYYY-MM-DDTHH:MM:SS`) and interpret it in the **site timezone from config**
    (`Europe/Bucharest` → zoneinfo → correct ±03:00/±02:00 incl. real DST rules) → UTC.
@@ -258,11 +270,32 @@ NTP anyway; only the tz rule is wrong).
   plain *python* gets `[Errno 65] No route to host` — macOS gates per-app. The CLI must
   surface this exact case with a pointer ("grant Local Network to your terminal app")
   instead of a generic connect error; the P2 site agent on Linux/Windows won't have it.
-- **Self-signed TLS on 443/8000**: P1 targets **HTTP:80** on the LAN, TLS deliberately
-  out of scope (do not silently disable cert verification and call it done). Note the
-  trade-off honestly: digest over plaintext HTTP on a trusted VLAN is acceptable for a
-  read-only LAN poll; it is not acceptable if a site's LAN is untrusted. If we ever move
-  to TLS we pin the device cert, we don't `verify=False`.
+- **TLS / port map (corrected by research)**: ISAPI lives on **80 (HTTP) and 443
+  (HTTPS, self-signed)**. **8000 is Hikvision's private SDK protocol port, not HTTPS** —
+  `https://device:8000/ISAPI` failing a TLS handshake is expected behaviour, not a bug
+  (554 = RTSP). P1 stays HTTP:80 on the LAN. If we ever move to TLS: pin the device
+  cert into our own CA bundle (`verify=/path/hik-ca.pem`) — note httpx `verify=False`
+  disables `CERT_REQUIRED` **and** `check_hostname` together, so it's full MITM
+  exposure, not a small exemption. Never a fail-open env toggle.
+- **Error envelopes come in three shapes** (research, matches our 401-XML observation):
+  canonical XML `<ResponseStatus statusCode>`; JSON flat `{"statusCode":…}` **without**
+  the wrapper (and int vs string flips between formats); and auth/lock replies as
+  `<userCheck><statusValue>` — `statusValue` is NOT `statusCode`. Parse: sniff first
+  byte (`{`/`[`) else XML, accept both field names, strip namespaces (live samples use
+  4 different xmlns). Retry classes: HTTP 503/`statusCode 2` (deviceBusy family) →
+  backoff 1→30s ≈6 tries; `3` once then alert; `4/5/6` (badParameters, notSupport,
+  badXmlFormat…) terminal — our request is wrong, retrying turns polling into lockout.
+- **Account lockout is machine-readable**: the 401 body carries
+  `<lockStatus>/<unlockTime>/<retryLoginTime>` — parse them and circuit-open for
+  `unlockTime + margin` instead of hardcoding folklore ("~5 tries/30 min"). Digest
+  gotchas that bind the client: `uri=` in the digest must include `?format=json`
+  (path-only HA2 = infinite 401 loop with a correct password); one `httpx.DigestAuth`
+  per thread, never shared (unlocked state); pin the httpx version (PR #2463 broke
+  digest for HA users); never shell out to `curl --digest` from the client (argv
+  leak + no structured errors).
+- **`maxResults` is SILENTLY clamped** to the capability when oversized (vendor text) —
+  so cursor arithmetic must use the returned `numOfMatches`, never the requested
+  page size. (Our paging rule already does this; keep it.)
 
 ## Credential plumbing
 

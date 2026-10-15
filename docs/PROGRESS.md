@@ -28,3 +28,14 @@ device truth: docs/OBSERVED.md.)
 ## Next expected
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
+
+### 2026-10-15 late — research folded in (second probe round)
+- The two research briefs (docs/references/) corrected three of my own claims, each
+  re-verified against the live device before writing: **AcsEventTotalNum** is the real
+  count endpoint (works, totalNum=30 — we'd probed a wrong path name); **port 8000 is
+  the SDK protocol port, not HTTPS**; **minor 38 = fingerprint, not card** (card pass
+  is minor 1). New device finding: **`employeeNo` filter is silently ignored** (returns
+  everything) while `employeeNoString` works → policy: filter client-side, trust only
+  probed server filters. Also added: three error-envelope shapes + machine-readable
+  lockout fields (`lockStatus/unlockTime`), silent maxResults clamping rationale,
+  digest uri=/thread-safety/version-pin rules. Card comments updated for p1-03/04/05/08/09.
