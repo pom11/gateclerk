@@ -1,0 +1,10 @@
+HTTP/1.1 401 Unauthorized
+Date: Thu, 15 Oct 2026 17:22:55 GMT
+Server: webs
+Content-Length: 235
+Connection: close
+X-Frame-Options: SAMEORIGIN
+Cache-Control: no-store
+Pragma: no-cache
+WWW-Authenticate: Digest qop="auth", realm="DS-39DED0D1", nonce="MASKED-NONCE", stale="false", opaque="MASKED", domain="::"
+Content-Type: application/xml

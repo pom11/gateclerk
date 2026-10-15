@@ -6,6 +6,12 @@ them in Business Central as timesheet data. `gateclerk` = time attendance (RO).
 Status: **P1 — read-only connector to one device.** BC mapping is deliberately not
 designed yet (open questions below).
 
+**Device-verified facts live in [OBSERVED.md](OBSERVED.md)** (probe of site-a
+DS-K1T341AMF-S, 2026-10-15: capabilities, paging quirks, the time-offset bug, the
+major=3 noise stream, `attendanceStatus` = null). Where this doc and OBSERVED.md
+disagree, OBSERVED.md wins — it was read off the box. Deep background research
+(with source citations, marked VERIFIED/INFERRED): `docs/references/`.
+
 ## Constraints / invariants
 
 - **Read-only.** Only `GET` and the two stateless search `POST`s
@@ -51,12 +57,13 @@ heal gaps.
 
 | Call | Method | Notes |
 |---|---|---|
-| `/ISAPI/System/deviceInfo?format=json` | GET | model, serial, fw. Serial is part of the idempotency key. |
-| `/ISAPI/System/time?format=json` | GET | device clock + tz; drift is our problem, not the device's |
-| `/ISAPI/AccessControl/UserInfo/Search?format=json` | POST | employee roster, paged |
-| `/ISAPI/AccessControl/AcsEvent?format=json` | POST | events, paged |
-| `/ISAPI/AccessControl/AcsEvent/capabilities?format=json` | GET | **the important one** — see below |
-| `/ISAPI/AccessControl/UserInfo/Count?format=json` | GET | sanity check on roster size |
+| `/ISAPI/System/deviceInfo` | GET | returns **XML on this fw even with ?format=json** — parser needs both. model, serial, fw. Serial is part of the idempotency key. |
+| `/ISAPI/System/time` | GET | XML here too. device clock + tz; drift/offset is our problem, not the device's (see Time handling) |
+| `/ISAPI/AccessControl/UserInfo/Count` | GET | GET only — POST → `methodNotAllowed` on this fw |
+| `/ISAPI/AccessControl/UserInfo/Search` | POST (JSON body) | employee roster, paged. Records carry a `password` hash key — strip before storing |
+| `/ISAPI/AccessControl/AcsEvent` | POST (JSON body) | events, paged |
+| `/ISAPI/AccessControl/AcsEvent/capabilities` | GET | **the important one** — see below |
+| `/ISAPI/AccessControl/AcsEvent/Total` | — | **not supported on site-a fw (400 notSupport)** — implemented nowhere; page instead |
 
 Everything returns `401 + WWW-Authenticate: Digest qop="auth"` unauthenticated,
 confirmed on `192.0.2.10` (realm `DS-39DED0D1`, `Server: webs`). So: HTTP digest,
@@ -90,84 +97,129 @@ advertised max and never assume — sending more is silently clamped on some fir
 ```
 site                 str   config-level: 'site-a' — the agent knows its own site
 device_serial        str   from deviceInfo, part of idempotency key
-serial_no            int   device's own monotonic event counter, part of key
+serial_no            int   device's own monotonic event counter, part of key.
+                           Counts ALL events incl. noise → checkpoint on it device-wide
 employee_no          str   employeeNoString (preferred; employeeNo is the int form and
                            truncates leading zeros / alphanumeric employee ids)
-name                 str   display name as the device reports it
-event_time_utc       datetime (tz-aware UTC)  — what BC wants
-event_time_local     str   verbatim device string, e.g. 2026-10-15T07:46:48+03:00
-tz_offset_min        int   offset parsed out of the device string
+name                 str   display name as the device reports it (strip UserInfo
+                           'password' hash key; never store it)
+event_time_utc       datetime (tz-aware UTC)  — site-tz policy, see Time handling
+event_time_local     str   verbatim device string, e.g. 2026-10-12T14:11:16+02:00
+tz_offset_min_device int   the offset the device claimed (WRONG on site-a — audit only)
+tz_source            enum  site-tz (primary) | unresolved
+tz_offset_mismatch   bool  device offset ≠ site offset at that instant (flag, don't fix)
 direction            enum  in | out | unknown   — derived, see below
-attendance_status    str   device's own attendanceStatus, if it sent one
-verify_mode          str   currentVerifyMode: face / card / faceOrCard / … — device's
-                           own vocabulary, kept verbatim, no silent normalisation
+attendance_status    str   device's own attendanceStatus if non-null (site-a: always null)
+direction_source     enum  device | inferred | none
+verify_mode          str   currentVerifyMode verbatim (on this fw: 'cardOrFaceOrFp' for
+                           every real pass — it does NOT distinguish face vs card;
+                           'invalid' on door/noise events — no silent normalisation)
 major / minor        int   raw codes, always kept
+outcome              enum  granted | denied | info   (info = noise/door/button/unknown)
 raw                  json  the untouched device record
 ```
+
+**Noise filter is part of the contract:** site-a logs `major=3,minor=1029` every
+minute on the minute (10,169 of 10,199 events — a remote-op/cloud heartbeat). Only
+`major=5, outcome=granted, employee_no present` (minor 75 here; 38 card-pass if it ever
+appears) are punch candidates. Everything is still *stored* (raw + flags); filtering is
+a query-time property, so a misclassification never loses data.
 
 Idempotency key = `(device_serial, serial_no)`. `UPSERT` on it, so re-polling an overlap
 window is free — which is how we heal a crash mid-page or a device clock step.
 Secondary guard: `(employee_no, event_time_local, minor)` dedupe for devices whose
 `serialNo` resets after a firmware upgrade / log clear.
 
-### in/out: device says it, or we infer it — and we tell you which
+### in/out: the two real options (device probe settled the first one — see OBSERVED.md)
 
-`attendanceStatus` (`checkIn` / `checkOut`) **does exist** in the AcsEvent record on this
-firmware family, and it's confirmed present on a DS-K1T341AMF specifically in a field
-report. But it is only populated when the terminal is configured in attendance mode with
-an attendance plan; in pure access-control mode it's absent and every punch arrives
-`unknown`. So the rule is:
+Observed on site-a: the `attendanceStatus` field exists in the record schema but is
+**null on every event** — the terminal is in pure access-control mode. So today every
+punch arrives direction-less. Two ways to get direction, both planned-for:
 
-- `attendanceStatus` present → use it. `direction` = device's answer. `source=device`.
-- absent → we don't invent a direction. `direction=unknown`, `source=none`, and the
-  consumer (BC, P3) decides: a day's first/last punch per person per site is a
-  reasonable span but *not* worked hours, and we refuse to pretend otherwise in the data.
-- A `timeReverseOrder`/`major=5,minor=0` query returns *everything* including door-forced,
-  exit-button, invalid-card and remote-unlock events. The connector classifies
-  `outcome` ∈ {granted, denied, info} and only granted-auth events are punch
-  candidates. Filtering this wrong is how you get ghost timesheet lines.
+**Option A — turn on attendance mode on the device(s) (recommended, owner decision).**
+Device UI: attendance mode + attendance plan, then `attendanceStatus` comes back
+`checkIn`/`checkOut` on every pass and direction is ground truth from the terminal.
+- + Correct in/out semantics per employee, handles re-entry the way HR expects.
+- + Zero inference logic to defend; our output stays `direction_source=device`.
+- − It's a device **write** (web UI, maintenance window, per site) — never via this
+  connector; it also changes door behaviour (attendance plan gates the relay), so it
+  needs a test pass at the door with the people who use it.
+- − Historical events (before the switch) stay direction-less forever.
 
-The **open question that decides P3**: get the terminals into attendance mode so
-`attendanceStatus` is real (a device config change — needs a human, on purpose, in the
-web UI, and it's out of P1's read-only scope), *or* accept first/last-inference in BC.
-Recommend attendance mode: inference is lossy for anyone who badges out and back in.
+**Option B — infer from passes, in the consumer (BC/P3), never silently here.**
+Connector keeps `direction=unknown, direction_source=none`; P3 derives per
+(site, employee, local-day): first granted pass = in, last granted pass = out.
+- + No device change; works with the existing 10k-event history.
+- − Only a *span*, not worked hours: mid-day exits/re-entries are invisible, someone
+  who badges in once and forgets to badge out gets a one-punch day, and night-shift
+  days need a day-boundary rule (e.g. 05:00 local) agreed with HR.
+- − The inference has to live *somewhere* anyway; baking it into BC keeps this
+  connector honest (it only reports what the device said) but makes the BC side own
+  the ambiguity.
+- Variant B2 (alternate in/out strictly) is **rejected**: it turns every forgotten
+  badge-out into a fake overnight shift.
+
+Whichever is chosen is recorded per event in `direction_source`
+(`device | inferred | none`) so a mixed history (site switched mid-year) stays
+auditable. Until a decision: **Option B semantics, direction=unknown in our store** —
+this connector will not write an inferred direction into the record.
 
 ## Paging + checkpoint
 
-`searchResultPosition` is **0-based**; advance by `numOfMatches` from the previous
-response. Loop until `responseStatusStrg != "MORE"` (values: `OK`, `MORE`, `NO_MATCHES`)
-— do not use `totalMatches` as the loop bound, it's advisory and lies on some firmware.
-`searchID` must be **stable across pages of one search** (device caches the cursor) but
-**unique per new search**; we use a per-search uuid and reuse it for every page of it.
+Verified against site-a (OBSERVED.md): `searchResultPosition` is **0-based**; advance
+by `numOfMatches`; terminate when `responseStatusStrg` normalized (`.upper().replace(
+" ","").replace("_","")`) ∉ {`MORE`} — note the empty-window value is **`"NO MATCH"`
+with a space**, so raw `== "NO_MATCHES"` comparisons are wrong; and the empty response
+has **no `InfoList` key at all** (not an empty list). `totalMatches` (30 = our full
+major=5 history, 10,199 = all) is advisory — never a loop bound. `searchID` stable
+across pages of one logical search (≤64 chars on this fw), fresh uuid per new search.
+`timeReverseOrder:true` honored (newest-first). `AcsEvent/Total` is **not supported**
+on this fw (`400 notSupport`) — don't implement it.
 
-Checkpoint = `(last_serial_no, last_event_time_local)`. Next poll window:
-`[last_event_time_local - overlap, now]`, `overlap` default 5 min. We re-read the overlap
-and let the `UPSERT` de-dupe — cheaper than trusting a cursor that a device log rotation
-can invalidate. Time window is chunked (`startTime`/`endTime`, default 1 day) because
-large windows are the thing that makes these devices return `Invalid Content`.
+`maxResults` clamped to the capability (`@max=30` on site-a); we request 30 and never
+more. Inter-page delay 100 ms default.
 
-Always send `startTime`+`endTime` even when querying "everything": at least one DS-K1T*
-firmware returns `statusCode 6 / Invalid Content / badParameters` on a time-less query
-while accepting the same query with bounds. Never send `picEnable: true` — we don't want
-face snapshots of staff leaving on the wire or in a sqlite file.
+Checkpoint = `(last_serial_no, last_event_time_local)` where `serial_no` counts **all**
+events (the noise major=3 shares the counter — proven by serials 5742..5753 interleaved
+with punches), so checkpointing on max serialNo device-wide is sound even while
+filtering noise out of results. Next poll window: `[last_event_time_local - overlap,
+now_device_wall]`, `overlap` default 5 min, `UPSERT` on `(device_serial, serial_no)`
+makes the re-read free. Windows chunked (default 1 day — the full 7-month window works
+on this fw too, but chunking bounds a mid-search failure) and **always** with
+`startTime`/`endTime` + offsets. Times sent to the device must be in **device-wall
+terms** (it filters on its own naive clock), and given the offset bug that means:
+derive the query window in site-tz wall time, stamp the device's claimed offset on it —
+test this round-trip with a fixture, it's the subtle one. Never send `picEnable:true`.
 
 ## Time handling (the part that matters for payroll)
 
-`AcsEvent.time` comes back **local-with-offset** in the observed reports
-(`2026-10-15T07:46:48+03:00`), which is ideal — it's self-describing and DST-safe. But
-some firmware returns naive local (`2026-10-15T07:46:48`) with no offset. Resolution:
+**Verified on site-a (OBSERVED.md): the device stamps the wrong offset.** `localTime`
+came back `2026-10-15T16:39:32+02:00` at real wall time 16:39 **+03:00** — the tz rule
+`CST-2:00:00DST01:00:00,M3.4.1/00:00:00,M10.5.0/23:00:00` never engages DST. Wall clock
+is fine; the label on it is not. So the device's self-reported offset is **never
+trusted**:
 
-1. offset in string → parse it, done. This is the expected path.
-2. naive string → combine with the device tz from `GET /ISAPI/System/time`, which for a
-   Romanian site should resolve to `Europe/Bucharest` (EEST/+03:00 in summer, EET/+02:00
-   in winter — the offset flip happens in the string, so path 1 handles it automatically).
-3. Hikvision tz strings are their own dialect (`GTB Standard Time` Windows names,
-   `Etc/GMT-2`, `CST-8`, and `Etc/GMT-2` inverts sign vs POSIX) — we keep a small
-   explicit mapping table validated against the device, never `str.replace("GMT","")`.
-4. If we can't resolve → store raw, `tz_unresolved=true`, alert. Never silently assume UTC.
+1. **Primary policy:** take the naive wall-clock part of the timestamp
+   (`YYYY-MM-DDTHH:MM:SS`) and interpret it in the **site timezone from config**
+   (`Europe/Bucharest` → zoneinfo → correct ±03:00/±02:00 incl. real DST rules) → UTC.
+   Applies whether the string carries an offset or not.
+2. Keep the raw string verbatim + the device's claimed offset
+   (`tz_offset_min_device`) for audit; set `tz_offset_mismatch=true` whenever
+   device-offset ≠ site-offset-at-that-instant (in summer: always, until the device
+   tz/NTP is fixed by the owner — a device write, not ours). If the owner later fixes
+   the device, the flag stops firing and the math doesn't change — that's the point.
+3. Naive string (no offset at all) → same site-tz path, `tz_source=site-tz`.
+4. Site tz missing/unresolvable → store raw, `tz_unresolved=true`, alert. Never
+   silently assume UTC.
+5. Hikvision tz dialect (`GTB Standard Time`, `Etc/GMT-2` with POSIX-inverted sign,
+   `CST-2:00:00DST…` POSIX rules) lives in a validator/parser table for *diagnostics
+   only* (explain what the device thinks) — never in the UTC math. Config stores IANA
+   names per site, nothing derived from these strings.
 
-We also record `device_clock_skew` (device `System/time` vs our clock) per poll. Skew
-over a threshold is a log line, not an auto-fix — setting device time is a write.
+We also record `device_clock_skew` (device `System/time` wall part vs our clock) per
+poll. Skew over a threshold is a log line, not an auto-fix — setting device time is a
+write. NTP config on the device is likewise the owner's call (its DST bug would survive
+NTP anyway; only the tz rule is wrong).
 
 ## Failure modes we design for
 
@@ -184,10 +236,15 @@ over a threshold is a log line, not an auto-fix — setting device time is a wri
 - **Half-open TCP**: the device drops idle keep-alives; set an explicit read timeout
   (default 30 s) and `Connection: close` rather than pooling aggressively to a box that
   will RST us.
-- **Encrypted person data**: some Hikvision deployments return `name`/`employeeNoString`
-  as opaque encrypted blobs (`security=1&iv=…` scheme). If the first smoke run shows
-  hex/base64-looking names instead of readable ones, that's this — it changes the whole
-  employee-mapping approach and goes in the open questions.
+- **Encrypted person data**: RESOLVED for site-a — the 2026-10-15 probe returned plain
+  readable names + `employeeNoString` "1".."4" (no `security=1&iv=` blob scheme in play).
+  Keep the `encrypted_person_data` flag in the model: sites B/C (or a firmware change)
+  could still enable it, and if blobs appear the connector must detect (high-entropy
+  no-space strings in `name`) and flag rather than store garbage as a name.
+- **macOS Local Network permission (TCC)**: on this Mac, *curl* reaches the LAN fine but
+  plain *python* gets `[Errno 65] No route to host` — macOS gates per-app. The CLI must
+  surface this exact case with a pointer ("grant Local Network to your terminal app")
+  instead of a generic connect error; the P2 site agent on Linux/Windows won't have it.
 - **Self-signed TLS on 443/8000**: P1 targets **HTTP:80** on the LAN, TLS deliberately
   out of scope (do not silently disable cert verification and call it done). Note the
   trade-off honestly: digest over plaintext HTTP on a trusted VLAN is acceptable for a
@@ -196,13 +253,25 @@ over a threshold is a log line, not an auto-fix — setting device time is a wri
 
 ## Credential plumbing
 
-- `security find-generic-password -s gateclerk-hikvision -a <device-ip>` → password;
-  `-a` value = the device host. Comment field carries `user=admin`.
-- CLI resolves credentials in order: explicit `--user/--password` flags (for one-off
-  debugging, and we will *not* encourage it), then `GATECLERK_<HOST>_USER/PASSWORD` env,
-  then macOS Keychain.
-- `.env` stays gitignored; `docs/` and fixtures must never contain a real password,
-  nonce, or a device serial that isn't already public.
+Config (`sites.toml`, committed — hosts are not secret, passwords never appear):
+
+```toml
+[[site]]
+name = "site-a"
+host = "192.0.2.10"
+port = 80
+iana_tz = "Europe/Bucharest"
+isapi_user = "admin"                      # overridable; keychain comment also carries user=
+keychain_service = "gateclerk-hikvision"    # macOS; = account is the host
+```
+
+New sites = one more block; the keychain account is the host (`security
+find-generic-password -s gateclerk-hikvision -a <host>`), so `security add-generic-password
+-s gateclerk-hikvision -a <ip> -U` plugs site B/C in identically. Resolution order:
+`--user/--password` flags (debug only, discouraged) → env (`GATECLERK_<HOST>_USER/_PASSWORD`)
+→ Keychain. The client receives a credential *callable*, never a baked-in source.
+`.env` stays gitignored; `docs/` and fixtures must never contain a real password,
+nonce, serial or employee name (fixtures mask them — see tests/fixtures/README).
 
 ## Testing
 
@@ -222,23 +291,34 @@ over a threshold is a log line, not an auto-fix — setting device time is a wri
 1. **P3 / BC** — deferred on purpose, do not design until asked. Shape we already know
   we'll need: the BC table/page + fields for a punch, and how a Hikvision
   `employeeNoString` maps to the BC employee key (BC employee no.? payroll no.? a
-  mapping table we maintain?). Device employee numbers look auto-assigned, so a manual
-  or HR-driven mapping table is likely.
-2. **Attendance mode** — can/should the three terminals be put in attendance mode (and
-  are the attendance plans per-shift or per-person?) so `attendanceStatus` is real
-  instead of inferred. Needs a human + a maintenance window. Read-only P1 can't and
-  won't do it.
-3. **Site identity** — `site` is agent config today. Fine for P1; once a punch must join
-  to a BC location/site code we need the canonical mapping. Who owns it: IT or HR/BC?
-4. **Retention / gaps** — how far back does the DS-K1T341AMF-S event buffer go before it
-   rolls? Determines the size of the very first backfill pull and whether a site that's
-   offline for a week silently loses punches.
+  mapping table we maintain?). Device employee numbers are auto-assigned small ints
+  ("1".."4" on site-a) and the device roster (4 users) proves they are NOT BC-safe ids —
+  a mapping table is certain; question is who owns it (HR/BC admin?).
+2. **Attendance mode** — device-confirmed null today → see "in/out: the two real
+  options" above (A = owner enables attendance mode per site, recommended; B = infer in
+  BC). Owner decision, per site, with a door-side test pass. Not blocking P1.
+3. **Site identity** — `site` is agent config today (`site-a`...). Once a punch joins to
+  a BC location code we need the canonical mapping. Same owner question as (1).
+4. **Retention / gaps** — partially answered by probe: oldest retained event is
+   serial 27 @ 2026-05-21 (device started counting ~then; no rolling observed in ~5
+   months of history). BUT site-a's noise stream runs 1/min ≈ 1,440 events/day, so
+   whatever the real ring capacity is, noise will dominate it. **Operational
+   consequence:** the agent must record oldest-serialNo per poll (a monotonic increase
+   of the minimum = rolling started = punches are being lost) and the owner should kill
+   the noise source at its client (looks like a Hik-Connect/remote poll — device-side
+   config is off-limits to us, but the *polling* client is theirs to stop). Poll
+   interval must be minutes, not days.
 5. **Multi-reader ambiguity** — one device per door means one direction signal per door.
   If a site ends up with a reader on each side of the same door, `direction` may need to
   come from the reader/door number rather than `attendanceStatus`. Worth confirming now.
 6. **Realtime** — is sub-minute latency ever a requirement (e.g. a live "who's in the
   office" board)? If not, polling stays the right choice. If yes, `alertStream` as an
   add-on, poll still the source of truth for completeness.
+7. **Device tz fix (owner, optional)** — the DST rule on site-a never engages (+02:00 in
+  summer). We're immune (site-tz policy) but every query-window we send is in the
+  device's naive-wall terms; if the owner fixes tz/NTP later, our UTC math is unchanged
+  and `tz_offset_mismatch` stops firing. Worth fixing anyway so the web UI logs read
+  sanely during incident triage.
 
 ## Phase plan
 

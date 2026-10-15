@@ -1,0 +1,34 @@
+{
+ "AcsEvent": {
+  "searchID": "gateclerk-fixture-2",
+  "totalMatches": 10130,
+  "responseStatusStrg": "MORE",
+  "numOfMatches": 3,
+  "InfoList": [
+   {
+    "major": 3,
+    "minor": 1029,
+    "time": "2026-10-08T15:42:45+02:00",
+    "type": 0,
+    "serialNo": 77,
+    "currentVerifyMode": "invalid"
+   },
+   {
+    "major": 3,
+    "minor": 1029,
+    "time": "2026-10-08T15:43:46+02:00",
+    "type": 0,
+    "serialNo": 78,
+    "currentVerifyMode": "invalid"
+   },
+   {
+    "major": 3,
+    "minor": 1029,
+    "time": "2026-10-08T15:44:46+02:00",
+    "type": 0,
+    "serialNo": 79,
+    "currentVerifyMode": "invalid"
+   }
+  ]
+ }
+}

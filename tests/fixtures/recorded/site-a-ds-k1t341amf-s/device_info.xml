@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DeviceInfo version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+<deviceName>Access Controller</deviceName>
+<deviceID>255</deviceID>
+<model>DS-K1T341AMF-S</model>
+<serialNumber>MASKED-SER-1</serialNumber>
+<macAddress>00:11:22:33:44:55</macAddress>
+<firmwareVersion>V3.2.30</firmwareVersion>
+<firmwareReleasedDate>build 220729</firmwareReleasedDate>
+<encoderVersion>V1.0</encoderVersion>
+<encoderReleasedDate>build 191119</encoderReleasedDate>
+<deviceType>ACS</deviceType>
+<telecontrolID>1</telecontrolID>
+<supportBeep>false</supportBeep>
+<localZoneNum>0</localZoneNum>
+<alarmOutNum>0</alarmOutNum>
+<electroLockNum>1</electroLockNum>
+<RS485Num>1</RS485Num>
+<marketType>2</marketType>
+</DeviceInfo>

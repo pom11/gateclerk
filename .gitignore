@@ -6,6 +6,7 @@ secrets/
 __pycache__/
 *.pyc
 .venv/
+.worktrees/
 .pytest_cache/
 *.sqlite
 *.db
