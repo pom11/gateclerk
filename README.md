@@ -51,7 +51,22 @@ uv run pytest -m live            # needs GATECLERK_LIVE=1: a HUMAN runs these on
 CI never opens a socket to a device: `pytest -m "not live"` is the default in
 `pyproject.toml`, `GATECLERK_LIVE=0` is set in the workflow, and `tests/conftest.py`
 monkeypatches `socket` so an accidental network call fails loudly instead of hanging.
-Fixtures live in `tests/fixtures/` with credentials, serials and names synthetic.
+Recorded-response fixtures will live in `tests/fixtures/` (card p1-09) with credentials,
+serials and names synthetic; `tests/test_repo_hygiene.py` already rejects any real
+device address or non-placeholder secret anywhere under `tests/`.
+
+## CI and branch protection
+
+One job, `.github/workflows/ci.yml`: `uv sync --frozen` → `ruff check` →
+`ruff format --check` → pytest on the base install → pytest with `[fast]` →
+console-script import check. Python 3.12 is provisioned by uv, not the runner.
+
+`main` is **not** branch-protected: this is a private repo on GitHub's free plan and
+the protection API returns `403 Upgrade to GitHub Pro or make this repository public`.
+Until that changes, "CI must be green before merge" is a process rule, not a platform
+enforcement — the required check name to look for is `lint + test (offline)`. Flip on
+protection (require that check + one approving review) the moment the repo goes public
+or upgrades.
 
 ## Layout
 

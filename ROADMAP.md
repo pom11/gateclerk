@@ -3,7 +3,7 @@
 Hikvision face/card terminals → Business Central timesheets. Details in docs/DESIGN.md.
 
 ## Now (P1 — read-only connector)
-- [ ] uv + py3.12 package scaffold, CLI `gateclerk`, offline tests in CI
+- [x] uv + py3.12 package scaffold, CLI `gateclerk`, offline tests in CI
 - [ ] ISAPI client: digest auth, timeouts, bounded retries, capability discovery
 - [ ] `device info|time`, `users list`, `events --since/--until` (paged, normalized)
 - [ ] Live smoke run vs 192.0.2.10 → docs/OBSERVED.md (real event codes)
