@@ -19,7 +19,9 @@ __all__ = [
     "IsapiBadContent",
     "IsapiBusy",
     "IsapiError",
+    "IsapiLocalNetworkError",
     "IsapiNotFound",
+    "IsapiPayloadError",
     "NotImplementedYet",
     "GateclerkError",
 ]
@@ -31,6 +33,26 @@ class GateclerkError(Exception):
 
 class NotImplementedYet(GateclerkError):
     """Placeholder for a command whose real implementation lands in a later card."""
+
+
+class IsapiPayloadError(GateclerkError):
+    """A device body we refused to parse: too big, declares an XML DTD/entity, or is
+    neither JSON nor well-formed XML.
+
+    Lives here rather than in the response module so both the parser and its callers
+    can name it without importing XML or httpx. (Also the exception `parse_isapi_xml()`
+    raises, so a p1-06 caller gets the same vocabulary.)
+    """
+
+
+class IsapiLocalNetworkError(GateclerkError):
+    """The OS refused to let us reach the device at all.
+
+    OBSERVED.md delta (4): on this Mac *curl* reaches the LAN while plain *python* gets
+    `[Errno 65] No route to host`, because macOS TCC gates Local Network per-app. A
+    generic "connection failed" here sends someone debugging at the wrong layer — the
+    fix is a permission grant, not a retry or a credential.
+    """
 
 
 class IsapiError(GateclerkError):
@@ -69,7 +91,36 @@ class IsapiAuthError(IsapiError):
 
     A Hikvision terminal locks the account after repeated failures, and the locked
     account is the one someone needs at the door. Never retry this in a loop.
+
+    The 401 body is a *payload*, not just a status: it carries the machine-readable
+    lockout counters (`lockStatus` / `unlockTime` / `retryLoginTime`, DESIGN.md
+    "Account lockout is machine-readable"), and the transport exposes them as
+    `unlock_time` / `retry_login_time` so a caller can circuit-open for
+    `unlock_time + margin` instead of hardcoding the "~5 tries / 30 minutes" folklore.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        envelope: dict[str, Any] | None = None,
+        request_body: str | None = None,
+        lock_status: str | None = None,
+        unlock_seconds: int | None = None,
+        retry_login_seconds: int | None = None,
+    ) -> None:
+        super().__init__(
+            message, status_code=status_code, envelope=envelope, request_body=request_body
+        )
+        self.lock_status = lock_status
+        self.unlock_time = unlock_seconds
+        self.retry_login_time = retry_login_seconds
+
+    @property
+    def locked(self) -> bool:
+        """True when the device says the account is currently locked."""
+        return (self.lock_status or "").strip().lower() in {"locked", "lock", "1"}
 
 
 class IsapiBadContent(IsapiError):
