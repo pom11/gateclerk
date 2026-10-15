@@ -548,16 +548,19 @@ def parse_isapi(body: bytes) -> dict:
         try:
             return json.loads(t)
         except json.JSONDecodeError:
-            pass                                  # fall through to XML
-    root = ET.fromstring(t)                        # strips the {ns} prefix below
-    return _xml_to_flat_dict(root)                 # statusCode/statusString/subStatusCode/requestURL
+            pass  # fall through to XML
+    root = ET.fromstring(t)  # strips the {ns} prefix below
+    return _xml_to_flat_dict(root)  # statusCode/statusString/subStatusCode/requestURL
+
 
 def isapi_status(payload: dict) -> int | None:
     """`statusCode` in the canonical envelope; `statusValue` in the lock/userCheck variant."""
     for k in ("statusCode", "statusValue"):
         if k in payload:
-            try: return int(payload[k])
-            except (TypeError, ValueError): return None
+            try:
+                return int(payload[k])
+            except (TypeError, ValueError):
+                return None
     return None
 ```
 
@@ -798,10 +801,12 @@ first, and never let a naive value through.**
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-DEVICE_TZ = ZoneInfo("Europe/Bucharest")   # fallback ONLY, never the primary path
+DEVICE_TZ = ZoneInfo("Europe/Bucharest")  # fallback ONLY, never the primary path
+
 
 class NaivePunchTime(ValueError):
     """A punch arrived without a UTC offset. Unambiguous conversion is impossible."""
+
 
 def punch_to_utc(raw: str, *, source: str = "") -> datetime:
     """
@@ -813,10 +818,10 @@ def punch_to_utc(raw: str, *, source: str = "") -> datetime:
       2. NEVER guess for a naive value. Raise; let the pipeline quarantine the record.
       3. Never use the *client's* timezone, and never a hardcoded +02:00.
     """
-    dt = datetime.fromisoformat(raw)                  # py3.11+ handles +07:00
+    dt = datetime.fromisoformat(raw)  # py3.11+ handles +07:00
     if dt.tzinfo is None:
         raise NaivePunchTime(f"{source}: naive punch time {raw!r} - refusing to guess")
-    return dt.astimezone(timezone.utc)                # offset-aware -> exact, DST-proof
+    return dt.astimezone(timezone.utc)  # offset-aware -> exact, DST-proof
 ```
 
 Why each rule:
