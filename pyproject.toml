@@ -1,0 +1,84 @@
+[project]
+name = "gateclerk"
+version = "0.1.0"
+description = "Read-only Hikvision attendance connector -> Business Central (P1)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "pom11" }]
+dependencies = [
+    "httpx>=0.27,<1",
+    "typer>=0.12,<1",
+    "rich>=13.7,<15",
+]
+
+[project.optional-dependencies]
+# orjson is an *optional* fast path only. The code must import and run without it
+# (fall back to stdlib json). Nothing may hard-import orjson.
+fast = ["orjson>=3.10"]
+
+[project.scripts]
+gateclerk = "gateclerk.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gateclerk"]
+
+[tool.uv]
+# The package itself is the workspace member; nothing else to resolve.
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "C4",  # comprehensions
+    "SIM", # simplify
+    "RUF", # ruff specifics
+    "S",   # bandit: no secrets/shell footguns in a repo that talks to door hardware
+    "DTZ", # tz-aware datetimes only -- timestamps here are payroll data
+    "PTH", # pathlib
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]  # assert + fake passwords in tests are fine
+# Exception names here are the shared vocabulary named in the p1-03 card body
+# (IsapiAuthError / IsapiBadContent / IsapiBusy / IsapiNotFound); renaming them to
+# satisfy N818 would break the cross-card contract, so the contract wins.
+"src/gateclerk/exceptions.py" = ["N818"]
+
+[tool.ruff.format]
+# line-length is inherited from [tool.ruff] (ruff >= 0.13 rejects repeating it here).
+quote-style = "double"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+# Live device tests are opt-in twice over: the marker expression excludes them, and
+# tests/live/ hard-skips unless GATECLERK_LIVE=1 (see tests/conftest.py). CI runs the
+# default set and therefore never opens a socket to a device.
+addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not live"]
+markers = [
+    "live: talks to a real Hikvision device -- skipped by default, needs GATECLERK_LIVE=1",
+    "unit: offline unit test (the default; marker exists for explicit selection)",
+]
+xfail_strict = true
