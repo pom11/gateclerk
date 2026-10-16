@@ -29,6 +29,45 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-16 evening — review cycle 4: PRs #7/#8/#9/#14/#15/#16 merged, main at 743 tests
+
+- **Queue had gone stale 3h** — watcher fired `!WATCH` but a background process attached to
+  an idle REPL cannot wake it (no gateway delivery here). Known limit; owner to decide fix.
+- **PR #14 IsapiBusy docstring -> `cdad256`**: `invalidOperation` is vendor class-4 =
+  terminal, never backoff (retrying it is the door-terminal-lockout path); verified against
+  gotchas §2.2 + `_BUSY_SUBCODES`, boundary pinned both directions incl. the
+  class-4-but-wait `beingExportedByAnotherUser` row.
+- **PR #15 flatten_xml `@`-attrs -> `f31bdc4`**: capability limits live in XML attributes;
+  `@`-prefix + `#text` convention now matches the recorded JSON fixtures. Probe:
+  `<maxResults max="30"/>` -> `{"@max":"30"}`, attrs+text leaf -> dict, fixture snapshots
+  byte-identical (root-attr scope unchanged).
+- **PR #16 DESIGN.md digest clause -> `a37f3a8`**: the "close forces 401 re-pay" line was
+  wrong per gotchas §1.7c (auth state lives on the auth object; 1 challenge/6 reqs under
+  `Connection: close`). Real cost is fresh-auth-per-call doubling (10 vs 6) + stale-nonce
+  on the long-lived auth object. Design doc now states the true reason reuse stays ON.
+- **PR #8 p1-05 paging -> `b420329`** (1,896 lines, 38 tests): cursor advances by RETURNED
+  `numOfMatches` only (the fw silent-clamp payroll bug), `NO MATCH`-with-space + missing
+  InfoList handled, 10k-page runaway cap raises instead of looping, AcsEvent always
+  bounded via `window_for_device`, checkpoint yielded only for completed chunks,
+  `employeeNoString` only, `picEnable` refused, cursor-smuggling refused pre-wire.
+  `AcsEventTotalNum` deliberately NOT added here — third POST = named registry decision,
+  belongs with p1-08 `--count`.
+- **PR #9 p1-06d facade -> `1ac9392`**: thin `resolve_event_time` over `TimeResolver` +
+  `is_offset_mismatch`, no policy duplicated. Card state was lagging the PR (blocked);
+  completed by orchestrator with gates on the merged tree.
+- **PR #7 p1-04 capabilities+classifier -> `fc87204`** (5,069 lines — big, but the
+  substance justified it): the catch of the day — (5,34)/(5,105) were catalog-named GRANTED
+  passes shipped as INFO, i.e. **real punches silently dropped**; now sourced from two
+  vendored catalogs with per-row `src:`, doc §3 generated + byte-pinned by guard,
+  `AUTH_PASS_MINORS` derived not hand-listed. Also: malformed-host exit-2 contract, `--json`
+  always machine-readable, IDNA UnicodeError -> transport class, subprocess socket-guard for
+  CLI tests. No POST added; registry guard extended for the documented GET only.
+- **Process**: afternoon PRs #10-#13 (p1-07 contract + doc/chore fixes) were merged by
+  kanban runs, not by me — same self-merge hazard as PR #6; content spotless on spot-check
+  this time. Reminder stands: **merges are orchestrator-only**.
+- **Main**: 743 tests, ruff clean, offline CI green. P1 remaining: p1-08 CLI (ready),
+  p1-09 suite (todo), then owner's P1-10 live smoke. Blocked-duplicate cards left blocked.
+
 ## 2026-10-16 morning — review cycle 2: all four open PRs merged, main at 401 tests
 
 - **PR #4 p1-02 credentials -> `ac6c91d`.** flag>env>keychain verified vs DESIGN.md
