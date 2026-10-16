@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -444,6 +447,150 @@ def test_named_codes_trace_to_a_vendored_catalog() -> None:
             f"({major},{minor}) {info.name} named in EVENT_CODE_TABLE but present in "
             "neither vendored catalog — an unnamed code stays info+unknown_code instead"
         )
+
+
+def gen_reference() -> ModuleType:
+    """Import `scripts/gen_code_reference.py` as a module (same trick as the
+    byte-identical pin below) so the provenance guard is checked by the SAME code the
+    generator runs — a guard that only exists in this file could be bypassed by
+    `gen_code_reference.py --write`."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "gen_code_reference",
+        Path(__file__).resolve().parents[1] / "scripts" / "gen_code_reference.py",
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def src_audit() -> list[str]:
+    """Every provenance defect in the shipped table, as computed by the generator's own
+    `audit_src` over the vendored fixtures."""
+    mod = gen_reference()
+    return mod.audit_src(EVENT_CODE_TABLE, *mod.load_catalogs())
+
+
+def test_src_provenance_resolves_in_the_catalog_it_claims() -> None:
+    """The identifier inside `src` must exist *in the catalog the token names*.
+
+    Review round 2 found the hole behind the pair-existence check above: five rows
+    (5,54/57/60/61/66) claimed `nr+mmi:` for minors the node-red table does not contain,
+    and nothing failed — because the earlier guard only asked "does some catalog have this
+    (major,minor)?", never "does the cited catalog call it what `src` says?". `audit_src`
+    recomputes the only admissible `src` per row from the fixtures (a two-source row cites
+    the node-red identifier; a single-source row cites that catalog's own name) and
+    compares exactly, so both a wrong catalog token and a wrong identifier are defects.
+    """
+    problems = src_audit()
+    assert not problems, "EVENT_CODE_TABLE provenance does not resolve:\n  " + "\n  ".join(problems)
+
+
+def test_src_audit_catches_a_fabricated_identifier() -> None:
+    """Negative control for the guard above — the reviewer's exact repro.
+
+    Without this, `audit_src` could pass by being vacuous. Each mutant keeps a REAL
+    (major,minor) pair and changes only the citation, which is the class of defect that
+    survived the previous round's checks."""
+    mod = gen_reference()
+    nr, mmi = mod.load_catalogs()
+    mutations = {
+        # claims node-red + mmisobuj, with a name neither catalog has
+        (5, 16): "nr+mmi:MINOR_TOTALLY_INVENTED_NAME_NOT_IN_ANY_CATALOG",
+        # the round-2 defect verbatim: mmisobuj-only minor cited as node-red
+        (5, 54): "nr+mmi:MINOR_FACE_AND_FP_VERIFY_PASS",
+        # a real mmisobuj identifier under the wrong catalog token
+        (5, 105): "nr+mmi:peopleAndIdCardComparePass",
+        # a real pair downgraded to a catalog that does not have it
+        (5, 75): "mmi:faceVerifyPass",
+        # and no provenance at all
+        (5, 1): None,
+    }
+    for (major, minor), src in mutations.items():
+        mutated = dict(EVENT_CODE_TABLE)
+        mutated[(major, minor)] = replace(EVENT_CODE_TABLE[(major, minor)], src=src)
+        problems = mod.audit_src(mutated, nr, mmi)
+        assert problems, f"fabricated src on ({major},{minor}) was not caught: {src!r}"
+        assert any(f"({major},{minor})" in p for p in problems), problems
+
+
+def test_src_audit_catches_a_code_no_catalog_names() -> None:
+    """The other direction: an invented (major,minor) row must be refused by the audit,
+    so `--write` can never publish a code the catalogs do not contain."""
+    mod = gen_reference()
+    nr, mmi = mod.load_catalogs()
+    mutated = dict(EVENT_CODE_TABLE)
+    mutated[(5, 4242)] = CodeInfo(name="INVENTED_PASS", outcome=Outcome.GRANTED, src="mmi:x")
+    problems = mod.audit_src(mutated, nr, mmi)
+    assert any("(5,4242)" in p for p in problems), problems
+
+
+def test_generator_refuses_to_write_unresolvable_provenance() -> None:
+    """The laundering path, closed: `--write` regenerates §3.1 *from* the row's own `src`,
+    so a fabricated citation would otherwise become self-corroborating documentation.
+    `require_clean_provenance` runs before anything is printed or written."""
+    mod = gen_reference()
+    mutated = dict(EVENT_CODE_TABLE)
+    mutated[(5, 16)] = replace(
+        EVENT_CODE_TABLE[(5, 16)],
+        src="nr+mmi:MINOR_TOTALLY_INVENTED_NAME_NOT_IN_ANY_CATALOG",
+    )
+    with pytest.raises(SystemExit) as raised:
+        mod.require_clean_provenance(mutated)
+    assert "(5,16)" in str(raised.value)
+    # and the shipped table passes it, so the refusal is not unconditional
+    mod.require_clean_provenance(EVENT_CODE_TABLE)
+
+
+def test_write_command_refuses_before_touching_the_doc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring, not just the helper — the reviewer's repro inverted.
+
+    His probe: set (5,16)'s `src` to a fabricated identifier, run
+    `gen_code_reference.py --write`, whole suite stayed green (the doc is generated from
+    the same string, so regeneration *corroborated* the lie). The suite now fails on that
+    mutation regardless; this pins the other half — that the `--write` command itself
+    refuses, rather than only the test noticing afterwards. Runs the real `main()` with a
+    patched table and a redirected doc path, then asserts the doc was never written."""
+    mod = gen_reference()
+    target = tmp_path / "acs-event-codes.md"
+    target.write_text("SENTINEL\n", encoding="utf-8")
+    mutated = dict(EVENT_CODE_TABLE)
+    mutated[(5, 16)] = replace(EVENT_CODE_TABLE[(5, 16)], src="mmi:notWhatTheCatalogSays")
+    monkeypatch.setattr(mod, "EVENT_CODE_TABLE", mutated)
+    monkeypatch.setattr(mod, "DOC", target)
+    monkeypatch.setattr(sys, "argv", ["gen_code_reference.py", "--write"])
+    with pytest.raises(SystemExit):
+        mod.main()
+    assert target.read_text(encoding="utf-8") == "SENTINEL\n", "--write edited the doc anyway"
+
+
+def test_doc_node_red_column_agrees_with_the_src_token() -> None:
+    """The self-contradiction the reviewer read off the generated table: a row whose `src`
+    claims node-red must show a node-red name in §3.1, and a row that does not claim it
+    must show the em dash. Pairs the .md's own columns against the row's provenance."""
+    for (major, minor), row in reference_doc_rows().items():
+        src = row["src"]
+        claims_nr = src.startswith(("nr:", "nr+mmi:"))
+        shows_nr = row["nr"] not in {"", "—"}
+        assert claims_nr == shows_nr, (
+            f"({major},{minor}) src={src!r} claims node-red={claims_nr} but the doc's "
+            f"node-red column reads {row['nr']!r}"
+        )
+
+
+def test_five_face_combo_rows_are_mmisobuj_only() -> None:
+    """Pin the round-2 correction itself: these five minors exist in mmisobuj and NOT in
+    the node-red hex table, so they must be cited single-source."""
+    nr, mmi = vendor_catalogs()
+    for minor in (54, 57, 60, 61, 66):
+        assert minor not in nr, f"node-red unexpectedly has minor {minor}"
+        assert (5, minor) in mmi
+        info = EVENT_CODE_TABLE[(5, minor)]
+        assert info.src == f"mmi:{mmi[(5, minor)]['name']}", (minor, info.src)
 
 
 def test_outcome_follows_the_catalog_except_where_declared() -> None:

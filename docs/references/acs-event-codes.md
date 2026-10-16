@@ -324,11 +324,11 @@ the catalog outcome verbatim.
 | 5 | 40 | MINOR_CARD_FINGERPRINT_VERIFY_PASS | cardFingerprintVerifyPass | granted | CARD_AND_FINGERPRINT_PASS | granted | `nr+mmi:MINOR_CARD_FINGERPRINT_VERIFY_PASS` |
 | 5 | 49 | MINOR_FINGERPRINT_INEXISTENCE | fingerprintInexistence | denied | FINGERPRINT_INEXISTENCE | denied | `nr+mmi:MINOR_FINGERPRINT_INEXISTENCE` |
 | 5 | 51 | MINOR_CALL_CENTER | callCenter | info | CALL_CENTER | info | `nr+mmi:MINOR_CALL_CENTER` |
-| 5 | 54 | — | faceAndFpVerifyPass | granted | FACE_AND_FINGERPRINT_PASS | granted | `nr+mmi:MINOR_FACE_AND_FP_VERIFY_PASS` |
-| 5 | 57 | — | faceAndPwVerifyPass | granted | FACE_AND_PASSWORD_PASS | granted | `nr+mmi:MINOR_FACE_AND_PW_VERIFY_PASS` |
-| 5 | 60 | — | faceAndCardVerifyPass | granted | FACE_AND_CARD_PASS | granted | `nr+mmi:MINOR_FACE_AND_CARD_VERIFY_PASS` |
-| 5 | 61 | — | faceAndCardVerifyFail | denied | FACE_AND_CARD_FAIL | denied | `nr+mmi:MINOR_FACE_AND_CARD_VERIFY_FAIL` |
-| 5 | 66 | — | faceCardAndFpVerifyPass | granted | FACE_CARD_AND_FINGERPRINT_PASS | granted | `nr+mmi:MINOR_FACE_CARD_AND_FP_VERIFY_PASS` |
+| 5 | 54 | — | faceAndFpVerifyPass | granted | FACE_AND_FINGERPRINT_PASS | granted | `mmi:faceAndFpVerifyPass` |
+| 5 | 57 | — | faceAndPwVerifyPass | granted | FACE_AND_PASSWORD_PASS | granted | `mmi:faceAndPwVerifyPass` |
+| 5 | 60 | — | faceAndCardVerifyPass | granted | FACE_AND_CARD_PASS | granted | `mmi:faceAndCardVerifyPass` |
+| 5 | 61 | — | faceAndCardVerifyFail | denied | FACE_AND_CARD_FAIL | denied | `mmi:faceAndCardVerifyFail` |
+| 5 | 66 | — | faceCardAndFpVerifyPass | granted | FACE_CARD_AND_FINGERPRINT_PASS | granted | `mmi:faceCardAndFpVerifyPass` |
 | 5 | 75 | MINOR_FACE_VERIFY_PASS | faceVerifyPass | granted | FACE_VERIFY_PASS | granted | `nr+mmi:MINOR_FACE_VERIFY_PASS` |
 | 5 | 76 | MINOR_FACE_VERIFY_FAIL | faceVerifyFail | denied | FACE_VERIFY_FAIL | denied | `nr+mmi:MINOR_FACE_VERIFY_FAIL` |
 | 5 | 77 | MINOR_EMPLOYEENO_AND_FACE_VERIFY_PASS | employeenoAndFaceVerifyPass | granted | EMPLOYEENO_AND_FACE_PASS | granted | `nr+mmi:MINOR_EMPLOYEENO_AND_FACE_VERIFY_PASS` |

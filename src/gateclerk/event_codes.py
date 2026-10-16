@@ -20,9 +20,14 @@ Provenance is data, not a comment (review round 1 asked that a reviewer be able 
 vendor-verified from plausible-sounding): every row carries `src`, the catalog identifier
 it was read from — `nr:` = the node-red vendor hex table (`MAJOR_EVENT-0x5.json`),
 `mmi:` = the mmisobuj decimal catalog (`acs-event-types.json`, the only source that
-states an outcome per code). Consequences, all enforced by tests/test_event_codes.py:
+states an outcome per code), `nr+mmi:` = both. **What a row may put in `src` is computed,
+not chosen**: `scripts/gen_code_reference.py:expected_src` derives the only admissible
+value from the fixtures, and `audit_src` fails the doc generator (and the test suite) on
+any deviation — so a row can neither claim a catalog that has no such code nor cite an
+identifier the catalog does not use for it. Consequences, all enforced by
+tests/test_event_codes.py:
 
-* no row may exist without a `src`;
+* no row may exist without a `src`, and no row may carry a `src` the fixtures contradict;
 * every (major, minor) we name must appear in the generated tables of
   docs/references/acs-event-codes.md §3.1 (the test reads that .md as a data file);
 * where our `outcome` differs from the outcome the doc records for the same code, the
@@ -200,15 +205,21 @@ EVENT_CODE_TABLE: dict[tuple[int, int], CodeInfo] = {
         "fingerprint matched — NOT card (common mislabel)",
     ),
     (5, 40): _c("CARD_AND_FINGERPRINT_PASS", _G, "nr+mmi:MINOR_CARD_FINGERPRINT_VERIFY_PASS"),
-    (5, 54): _c("FACE_AND_FINGERPRINT_PASS", _G, "nr+mmi:MINOR_FACE_AND_FP_VERIFY_PASS"),
-    (5, 57): _c("FACE_AND_PASSWORD_PASS", _G, "nr+mmi:MINOR_FACE_AND_PW_VERIFY_PASS"),
+    # (5,54/57/60/61/66) are mmisobuj-only rows: the node-red hex table has no 0x36,
+    # 0x39, 0x3C, 0x3D or 0x42 (checked against the vendored copy *and* upstream). An
+    # earlier draft cited them `nr+mmi:` with node-red-style names, which the generated
+    # §3.1 table contradicted by printing `—` in its node-red column. `src` is now derived
+    # from the fixtures (scripts/gen_code_reference.py:expected_src), so a row can no
+    # longer claim a catalog that does not contain the code.
+    (5, 54): _c("FACE_AND_FINGERPRINT_PASS", _G, "mmi:faceAndFpVerifyPass"),
+    (5, 57): _c("FACE_AND_PASSWORD_PASS", _G, "mmi:faceAndPwVerifyPass"),
     (5, 60): _c(
         "FACE_AND_CARD_PASS",
         _G,
-        "nr+mmi:MINOR_FACE_AND_CARD_VERIFY_PASS",
+        "mmi:faceAndCardVerifyPass",
         "card+face combined pass",
     ),
-    (5, 66): _c("FACE_CARD_AND_FINGERPRINT_PASS", _G, "nr+mmi:MINOR_FACE_CARD_AND_FP_VERIFY_PASS"),
+    (5, 66): _c("FACE_CARD_AND_FINGERPRINT_PASS", _G, "mmi:faceCardAndFpVerifyPass"),
     (5, 75): _c(
         "FACE_VERIFY_PASS", _G, "nr+mmi:MINOR_FACE_VERIFY_PASS", "face recognized/verified"
     ),
@@ -260,7 +271,7 @@ EVENT_CODE_TABLE: dict[tuple[int, int], CodeInfo] = {
         "fingerprint not enrolled for this person (earlier draft called this "
         "CASE_SENSOR_OPEN, which no catalog names)",
     ),
-    (5, 61): _c("FACE_AND_CARD_FAIL", _D, "nr+mmi:MINOR_FACE_AND_CARD_VERIFY_FAIL"),
+    (5, 61): _c("FACE_AND_CARD_FAIL", _D, "mmi:faceAndCardVerifyFail"),
     (5, 76): _c(
         "FACE_VERIFY_FAIL",
         _D,
