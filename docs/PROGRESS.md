@@ -29,6 +29,40 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-16 morning — review cycle 2: all four open PRs merged, main at 401 tests
+
+- **PR #4 p1-02 credentials -> `ac6c91d`.** flag>env>keychain verified vs DESIGN.md
+  Credential plumbing; `Secret` masks in repr/str + identity-equality (closes the
+  pytest-assertion-diff leak path); `security ... -w` + exit-44 -> actionable
+  `CredentialUnavailable`; p1-03 gets a *callable* provider, never a baked plaintext.
+  Committed config example uses TEST-NET hosts — no device IP, no password literals (grepped).
+- **PR #5 p1-03 transport -> `5df152b`.** Card policy all verified in code: `uri=` carries
+  query (the HA2/401-loop trap), digest session reuse + one-client-per-thread pinned, 401
+  terminal + `lockStatus/unlockTime` circuit breaker, busy backoff capped, 10/30s timeouts,
+  search retries byte-identical with same `searchID`, read-only registry guard. Conflict
+  with #4 in `exceptions.py` (both added classes at same anchor) resolved on-branch by
+  orchestrator (`b86dd44`); merged tree gated before merge.
+- **PR #6 p1-06c mismatch -> `6f00c7e` — merged WRONG on process.** The card was assigned
+  to `gateclerk-orch` (me) as a *worker*, and the session that "reviewed" it merged its own
+  PR — the self-merge the policy forbids. Content re-verified by me post-merge (probe:
+  summer +02 flags, missing claim -> None not False, GTB winter agrees), so the merge
+  stands. **Fix: workers are backend-engineer/qa/reviewer — never gateclerk-orch; merges
+  are orchestrator-only.**
+- **PR #2 p1-06 tz core -> `58650e0`.** The "no push since 22:12" reading was stale: the
+  worker HAD pushed the review fixes at 01:08 (`eec6658`: unpadded clock components
+  accepted — my ask #2 — plus a real find: the DTD scan head-window was bypassable via
+  padding, now whole-payload). I merged main into the branch, gated (401 tests, ruff,
+  probes: unpadded OK / range still refused / padded-DTD refused) and merged. Scope ask
+  (five concerns in one module) handled as planned via ownership cards, not a rewrite.
+- **Card hygiene**: t_c9c62093 (worker-written, stale pre-review plan) blocked as
+  superseded by t_7b073d11 (tz.py re-exports isapi_response's guard;
+  `read_system_time` stays in tz.py). p1-06d correctly blocked itself pre-merge and is
+  now re-scoped + unblocked as the thin `resolve_event_time` wrapper over
+  `TimeResolver` + `is_offset_mismatch` — do not re-implement policy there.
+- **Main**: 401 tests, ruff check+format clean, offline CI green. Ready queue: p1-04,
+  p1-05, p1-07, p1-06d, t_7b073d11 dedupe, t_d1c511fc docs. Next review wave = their PRs;
+  then p1-08 CLI -> p1-09 suite -> owner's P1-10 live smoke.
+
 ### 2026-10-16 00:15 — first review cycle (PR #2 + PR #3)
 - **PR #3 (p1-06b tz dialect) reviewed + merged** → main `b1c7bd6`. Verified on the
   worktree, not from the PR body: 99 tests green, ruff clean, and all four dialects decode
