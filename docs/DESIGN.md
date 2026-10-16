@@ -108,41 +108,74 @@ advertised max and never assume — sending more is silently clamped on some fir
 
 ## Event model (normalized)
 
+Implemented by p1-07 in `src/gateclerk/model.py`. The field list below is the contract;
+`gateclerk.model.RECORD_JSON_KEYS` is its machine-readable twin and
+`tests/test_model.py::test_record_key_set_is_the_documented_contract` pins it by
+enumeration, so a rename here and there cannot drift apart unnoticed. Ten of the
+time-related keys (`event_time_utc`, `event_time_local`, `tz_offset_min`,
+`tz_offset_min_device`, `tz_source`, `iana_tz`, `tz_unresolved`, `tz_ambiguous`,
+`tz_nonexistent`, `tz_reason`) are consumed **verbatim** from
+`gateclerk.tz.ResolvedTime.as_record()` (p1-06) — see `model.tz_fields_from_record()`,
+which refuses a block that renames one. `tz_offset_mismatch` is the eleventh and the
+only one not emitted there: it is our own comparison, filled by p1-06c.
+
 ```
 site                 str   config-level: 'site-a' — the agent knows its own site
 device_serial        str   from deviceInfo, part of idempotency key
 serial_no            int   device's own monotonic event counter, part of key.
                            Counts ALL events incl. noise → checkpoint on it device-wide
 employee_no          str   employeeNoString (preferred; employeeNo is the int form and
-                           truncates leading zeros / alphanumeric employee ids)
+                           truncates leading zeros / alphanumeric employee ids). Stored
+                           NFC-normalized so two spellings of one id are one person
 name                 str   display name as the device reports it (strip UserInfo
                            'password' hash key; never store it)
-event_time_utc       datetime (tz-aware UTC)  — site-tz policy, see Time handling
+event_time_utc       datetime (tz-aware UTC)  — site-tz policy, see Time handling.
+                           None when unresolvable — that is data, not a dropped event
 event_time_local     str   verbatim device string, e.g. 2026-10-12T14:11:16+02:00
+tz_offset_min        int   the offset we actually used for the UTC math (site zone)
 tz_offset_min_device int   the offset the device claimed (WRONG on site-a — audit only)
-tz_source            enum  site-tz (primary) | unresolved
-tz_offset_mismatch   bool  device offset ≠ site offset at that instant (flag, don't fix)
+tz_source            enum  site-tz (primary) | string-offset | unresolved
+iana_tz              str   the site zone we resolved with (config value)
+tz_unresolved        bool  could not resolve → kept + flagged, never assumed UTC
+tz_ambiguous         bool  autumn fold: the FIRST occurrence is the one we resolved
+tz_nonexistent       bool  spring gap: kept as stamped, not shifted
+tz_reason            str   why it is unresolved / not resolved as expected
+tz_offset_mismatch   bool|null  device offset ≠ site offset at that instant (flag, don't
+                           fix). None = no claim to compare — NOT the same as "agrees"
 direction            enum  in | out | unknown   — derived, see below
 attendance_status    str   device's own attendanceStatus if non-null (site-a: always null)
-direction_source     enum  device | inferred | none
+direction_source     enum  device | inferred | none — `inferred` is a CONSUMER's
+                           (P3) attribution; the connector never writes it (p1-07)
 verify_mode          str   currentVerifyMode verbatim (on this fw: 'cardOrFaceOrFp' for
                            every real pass — it does NOT distinguish face vs card;
                            'invalid' on door/noise events — no silent normalisation)
 major / minor        int   raw codes, always kept
 outcome              enum  granted | denied | info   (info = noise/door/button/unknown)
+unknown_code         bool  (major,minor) not in the curated table → info, kept, never dropped
+encrypted_person_data bool name reads as a base64 blob (see Failure modes) → flagged,
+                           and still stored verbatim: a false positive costs a flag
 raw                  json  the untouched device record
+captured_at          datetime  when WE read it (not a device fact; never in a key)
 ```
 
 **Noise filter is part of the contract:** site-a logs `major=3,minor=1029` every
 minute on the minute (10,169 of 10,199 events — a remote-op/cloud heartbeat). Only
 `major=5, outcome=granted, employee_no present` (minor 75 here; 38 card-pass if it ever
 appears) are punch candidates. Everything is still *stored* (raw + flags); filtering is
-a query-time property, so a misclassification never loses data.
+a query-time property, so a misclassification never loses data. Exposed as the record
+property `EventRecord.is_punch_candidate` — a property, never a filter applied by the
+model (p1-04 owns the full rule incl. `AUTH_PASS_MINORS`).
 
 Idempotency key = `(device_serial, serial_no)`. `UPSERT` on it, so re-polling an overlap
 window is free — which is how we heal a crash mid-page or a device clock step.
 Secondary guard: `(employee_no, event_time_local, minor)` dedupe for devices whose
 `serialNo` resets after a firmware upgrade / log clear.
+Both are published as stable digests for the P2 store's UNIQUE columns:
+`model.idempotency_key_hash/json` and `model.fingerprint_key_hash/json`, sha256 over
+canonical JSON (`sort_keys`, NFC strings, UTC ISO datetimes) under the algorithm tag
+`KEY_ALGORITHM`. The JSON form is stored alongside the hash so a collision is visible
+to a human instead of silently merging two punches. `model.to_jsonl()/from_jsonl()` is
+the P2→ingest push payload format.
 
 ### in/out: the two real options (device probe settled the first one — see OBSERVED.md)
 

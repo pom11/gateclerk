@@ -1,0 +1,120 @@
+{
+  "_comment": [
+    "Synthetic fixture (NOT recorded from the device). Site-a returned plaintext names",
+    "on the 2026-10-15 probe and advertises no encryption capability at all",
+    "(`GET /ISAPI/Security/encryption/capabilities` -> 404 notSupport, OBSERVED.md), so",
+    "the encrypted-blob shape cannot be captured here; this file carries it for the",
+    "detector + flag tests in tests/test_model.py.",
+    "Shapes follow docs/references/acs-event-codes.md section 5 and the recorded",
+    "events_major5_page1.json record layout. `expect_encrypted` is the asserted",
+    "encrypted_person_data value; `name` is always stored verbatim, never rewritten.",
+    "Masking policy as everywhere: no real names, serials, nonces or credentials."
+  ],
+  "InfoList": [],
+  "cases": [
+    {
+      "id": "base64_blob",
+      "expect_encrypted": true,
+      "_note": "what an encrypted-person-data site would put in `name`",
+      "event": {
+        "major": 5,
+        "minor": 75,
+        "time": "2026-10-12T08:01:02+02:00",
+        "cardType": 1,
+        "name": "VGhpc0lzQ0lwaGVyTm90QVBlcnNvbk5hbWU=",
+        "cardReaderNo": 1,
+        "doorNo": 1,
+        "employeeNoString": "0007A",
+        "type": 0,
+        "serialNo": 6100,
+        "userType": "normal",
+        "currentVerifyMode": "cardOrFaceOrFp",
+        "mask": "no"
+      }
+    },
+    {
+      "id": "base64_blob_no_padding",
+      "expect_encrypted": true,
+      "_note": "unpadded blob of the same family",
+      "event": {
+        "major": 5,
+        "minor": 75,
+        "time": "2026-10-12T08:01:40+02:00",
+        "name": "3kD9xv2Qm7Zp4Ln8Yb6Tc1Rs0We5",
+        "employeeNoString": "0007B",
+        "serialNo": 6102,
+        "currentVerifyMode": "cardOrFaceOrFp"
+      }
+    },
+    {
+      "id": "hyphenated_name",
+      "expect_encrypted": false,
+      "_note": "long and base64-shaped but not base64 (hyphen is outside the alphabet)",
+      "event": {
+        "major": 5,
+        "minor": 75,
+        "time": "2026-10-12T08:02:10+02:00",
+        "name": "Popescu-Ionescu",
+        "employeeNoString": "1",
+        "serialNo": 6104,
+        "currentVerifyMode": "cardOrFaceOrFp"
+      }
+    },
+    {
+      "id": "base64_looking_real_name",
+      "expect_encrypted": false,
+      "_note": "13 chars all in the base64 alphabet; too short and no digit",
+      "event": {
+        "major": 5,
+        "minor": 75,
+        "time": "2026-10-12T08:02:40+02:00",
+        "name": "Annemariel",
+        "employeeNoString": "2",
+        "serialNo": 6106,
+        "currentVerifyMode": "cardOrFaceOrFp"
+      }
+    },
+    {
+      "id": "diacritic_name",
+      "expect_encrypted": false,
+      "_note": "outside the base64 alphabet; must survive byte-equal through the round trip",
+      "event": {
+        "major": 5,
+        "minor": 75,
+        "time": "2026-10-12T08:03:10+02:00",
+        "name": "ĐẶNG THỊ HOÀNG YẾN",
+        "employeeNoString": "0008",
+        "serialNo": 6108,
+        "currentVerifyMode": "cardOrFaceOrFp"
+      }
+    },
+    {
+      "id": "short_base64",
+      "expect_encrypted": false,
+      "_note": "below the length floor: 'dGVzdA==' is 'test' but a 8-char name can look identical",
+      "event": {
+        "major": 5,
+        "minor": 75,
+        "time": "2026-10-12T08:03:40+02:00",
+        "name": "dGVzdA==",
+        "employeeNoString": "9",
+        "serialNo": 6110,
+        "currentVerifyMode": "cardOrFaceOrFp"
+      }
+    },
+    {
+      "id": "door_event_no_name",
+      "expect_encrypted": false,
+      "_note": "the recorded same-second door partner: no name at all",
+      "event": {
+        "major": 5,
+        "minor": 21,
+        "time": "2026-10-12T08:01:06+02:00",
+        "doorNo": 1,
+        "type": 0,
+        "serialNo": 6101,
+        "currentVerifyMode": "invalid"
+      }
+    }
+  ]
+}
