@@ -85,6 +85,13 @@ REGISTRY: dict[str, Endpoint] = {
             "maxResults this model actually accepts — we read it instead of guessing",
         ),
         Endpoint(
+            "access_control_capabilities",
+            "/ISAPI/AccessControl/capabilities",
+            HttpMethod.GET,
+            "AccessControl-wide caps (event ring capacity etc.) — advisory context for "
+            "the rolling-log question; absent on some firmware, which is not an error",
+        ),
+        Endpoint(
             "user_info_count",
             "/ISAPI/AccessControl/UserInfo/Count",
             HttpMethod.GET,

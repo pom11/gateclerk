@@ -277,6 +277,25 @@ class IsapiClient:
                     content=content,
                     headers=headers or None,
                 )
+            except UnicodeError as exc:
+                # The request died before it reached the resolver. `socket.getaddrinfo`
+                # idna-encodes the host *before* querying DNS, so `.localhost`,
+                # `localhost..` and any label >= 64 chars die here as UnicodeError
+                # ("label empty or too long"); an `xn--` A-label with an invalid payload
+                # dies one frame earlier in httpx's URL layer as idna.IDNAError — which is
+                # a UnicodeError subclass, so this one clause covers both. Neither is an
+                # httpx.TransportError, so the branch below would never wrap them and the
+                # CLI printed a raw traceback with exit 1 (review round 2). Same class as
+                # the `[Errno 8] nodename nor servname` case: an unusable name is transport
+                # (exit 4), not config. Not retried — a name that cannot be encoded never
+                # becomes encodable. `exc!r` is in the message because the *other* thing
+                # that can raise a UnicodeError here is a lone surrogate in a search body,
+                # and the operator deserves to see which one it was.
+                raise IsapiError(
+                    f"request to {self._client.base_url} failed before it left the "
+                    f"process: {exc!r} — most likely the host name cannot be encoded "
+                    "for DNS lookup (check --host); nothing was sent, so nothing was retried"
+                ) from exc
             except httpx.TransportError as exc:
                 self._raise_if_local_network(exc)
                 if transport_left > 0:

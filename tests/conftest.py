@@ -1,6 +1,6 @@
 """Offline test setup for the whole suite.
 
-Two hard guarantees, both mechanical rather than advisory:
+Three hard guarantees, all mechanical rather than advisory:
 
 1. No test may reach the network. A real Hikvision terminal sits on a site LAN and a
    stray socket here would either hang CI or, worse, hit a door controller. `netoff`
@@ -8,12 +8,23 @@ Two hard guarantees, both mechanical rather than advisory:
    and only under GATECLERK_LIVE=1.
 2. The live suite is inert unless a human opts in, twice: `-m "not live"` in
    pyproject addopts, plus the GATECLERK_LIVE gate below.
+3. `cli_child` runs the real CLI in a **subprocess** whose socket layer is guarded, for
+   the cases the in-process guard cannot express: code paths where the network failure
+   itself is the thing under test (a host name that dies in the IDNA encoder, say), and
+   the `main()`/console-script entry point, which the in-process CliRunner does not use.
+   The child refuses to resolve a name or build a socket; the only way a test there can
+   pass is if the code handles the failure without ever needing either.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import socket
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -70,3 +81,111 @@ def network_blocked() -> type[Exception]:
     games around importing `tests.conftest` itself.
     """
     return NetworkBlockedError
+
+
+# --- the guarded subprocess ---------------------------------------------------------------
+#
+# Why a subprocess at all: the in-process `netoff` guard replaces socket I/O with a
+# raise, which is right for almost everything but cannot express two cases —
+#   * a test whose SUBJECT is the failure to encode/resolve a host name (patching
+#     getaddrinfo wholesale would hide the very IDNA step under test), and
+#   * the `main()`/console-script path, which `typer.testing.CliRunner` bypasses.
+#
+# The child reproduces the OS's behaviour deterministically, with no egress:
+# `socket.getaddrinfo` performs the idna encode CPython would do (so a malformed name
+# still fails exactly as it fails in production) and then refuses the lookup as
+# `gaierror(8, ...)`, which is what a real resolver answers for a name it does not know.
+# httpx wraps that as `ConnectError`, so the transport behaves as it would on the LAN —
+# but no packet can leave, and the child also refuses to construct a socket at all.
+# Every name that survives the encode is recorded, so a test can assert whether the code
+# under test died *before* or *after* the resolver was reached.
+
+_CHILD_PROGRAM = r"""
+import json, sys
+import gateclerk.cli                     # FIRST: importing httpx/ssl needs a real socket
+import socket
+
+_reached_resolver = []
+
+def _encode_then_refuse(name, *args, **kwargs):
+    str(name).encode("idna")           # the exact step production fails in
+    _reached_resolver.append(str(name))  # only a name that ENCODES gets this far
+    raise socket.gaierror(8, "nodename nor servname provided, or not known")
+
+socket.getaddrinfo = _encode_then_refuse
+socket.socket = lambda *a, **k: (_ for _ in ()).throw(
+    AssertionError("child constructed a socket"))
+
+_exit = 99
+try:
+    _exit = gateclerk.cli.main()
+except BaseException:                   # noqa: BLE001
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+print("@@GATECLERK_CHILD@@" + json.dumps(
+    {"exit": _exit, "reached_resolver": _reached_resolver}))
+sys.exit(_exit)
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class ChildResult:
+    """What the guarded child reported: the CLI's exit code, its stdout, and every name
+    that got as far as a resolver lookup (empty means the code died before DNS)."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    reached_resolver: list[str] = field(default_factory=list)
+
+    @property
+    def json_rows(self) -> list[dict]:
+        """JSON lines the CLI printed, for --json assertions."""
+        rows = []
+        for line in self.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("{") or line.startswith("["):
+                rows.append(json.loads(line))
+        return rows
+
+    def last_json(self) -> dict:
+        return self.json_rows[-1]
+
+    @property
+    def all_output(self) -> str:
+        return self.stdout + self.stderr
+
+
+@pytest.fixture
+def cli_child() -> Callable[..., ChildResult]:
+    """Run `gateclerk.cli.main()` in a socket-guarded child process.
+
+    Deliberately NOT the CliRunner: this exercises the real entry point over the real
+    httpx transport (no monkeypatching), which is the only way to test a failure that
+    happens *inside* the transport.
+    """
+
+    def run(*args: str, timeout: float = 120.0) -> ChildResult:
+        proc = subprocess.run(  # noqa: S603 — argv list, no shell, fixed program text
+            [sys.executable, "-c", _CHILD_PROGRAM, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        marker = "@@GATECLERK_CHILD@@"
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith(marker)]
+        if not lines:
+            raise AssertionError(
+                "the guarded child did not report; its stderr was:\n" + proc.stderr
+            )
+        report = json.loads(lines[-1][len(marker) :])
+        stdout = "\n".join(ln for ln in proc.stdout.splitlines() if not ln.startswith(marker))
+        assert report["exit"] == proc.returncode, (report, proc.returncode)
+        return ChildResult(
+            exit_code=proc.returncode,
+            stdout=stdout,
+            stderr=proc.stderr,
+            reached_resolver=report["reached_resolver"],
+        )
+
+    return run

@@ -333,6 +333,74 @@ def test_macos_tcc_no_route_to_host_names_the_permission_fix() -> None:
         client.get("device_info")
 
 
+# --- host names that die before the resolver (review round 2, finding 1) ----------------
+#
+# `socket.getaddrinfo` idna-encodes the host *before* it asks DNS, so `.localhost`,
+# `localhost..` and a 64-char label raise UnicodeError there, and an `xn--` A-label with
+# an invalid payload raises idna.IDNAError one frame earlier, inside httpx's URL layer.
+# Neither class is an `httpx.TransportError` (pinned below, because that is exactly the
+# assumption that made the first fix incomplete), so without an explicit clause they
+# escaped the client — and the CLI with them — as a raw traceback with exit 1.
+
+
+def test_unicode_error_is_not_a_transport_error() -> None:
+    """The precondition for the clause below: `except httpx.TransportError` cannot have
+    caught these, which is why the malformed-host fix needed a second branch."""
+    import idna
+
+    assert not issubclass(UnicodeError, httpx.TransportError)
+    assert not issubclass(idna.IDNAError, httpx.TransportError)
+    # and IDNAError rides under UnicodeError, so one clause covers both shapes.
+    assert issubclass(idna.IDNAError, UnicodeError)
+
+
+def test_host_that_cannot_be_idna_encoded_becomes_isapi_error_not_a_crash() -> None:
+    """The reviewer's `.localhost`: a UnicodeError out of the socket layer must arrive as
+    a typed IsapiError, so `except GateclerkError` in the CLI can map it to an exit code."""
+    device = FakeDevice()
+    err = UnicodeError("label empty or too long")
+    device.add_raw("GET", DEVICE_INFO, err, err)  # twice: proves it is not retried
+    client = make_client(device)
+    with pytest.raises(IsapiError, match="failed before it left the process") as raised:
+        client.get("device_info")
+    assert "label empty or too long" in str(raised.value)
+    assert isinstance(raised.value, GateclerkError), "the CLI's except GateclerkError must catch it"
+
+
+def test_invalid_idna_a_label_is_wrapped_too() -> None:
+    """`xn--` with an invalid payload fails in httpx's URL layer instead (idna.IDNAError).
+    Same contract: a typed error naming the base_url, no traceback."""
+    import idna
+
+    device = FakeDevice()
+    device.add_raw("GET", DEVICE_INFO, idna.IDNAError("Invalid A-label"))
+    client = make_client(device)
+    with pytest.raises(IsapiError, match="Invalid A-label"):
+        client.get("device_info")
+
+
+def test_unencodable_host_consumes_no_retry_budget() -> None:
+    """A name that cannot be encoded will never become encodable, so the transparent
+    transport retry must not be spent on it: one attempt, not 1 + transport_retries."""
+    device = FakeDevice()
+    device.add_raw("GET", DEVICE_INFO, UnicodeError("label too long"))
+    client = make_client(device, transport_retries=5)
+    with pytest.raises(IsapiError, match="nothing was sent"):
+        client.get("device_info")
+    # One trip into the transport layer, zero retries — the retry budget is left intact
+    # for the failure it exists for (a dropped keep-alive).
+    assert len(device.served) == 1
+
+
+def test_search_post_wraps_the_unencodable_host_the_same_way() -> None:
+    """Same clause on the POST path (p1-05 pages through it, so it must not crash there)."""
+    device = FakeDevice()
+    device.add_raw("POST", EVENT_SEARCH, UnicodeError("label too long"))
+    client = make_client(device)
+    with pytest.raises(IsapiError, match="failed before it left the process"):
+        client.search("acs_event_search", {"AcsEventCond": {"searchID": "1", "maxResults": 1}})
+
+
 # --- busy / backoff ------------------------------------------------------------------------
 
 

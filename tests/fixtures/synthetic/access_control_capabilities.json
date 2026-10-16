@@ -1,0 +1,11 @@
+{
+ "AccessControlCap": {
+  "AcsEvent": {
+   "maxCapacity": 300000,
+   "supportSerialNo": "true"
+  },
+  "Face": {
+   "maxCapacity": 3000
+  }
+ }
+}

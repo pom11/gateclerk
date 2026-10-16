@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SYNTHETIC capability XML (child-node idiom) — see the attrs.xml note for why this
+     is synthetic. Same values, second ISAPI spelling: limits as <min>/<max>/<opt>
+     child nodes instead of attributes. -->
+<Capabilities version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+ <AcsEventCond>
+  <searchID><min>1</min><max>64</max></searchID>
+  <maxResults><min>1</min><max>30</max></maxResults>
+  <major><opt>0,1,2,3,5</opt></major>
+  <minorAlarm><opt>1028,1029,1030</opt></minorAlarm>
+  <minorOperation><opt>80,112,113,1024,1025,1029</opt></minorOperation>
+  <minorEvent><opt>1,9,21,22,23,75,76,80</opt></minorEvent>
+  <employeeNoString><min>0</min><max>32</max></employeeNoString>
+ </AcsEventCond>
+ <InfoList>
+  <maxSize>30</maxSize>
+  <currentVerifyMode><opt>face,card,fp,cardOrFaceOrFp</opt></currentVerifyMode>
+  <attendanceStatus><opt>undefined,checkIn,checkOut</opt></attendanceStatus>
+ </InfoList>
+</Capabilities>

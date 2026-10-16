@@ -103,6 +103,9 @@ def test_registry_is_exactly_the_documented_surface() -> None:
         ("device_info", "GET", "/ISAPI/System/deviceInfo"),
         ("system_time", "GET", "/ISAPI/System/time"),
         ("acs_event_capabilities", "GET", "/ISAPI/AccessControl/AcsEvent/capabilities"),
+        # Added by card p1-04 (capability discovery), together with the DESIGN.md
+        # endpoint table entry: AccessControl-wide caps, GET, advisory.
+        ("access_control_capabilities", "GET", "/ISAPI/AccessControl/capabilities"),
         ("user_info_count", "GET", "/ISAPI/AccessControl/UserInfo/Count"),
         ("user_info_search", "POST", "/ISAPI/AccessControl/UserInfo/Search"),
         ("acs_event_search", "POST", "/ISAPI/AccessControl/AcsEvent"),
