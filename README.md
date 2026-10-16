@@ -27,12 +27,51 @@ order, highest first — implemented by card p1-02:
 
 1. `--user` / `--password` flags (one-off debugging only; they land in shell history)
 2. `GATECLERK_USER` / `GATECLERK_PASSWORD`, or per-host `GATECLERK_<SANITIZED_HOST>_USER` / `_PASSWORD`
+   (every non-alphanumeric becomes `_`, so host `192.0.2.10` → `GATECLERK_192_0_2_10_PASSWORD`).
+   An empty variable counts as unset, so a half-filled `.env` falls through instead of
+   sending a blank password at the device's lockout counter.
 3. macOS Keychain, service `gateclerk-hikvision`, account = the device host:
 
 ```bash
-security add-generic-password -s gateclerk-hikvision -a 192.0.2.10 -w \
-  -C 'user=admin'   # comment field carries user=
+# -j is the comment flag (-C is a four-char TYPE code, it will not store this).
+# -w last so the password is prompted, never typed into shell history.
+security add-generic-password -U -s gateclerk-hikvision -a 192.0.2.10 -j 'user=admin' -w
 ```
+
+The `user=` inside that comment is the ISAPI username, used unless a flag, an env var, or
+`sites.toml`'s `isapi_user` overrides it. Check what would be used, without touching the
+device or printing a secret:
+
+```bash
+uv run gateclerk creds explain 192.0.2.10          # the resolution plan for this host
+uv run gateclerk creds check --host 192.0.2.10     # resolve + print the SOURCE, never the pw
+```
+
+`creds check` exits `2` and prints the exact `security` command to run when nothing
+resolves. A password never appears in a repr, a log line, or an error message: it lives in
+a `Secret` whose `repr` is `Secret(***)`, and the ISAPI client is handed a *callable* that
+returns one rather than a password attribute.
+
+## Site config
+
+`sites.toml` (see `sites.toml.example`) holds the non-secret half of a connection — hosts
+are config, passwords never are:
+
+```toml
+[[site]]
+name = "site-a"
+host = "192.0.2.10"
+port = 80
+iana_tz = "Europe/Bucharest"
+isapi_user = "admin"
+keychain_service = "gateclerk-hikvision"
+```
+
+`--site site-a --config sites.toml` resolves host/port/user/service in one step. The tool
+never picks a site for you: `--host` or `--site` is required, even when the file holds
+exactly one block — a leftover `sites.toml` in the current directory must not silently
+choose which door controller to talk to. Unknown keys and out-of-range values are refused
+before any request is built.
 
 ## Read-only, enforced by CI
 

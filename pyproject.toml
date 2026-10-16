@@ -60,7 +60,10 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106"]  # assert + fake passwords in tests are fine
+# assert + fake passwords in tests are fine (S107: FakeDevice's placeholder default
+# "fakepw" is the same policy as S105/S106 — recognisably fake, pinned by
+# tests/test_repo_hygiene.py's PLACEHOLDER)
+"tests/**" = ["S101", "S105", "S106", "S107"]
 # Exception names here are the shared vocabulary named in the p1-03 card body
 # (IsapiAuthError / IsapiBadContent / IsapiBusy / IsapiNotFound); renaming them to
 # satisfy N818 would break the cross-card contract, so the contract wins.
@@ -73,6 +76,9 @@ quote-style = "double"
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+# tests/fakedevice.py is the shared FakeDevice harness; make it importable by name
+# (tests/test_isapi_transport.py: `from fakedevice import ...`) without sys.path games.
+pythonpath = ["tests"]
 # Live device tests are opt-in twice over: the marker expression excludes them, and
 # tests/live/ hard-skips unless GATECLERK_LIVE=1 (see tests/conftest.py). CI runs the
 # default set and therefore never opens a socket to a device.
