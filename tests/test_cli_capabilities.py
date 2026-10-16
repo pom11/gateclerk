@@ -50,10 +50,18 @@ def device() -> FakeDevice:
 
 @pytest.fixture(autouse=True)
 def redirect_transport(monkeypatch: pytest.MonkeyPatch, device: FakeDevice) -> FakeDevice:
-    """Every IsapiClient the CLI builds rides the FakeDevice transport."""
+    """Every IsapiClient the CLI builds rides the FakeDevice transport.
+
+    The base_url the CLI assembled is *recorded*, not asserted here: a malformed --host
+    must reach IsapiClient so httpx gets to reject it (the exit-2 contract under test in
+    test_malformed_host_exits_config_error_with_no_traceback). The wiring assertion lives
+    in test_client_url_is_assembled_from_host_and_port, where the host is well-formed.
+    """
+    seen: list[str] = []
+    device.assembled_base_urls = seen  # type: ignore[attr-defined]
 
     def factory(base_url: str, user: str, password: str, **kw: object) -> IsapiClient:
-        assert base_url == f"{BASE_URL}:80"
+        seen.append(base_url)
         return IsapiClient(
             base_url, user, password, transport=device.transport, sleep=lambda _s: None
         )
@@ -113,6 +121,15 @@ def test_command_is_read_only_against_the_wire(device: FakeDevice) -> None:
     run([*BASE, "--json"])
     assert {s.method for s in device.served} == {"GET"}
     assert all(s.path.endswith("format=json") for s in device.served)
+
+
+def test_client_url_is_assembled_from_host_and_port(device: FakeDevice) -> None:
+    """The wiring assertion the redirect fixture used to carry inline: the CLI builds
+    `http://<host>:<port>` from the resolved site, and --port is honoured."""
+    run([*BASE, "--json"])
+    assert device.assembled_base_urls == [f"{BASE_URL}:80"]  # type: ignore[attr-defined]
+    run([*BASE, "--port", "8080", "--json"])
+    assert device.assembled_base_urls[-1] == f"{BASE_URL}:8080"  # type: ignore[attr-defined]
 
 
 def test_password_never_appears_in_output(device: FakeDevice) -> None:
@@ -200,3 +217,76 @@ def test_missing_creds_exits_config_error(monkeypatch: pytest.MonkeyPatch) -> No
 def test_host_is_never_guessed() -> None:
     code, _ = run(["device", "capabilities"])
     assert code not in (0, 3, 4)
+
+
+# --- malformed host: the exit-2 config contract (review round 1, finding 1) --------------
+
+
+#: Hosts the config path must refuse with exit 2: the first group is what httpx refuses
+#: (InvalidURL — NOT a ValueError subclass, which is why `except ValueError` alone let the
+#: reviewer's repro escape as a raw traceback); the second group is what the env-rung name
+#: derivation refuses (host sanitizes to an empty variable name).
+HTTPX_REJECTED_HOSTS = ("[fe80::1", "192.0.2.10:99999", "a\nb", "e\u202evilsite")
+SANITIZER_REJECTED_HOSTS = ("..", "-", "//")
+
+
+@pytest.mark.parametrize("bad_host", HTTPX_REJECTED_HOSTS + SANITIZER_REJECTED_HOSTS)
+def test_malformed_host_exits_config_error_with_no_traceback(bad_host: str) -> None:
+    """A malformed --host is a config problem (exit 2), not a crash (exit 1 + traceback).
+
+    Regression pinned twice over: `except ValueError` in `_client_for` missed
+    httpx.InvalidURL, and `_resolve_creds` missed the ConfigError that `host_env_prefix`
+    raises for a host with no alphanumerics. Both now land on the documented exit 2.
+    """
+    code, out = run(
+        [
+            "device",
+            "capabilities",
+            "--host",
+            bad_host,
+            "--user",
+            "admin",
+            "--password",
+            "fakepw",
+            "--json",
+        ]
+    )
+    assert code == 2, f"malformed host must be the exit-2 config contract, got {code}"
+    lowered = out.lower()
+    assert "traceback" not in lowered and "httpx" not in lowered, out
+    doc = json.loads(out.strip().splitlines()[-1])
+    assert doc["exit_code"] == 2 and doc["error"]
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        *HTTPX_REJECTED_HOSTS,
+        *SANITIZER_REJECTED_HOSTS,
+        "http://[fe80::1",  # httpx *accepts* this shape; the mock box then answers 404
+        "host name with spaces",  # ditto: httpx does not reject it, the device path decides
+        "ftp://host",
+        "x" * 300,
+    ],
+)
+def test_no_host_shape_escapes_with_an_uncaught_exception(host: str) -> None:
+    """The contract, stated as the absence of a crash: any host string either exits with
+    a documented code (2 config / 3 auth / 4 device) or is accepted and served (0, via
+    the mock), but never exits 1 with a traceback. What a host *may* legally be is
+    p1-02's config grammar — deliberately not re-litigated here; this pins only that the
+    CLI converts everything it refuses, instead of escaping."""
+    code, out = run(
+        [
+            "device",
+            "capabilities",
+            "--host",
+            host,
+            "--user",
+            "admin",
+            "--password",
+            "fakepw",
+            "--json",
+        ]
+    )
+    assert code in (0, 2, 3, 4), f"host {host!r} escaped with exit {code}"
+    assert "traceback" not in out.lower()

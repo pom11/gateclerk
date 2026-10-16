@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
+import httpx
 import typer
 
 from gateclerk import __version__
@@ -208,10 +209,17 @@ def _resolve_creds(
     output: OutputFormat,
     keychain: KeychainReader | None = None,
 ) -> cfg.Credentials:
-    """Resolve credentials, converting a failure into the documented exit 2."""
+    """Resolve credentials, converting a failure into the documented exit 2.
+
+    ConfigError is caught alongside CredentialUnavailable on purpose: the env rung derives
+    per-host variable names from the host (`host_env_prefix`), and a host that sanitizes to
+    an empty name (`--host ".."`, `-`, `//`) raises ConfigError from inside that derivation.
+    That is the same config class the p1-08 contract already maps to exit 2; letting it
+    escape printed an uncaught traceback with exit 1 instead.
+    """
     try:
         return resolve_credentials(target, user=user, password=password, keychain=keychain)
-    except CredentialUnavailable as exc:
+    except (CredentialUnavailable, ConfigError) as exc:
         raise _config_exit(output, str(exc)) from exc
 
 
@@ -258,6 +266,11 @@ def _client_for(
     `reveal()` is called here and nowhere else: the plaintext exists from this line to the
     transport's digest object (p1-02's seam). A construction failure is a config problem
     (a bad base_url), so it exits 2 like any other "you have not told me how to reach it".
+
+    The caught pair is deliberate: httpx raises InvalidURL for a malformed URL and it is
+    NOT a ValueError subclass (verified against httpx 0.28 — InvalidURL.__mro__ is
+    (InvalidURL, Exception, ...)), so `--host "[fe80::1"` would otherwise escape as a raw
+    traceback with exit 1 instead of the exit-2 config contract (p1-08).
     """
     try:
         return IsapiClient(
@@ -266,7 +279,7 @@ def _client_for(
             creds.password.reveal(),
             read_timeout=timeout,
         )
-    except ValueError as exc:
+    except (ValueError, httpx.InvalidURL) as exc:
         raise _config_exit(output, str(exc)) from exc
 
 
@@ -376,12 +389,15 @@ def device_capabilities(
     Card size we may ask for, searchID length, the queryable major set and the minor
     code sets all come from here — never from a guessed table. `--json` prints the raw
     bodies too, which is what gets pasted into docs/OBSERVED.md after a live run.
+
+    `fmt` is resolved BEFORE any failure can happen and is what every error path is
+    given: `--json` means "machine-readable, including the errors", and a config failure
+    during host/credential resolution used to print prose while exiting 2, which broke
+    the caller that asked for JSON.
     """
-    target = _resolve_site(
-        host=host, site=site, port=port, sites_file=config, output=output
-    ).target()
-    creds = _resolve_creds(target, user=user, password=password, output=output)
     fmt = OutputFormat.JSON if json_flag else output
+    target = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt).target()
+    creds = _resolve_creds(target, user=user, password=password, output=fmt)
     with _client_for(target, creds, timeout=timeout, output=fmt) as client:
         try:
             caps = discover(client, force_refresh=refresh)
