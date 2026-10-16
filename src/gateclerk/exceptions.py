@@ -8,13 +8,22 @@ The shapes are dictated by docs/DESIGN.md ("Failure modes we design for"): a 401
 terminal (the device locks an account after repeated failures, so we surface it and
 stop rather than looping), and a 400/badParameters is almost always our request shape,
 so the message has to carry the request body verbatim or the error is useless.
+
+Credential/config failures (p1-02) live here too: they are part of the same surface a
+caller has to handle, and `ConfigError` is what `gateclerk` exits 2 on. They must never
+carry a password — hence the redaction base64 below: a `security` stderr fragment or a
+malformed keychain comment has to be explainable in an error message without possibly
+echoing a credential that lives next to it in the same keychain item.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 __all__ = [
+    "ConfigError",
+    "CredentialUnavailable",
     "IsapiAuthError",
     "IsapiBadContent",
     "IsapiBusy",
@@ -22,6 +31,7 @@ __all__ = [
     "IsapiNotFound",
     "NotImplementedYet",
     "GateclerkError",
+    "redact_b64",
 ]
 
 
@@ -31,6 +41,23 @@ class GateclerkError(Exception):
 
 class NotImplementedYet(GateclerkError):
     """Placeholder for a command whose real implementation lands in a later card."""
+
+
+class ConfigError(GateclerkError):
+    """Config or credential resolution failed — the request never left the process.
+
+    p1-08 maps this to exit code 2. Subclasses carry the exact command that would have
+    worked, because "keychain item missing" is only actionable if it names it.
+    """
+
+
+class CredentialUnavailable(ConfigError):
+    """No password could be resolved for a host, or the source refused.
+
+    The message always names the source that was tried and the command or variable that
+    would satisfy it (docs/OBSERVED.md + card p1-02), so the fix is a copy-paste away —
+    never a guess. Never contains the secret itself.
+    """
 
 
 class IsapiError(GateclerkError):
@@ -82,3 +109,25 @@ class IsapiBusy(IsapiError):
 
 class IsapiNotFound(IsapiError):
     """404 — the endpoint does not exist on this model/firmware."""
+
+
+# --- error-message redaction ---------------------------------------------------------
+
+#: A best-effort belt, deliberately narrow. A base64 blob of real bytes ~always mixes
+#: letters and digits and is long; macOS's own error identifiers (`SecKeychainSearchCopyNext`,
+#: `UNIXService`) are CamelCase and digit-free. Requiring a digit inside the run is what
+#: keeps this from eating the diagnostic we are trying to show the user — the failure mode
+#: a looser `[A-Za-z0-9+/]{16,}` had in this file's first draft, which turned
+#: "SecKeychainSearchCopyNext: item could not be found" into "<redacted>: item could not be…".
+_B64 = re.compile(r"(?=[A-Za-z0-9+/]*[0-9])(?=[A-Za-z0-9+/]*[A-Za-z])[A-Za-z0-9+/]{20,}={0,2}")
+
+
+def redact_b64(text: str) -> str:
+    """Blank out base64-shaped runs before a foreign string goes into an error message.
+
+    A `security` stderr line can sit right next to the secret it describes. We want the
+    shape of what went wrong without the payload. This is belt-and-braces on top of
+    `gateclerk.secrets.Secret` (which covers exactly what WE hold, and is the real
+    guarantee); it covers what a subprocess or the OS hands back, best-effort.
+    """
+    return _B64.sub("<redacted>", text)
