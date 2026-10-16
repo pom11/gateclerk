@@ -76,6 +76,7 @@ heal gaps.
 | `/ISAPI/AccessControl/UserInfo/Search` | POST (JSON body) | employee roster, paged. Records carry a `password` hash key — strip before storing |
 | `/ISAPI/AccessControl/AcsEvent` | POST (JSON body) | events, paged |
 | `/ISAPI/AccessControl/AcsEvent/capabilities` | GET | **the important one** — see below |
+| `/ISAPI/AccessControl/capabilities` | GET | AccessControl-wide caps (per-group `maxCapacity`; the `AcsEvent` group's is the event-ring capacity — advisory for open question 4). Absent on some firmware: a 404 `notSupport` here is recorded as data, not failure. |
 | `/ISAPI/AccessControl/AcsEventTotalNum` | POST (JSON body) | the real count endpoint (works: `totalNum` int); advisory cross-check vs `totalMatches`, never a loop bound |
 | `/ISAPI/AccessControl/AcsEvent/Total` | — | **not supported on site-a fw (400 notSupport)** — implemented nowhere |
 
