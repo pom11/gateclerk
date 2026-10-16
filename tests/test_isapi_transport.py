@@ -9,10 +9,19 @@ autouse socket guard in conftest still bites if anything here sprouts a real soc
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
-from fakedevice import BASE_URL, FAKE_HOST, NONCE, FakeDevice
+from fakedevice import (
+    BASE_URL,
+    FAKE_HOST,
+    NONCE,
+    REALM,
+    FakeDevice,
+    parse_digest_header,
+)
 from gateclerk.endpoints import REGISTRY, SEARCH_ENDPOINTS
 from gateclerk.exceptions import (
     IsapiAuthError,
@@ -28,6 +37,8 @@ from gateclerk.isapi_transport import (
     DEFAULT_READ_TIMEOUT,
     IsapiClient,
 )
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures/recorded/site-a-ds-k1t341amf-s"
 
 DEVICE_INFO = "/ISAPI/System/deviceInfo?format=json"
 EVENT_SEARCH = "/ISAPI/AccessControl/AcsEvent?format=json"
@@ -91,13 +102,33 @@ def test_digest_uri_includes_format_json_query() -> None:
 
 
 def test_digest_qop_auth_realm_and_server_match_the_recorded_challenge() -> None:
-    """The fake mirrors OBSERVED.md (realm DS-39DED0D1, qop=auth, Server: webs); the
-    client must complete the flow against exactly that shape."""
+    """The challenge used by FakeDevice is the recorded fixture's, field for field.
+
+    tests/fixtures/recorded/site-a-ds-k1t341amf-s/digest_challenge_401.txt is the
+    masked real 401 (qop="auth", realm DS-39DED0D1, Server: webs). The handshake must
+    complete against exactly that shape — if someone "tidies" the fake into a generic
+    digest server, this test notices the drift from the device truth."""
+    fixture_text = (FIXTURE_DIR / "digest_challenge_401.txt").read_text(encoding="utf-8")
+    header = next(
+        (
+            line
+            for line in fixture_text.splitlines()
+            if line.lower().startswith("www-authenticate:")
+        ),
+        "",
+    )
+    assert header, "fixture digest_challenge_401.txt lost its WWW-Authenticate line"
+    challenge_fields = parse_digest_header(header.split(":", 1)[1].strip())
+    assert challenge_fields["qop"] == "auth"
+    assert challenge_fields["realm"] == REALM
+
     device = FakeDevice()
     device.json_ok("GET", DEVICE_INFO, {"DeviceInfo": {}})
     make_client(device).get("device_info")
-    assert device.served[-1].digest["qop"] == "auth"
-    assert device.served[-1].digest["realm"] == "DS-39DED0D1"
+    sent = device.served[-1].digest
+    assert sent["realm"] == challenge_fields["realm"]
+    assert sent["nonce"] == challenge_fields["nonce"]
+    assert sent["qop"] == "auth"
 
 
 def test_wrong_password_costs_two_requests_and_raises_auth_error() -> None:
