@@ -1,8 +1,16 @@
-"""Output rendering: `json` (machine) and `table` (human) via rich.
+"""Output rendering: `table` (human), `json` (machine) and `jsonl` (streaming) via rich.
 
 `json` is the stable, pipeable form — one JSON document (or JSONL for a sequence) on
 stdout with nothing else mixed in. `table` is the only place rich formatting lives, so
 a later card can add columns without touching command logic.
+
+`jsonl` is the third format and it is NOT cosmetic: `OutputFormat` is a closed choice
+list, so a command cannot expose a format this enum does not name. Card p1-08's
+definition of done asks for `gateclerk events --format jsonl` whose output feeds
+`gateclerk.model.from_jsonl()` losslessly, which is one line per record — i.e. exactly
+what `_render_json` already does. The two spellings are therefore kept as synonyms of
+one behaviour rather than two code paths that can drift; which one a caller reaches for
+is a naming preference, and `test_output.py` pins that the bytes are identical.
 
 Deliberately no business logic here: it takes rows of plain dicts.
 """
@@ -45,9 +53,16 @@ def make_console(**kwargs: Any) -> Console:
 
 
 class OutputFormat(StrEnum):
-    """The two supported renderings. `json` is the stable machine form."""
+    """The three supported renderings. `json` is the stable machine form.
+
+    `jsonl` is a synonym for `json` at this layer (both are one record per line — see
+    the module docstring); it exists because p1-08's contract names `--format jsonl`
+    for the stream that feeds `gateclerk.model.from_jsonl()`, and a command cannot offer
+    a format this enum does not list.
+    """
 
     JSON = "json"
+    JSONL = "jsonl"
     TABLE = "table"
 
 
@@ -67,7 +82,11 @@ def render(
     `columns` selects and orders the table view; json always emits whole records so a
     consumer never silently loses a field because someone tidied a table.
     """
-    if fmt == OutputFormat.JSON:
+    if fmt == OutputFormat.JSON or fmt == OutputFormat.JSONL:
+        # Same renderer on purpose: `model.to_jsonl()`/`from_jsonl()` are one compact
+        # object per line, which is exactly what `_render_json` emits. Two renderers would
+        # be two places for the framing rule (separators, ensure_ascii, trailing newline)
+        # to drift, and a drifted frame is a silently unparseable payroll stream.
         _render_json(rows, stream=stream)
     elif fmt == OutputFormat.TABLE:
         _render_table(rows, columns=columns, stream=stream)

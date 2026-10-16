@@ -60,10 +60,9 @@ serial sessions), injected `sleep`/`clock` so tests never wait.
 What is deliberately NOT here
 -----------------------------
 * Capability discovery / `maxResults` probing — p1-04 (`PagingLimits` is the seam).
-* The `AcsEventTotalNum` cross-check — DESIGN.md's read-only invariant names
-  *exactly two* search POSTs and the registry guard enumerates them; adding the
-  third POST is a reviewed registry change, which belongs with the CLI flag
-  (`--count`, p1-08), not folded into the engine. The engine exposes
+* The `AcsEventTotalNum` cross-check — a third POST is a reviewed registry decision, so it
+  was added with the CLI flag that consumes it (p1-08's `--count`), not folded into the
+  engine that never calls it. The engine exposes
   `SearchSummary` (pages, records, positions) so p1-08 can warn on mismatch
   against `UserInfo/Count` / `AcsEventTotalNum` without the engine owning either.
 * Normalization/classification of records (p1-07) and CLI surface (p1-08).

@@ -17,8 +17,9 @@ disagree, OBSERVED.md wins — it was read off the box. Deep background research
 
 ## Constraints / invariants
 
-- **Read-only.** Only `GET` and the two stateless search `POST`s
-  (`UserInfo/Search`, `AcsEvent`). No `PUT`/`POST` that writes users, faces, cards,
+- **Read-only.** Only `GET` and the stateless search `POST`s listed in
+  `gateclerk.endpoints.SEARCH_ENDPOINTS` (`UserInfo/Search`, `AcsEvent`, and the
+  `AcsEventTotalNum` count probe). No `PUT`/`POST` that writes users, faces, cards,
   doors, schedules. No reboots/upgrades. Nothing in this repo may issue a mutating
   verb; enforced by a test that walks the client's endpoint table and asserts method
   ∈ {GET, search POSTs}. If we ever need a write path, it gets its own flag + its own
