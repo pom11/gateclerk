@@ -123,6 +123,7 @@ class IsapiClient:
         circuit_margin_seconds: float = DEFAULT_CIRCUIT_MARGIN_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.monotonic,
+        transport: httpx.BaseTransport | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         if not base_url.startswith(("http://", "https://")):
@@ -135,6 +136,7 @@ class IsapiClient:
         self._auth = httpx.DigestAuth(username, password)
         self._client = client or httpx.Client(
             base_url=base_url,
+            transport=transport,
             timeout=httpx.Timeout(
                 read=read_timeout,
                 connect=connect_timeout,
@@ -166,6 +168,11 @@ class IsapiClient:
         self._client.close()
 
     # --- public surface: names in, dicts out ------------------------------------------
+
+    @property
+    def timeout(self) -> httpx.Timeout:
+        """The effective timeouts, so a caller (and a test) can see what was configured."""
+        return self._client.timeout
 
     def get(self, name: str) -> dict[str, Any]:
         """GET a registered endpoint and return its body parsed (XML or JSON — the
