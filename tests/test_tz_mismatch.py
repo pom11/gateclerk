@@ -162,24 +162,47 @@ def test_dialect_module_stays_a_leaf_and_clock_free() -> None:
     """The p1-06b invariant this card deliberately did NOT weaken.
 
     tz_dialect.py must not import tz_mismatch (the dialect stays pure text; see
-    test_tz_dialect's own pin), and the mismatch module must not be imported by tz.py —
-    the flag is an observation on the record, never an input to resolution. tz.py only
-    exists once PR #2 merges, so the check is conditional on it being present.
+    test_tz_dialect's own pin), and tz.py must not import tz_mismatch **at module
+    level** — resolution reaching the detector is what must never happen; the flag is an
+    observation on the record, never an input to resolution. p1-06d's `resolve_event_time`
+    façade is the sanctioned exception: a *function-local* import inside the façade, after
+    the instant is already fixed. The relaxation is two-sided on purpose — the façade
+    branch only holds while test_tz.py's ordering pins stay green (flag computed from the
+    resolved result; a mismatch never moves the instant). A future module-level edge would
+    let any resolver code path consult the flag, which is exactly what this pin forbids.
     """
     dialect = (REPO / "src/gateclerk/tz_dialect.py").read_text(encoding="utf-8")
     assert "tz_mismatch" not in dialect
 
     resolver = REPO / "src/gateclerk/tz.py"
     if resolver.exists():
-        imported: set[str] = set()
-        for node in ast.walk(ast.parse(resolver.read_text(encoding="utf-8"))):
+        tree = ast.parse(resolver.read_text(encoding="utf-8"))
+        top_level: set[str] = set()
+        for node in tree.body:  # module body only — function-local imports are the façade's
             if isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module)
+                top_level.add(node.module)
             elif isinstance(node, ast.Import):
-                imported.update(a.name for a in node.names)
-        assert "gateclerk.tz_mismatch" not in imported, (
-            "resolution imported the mismatch detector: the flag must never steer UTC math"
+                top_level.update(a.name for a in node.names)
+        assert "gateclerk.tz_mismatch" not in top_level, (
+            "tz.py imports the mismatch detector at module level: resolution must never "
+            "be able to consult the flag (p1-06d façade uses a function-local import)"
         )
+        # And the delegation must be REAL: the p1-06d façade has to route the flag
+        # through this module, not re-derive a comparison beside the resolver it wraps.
+        facade = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "resolve_event_time"
+            ),
+            None,
+        )
+        if facade is not None:  # p1-06d may not have landed on this revision yet
+            delegated = any(
+                isinstance(node, ast.ImportFrom) and node.module == "gateclerk.tz_mismatch"
+                for node in ast.walk(facade)
+            )
+            assert delegated, "resolve_event_time inlined the mismatch comparison"
 
 
 def test_utc_instant_is_untouched_by_a_mismatch() -> None:
