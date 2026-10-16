@@ -52,6 +52,7 @@ from gateclerk.exceptions import (
 
 __all__ = [
     "MAX_ISAPI_XML_BYTES",
+    "TEXT_KEY",
     "Envelope",
     "envelope_to_error",
     "flatten_xml",
@@ -125,6 +126,34 @@ def parse_isapi_xml(payload: str) -> ET.Element:
         raise IsapiPayloadError(f"ISAPI XML body is not well-formed XML: {exc}") from exc
 
 
+#: Key a leaf's text gets when that leaf also carries attributes (the leaf became a
+#: dict for the `@` keys, so the text needs a name). Convention from the round-1
+#: review on t_a8cdd1a9; `@`/`#text` match the recorded JSON capability fixtures
+#: (`tests/fixtures/recorded/site-a-ds-k1t341amf-s/acs_capabilities.json` uses `@max`).
+TEXT_KEY = "#text"
+
+
+def _flatten_element(el: ET.Element) -> Any:
+    """One element -> its value under the `@`-prefix convention.
+
+    - attributes (always, on any element) become `@`-prefixed keys on that element's
+      dict — an element with no other content flattens to just those keys;
+    - a leaf with attributes AND text becomes `{"@…": …, TEXT_KEY: text}`;
+    - text-only leaves, empty leaves (`None`), and repeated tags (lists) UNCHANGED.
+      Mixed content on an element that has children still drops the leading text, as
+      before — out of scope, ISAPI capability/payload elements are not mixed content.
+    """
+    attrs = {f"@{strip_ns(name)}": value for name, value in el.attrib.items()}
+    if len(el):
+        nested = flatten_xml(el)
+        nested.update(attrs)
+        return nested
+    text = (el.text or "").strip()
+    if attrs:
+        return {**attrs, TEXT_KEY: text} if text else attrs
+    return text if text else None
+
+
 def flatten_xml(root: ET.Element) -> dict[str, Any]:
     """XML -> plain dict, namespace-stripped, repeated tags collected into lists.
 
@@ -137,16 +166,19 @@ def flatten_xml(root: ET.Element) -> dict[str, Any]:
     rather than `""`, so "the device said nothing" stays distinguishable from "the
     device said the empty string" only where it matters, and never silently becomes a
     falsy that a caller mistakes for absence... it stays a key, with `None`.
+
+    Attributes are data, not decoration (review defect #1 of PR #5): the device puts
+    capability limits in XML attributes (`maxResults@max=30`, `searchID@max=64`,
+    `major@opt=…` — OBSERVED.md) and p1-04's clamping reads them through this fallback.
+    They become `@`-prefixed keys on the element's dict, and a leaf with attributes AND
+    text carries its text under `TEXT_KEY` (`"#text"`). An element whose only content
+    was attributes is now that attribute dict — never the silent `None` that made a
+    real capability read as no-data.
     """
     out: dict[str, Any] = {}
     for child in root:
         key = strip_ns(child.tag)
-        value: Any
-        if len(child):
-            value = flatten_xml(child)
-        else:
-            text = (child.text or "").strip()
-            value = text if text else None
+        value = _flatten_element(child)
         if key in out:
             existing = out[key]
             if isinstance(existing, list):

@@ -21,6 +21,7 @@ from gateclerk.exceptions import (
 )
 from gateclerk.isapi_response import (
     MAX_ISAPI_XML_BYTES,
+    TEXT_KEY,
     envelope_to_error,
     flatten_xml,
     parse_body,
@@ -181,6 +182,47 @@ def test_flatten_xml_nests_repeats_and_empty_nodes() -> None:
     body = "<Root><a>1</a><a>2</a><b><c>x</c></b><d></d></Root>"
     flat = flatten_xml(parse_isapi_xml(body))
     assert flat == {"a": ["1", "2"], "b": {"c": "x"}, "d": None}
+
+
+# --- attribute convention (review defect #1 of PR #5) --------------------------------
+#
+# The device puts capability limits in XML attributes (OBSERVED.md: maxResults@max=30,
+# searchID@max=64, major@opt=…). Before this fix they flattened to None — a real
+# capability read as no-data, the failure class this module's docstring forbids. The
+# `@`-prefix spelling is not invented here: the recorded JSON fixtures under
+# tests/fixtures/recorded/site-a-ds-k1t341amf-s/ (acs_capabilities.json) already use
+# `@max`, and p1-04's clamping reads both paths, so XML must agree on the spelling.
+
+
+def test_flatten_xml_capability_attributes_become_at_keys() -> None:
+    """The exact PR #5 repro: `<maxResults max="30" min="1"/>` used to yield None."""
+    flat = flatten_xml(parse_isapi_xml('<Transaction><maxResults max="30" min="1"/></Transaction>'))
+    assert flat == {"maxResults": {"@max": "30", "@min": "1"}}
+    # And it is readable the way the JSON fixture path exposes it (clamping contract):
+    assert flat["maxResults"]["@max"] == "30"
+
+
+def test_flatten_xml_leaf_with_attrs_and_text_keeps_text_under_text_key() -> None:
+    flat = flatten_xml(parse_isapi_xml('<Root><depth mode="auto">4</depth></Root>'))
+    assert flat == {"depth": {"@mode": "auto", TEXT_KEY: "4"}}
+    assert TEXT_KEY == "#text"
+
+
+def test_flatten_xml_attrs_on_parent_merge_into_nested_dict() -> None:
+    """Attributes live *on that element's dict* — an element with children keeps them."""
+    flat = flatten_xml(parse_isapi_xml('<Root><list opt="a,b"><item>1</item></list></Root>'))
+    assert flat == {"list": {"@opt": "a,b", "item": "1"}}
+
+
+def test_flatten_xml_attribute_free_behaviour_unchanged() -> None:
+    """Guard against over-application: the text-only/empty/repeat shapes of the pin
+    above must survive verbatim when no attributes are present."""
+    body = "<Root><a>1</a><a>2</a><b><c>x</c></b><d></d></Root>"
+    assert flatten_xml(parse_isapi_xml(body)) == {
+        "a": ["1", "2"],
+        "b": {"c": "x"},
+        "d": None,
+    }
 
 
 def test_content_type_header_is_never_consulted() -> None:
