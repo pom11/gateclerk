@@ -1005,6 +1005,26 @@ def test_window_for_device_survives_unpadded_bounds() -> None:
 
 
 # --- 10. the XML guard has to be complete (reviewer finding on PR #2) ---------------
+#
+# These two are behaviour pins on the guard p1-06 used to own. The guard now lives in
+# `gateclerk.isapi_response` (p1-03) and `gateclerk.tz.parse_isapi_xml` is a re-export of it
+# (chore t_7b073d11), so they exercise the *imported* parser through this module's public
+# name — the point is that the System/time path still refuses, not that tz.py carries the
+# code. Do not "simplify" them into a mock: the reviewer's probe expanded real entities.
+
+
+def test_tz_parse_isapi_xml_is_the_shared_guard_not_a_second_copy() -> None:
+    """One XML security policy per package: tz.py must re-export, not reimplement.
+
+    A copy that drifts is the bug this pin catches — it is the reason the p1-03/p1-06
+    guards had to be kept "in lockstep" by hand until t_7b073d11 landed. Identity (not
+    just "same behaviour") is what makes a re-implementation fail here.
+    """
+    from gateclerk import isapi_response, tz
+
+    assert tz.parse_isapi_xml is isapi_response.parse_isapi_xml
+    assert tz.IsapiPayloadError is isapi_response.IsapiPayloadError
+    assert "parse_isapi_xml" in tz.__all__ and "IsapiPayloadError" in tz.__all__
 
 
 def test_xml_guard_catches_a_dtd_past_the_head_window() -> None:
@@ -1013,8 +1033,8 @@ def test_xml_guard_catches_a_dtd_past_the_head_window() -> None:
     The first version scanned `payload[:MAX//4]` for `<!DOCTYPE`/`<!ENTITY` and the
     reviewer's probe put the bomb at offset 20 000: it passed the guard and ElementTree
     EXPANDED the internal entities (a 4x4x4 nesting came back as 64 characters, so the
-    expansion is real, not theoretical). The scan is now over the whole payload; this is
-    the regression pin.
+    expansion is real, not theoretical). The scan is over the whole payload; this is the
+    regression pin, now reached through the guard re-exported by tz.py.
     """
     bomb = (
         '<!DOCTYPE Time [<!ENTITY a "aaaa">'

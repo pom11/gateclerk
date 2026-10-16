@@ -33,6 +33,11 @@ Two consequences that are easy to get wrong, both pinned by tests:
 Parsing only: nothing here touches the network. `read_system_time()` takes the body of a
 `GET /ISAPI/System/time` response (this firmware returns **XML** even for `?format=json`
 — OBSERVED.md endpoint table) so the caller owns the transport.
+
+The XML safety guard is NOT owned here: `parse_isapi_xml` is imported from
+`gateclerk.isapi_response` (p1-03, merged as 5df152b) and re-exported so `gateclerk.tz.parse_isapi_xml`
+keeps working for existing callers. One package = one XML security policy; the size cap and
+the whole-payload DTD/entity refusal live in that module and its tests.
 """
 
 from __future__ import annotations
@@ -45,7 +50,8 @@ from typing import Any
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from gateclerk.exceptions import GateclerkError
+from gateclerk.exceptions import IsapiPayloadError, GateclerkError
+from gateclerk.isapi_response import parse_isapi_xml
 
 __all__ = [
     "DEFAULT_SITE_TZ",
@@ -75,21 +81,13 @@ DEFAULT_SITE_TZ = "Europe/Bucharest"
 #: DESIGN.md/OBSERVED.md: skew over this many seconds is a warning *line*, never a write.
 SKEW_WARN_SECONDS = 120.0
 
-#: ISAPI System/* answers are small (< 4 kB observed). The cap bounds the XML path: we
-#: parse XML from a box on the LAN, so bound the input rather than trust it.
-MAX_ISAPI_XML_BYTES = 64 * 1024
-
-# `UTC` is `datetime.UTC` (imported above; an alias of `timezone.utc`). It is used by
-# name at every conversion site in this module so the payroll invariant — every stored
-# instant is UTC — is visible at each call site.
+#: `UTC` is `datetime.UTC` (imported above; an alias of `timezone.utc`). It is used by
+#: name at every conversion site in this module so the payroll invariant — every stored
+#: instant is UTC — is visible at each call site.
 
 
 class TimestampInputError(GateclerkError):
     """A `--since`/`--until` value the operator typed that we cannot interpret."""
-
-
-class IsapiPayloadError(GateclerkError):
-    """A device payload we refused to parse (too big, or declares an XML DTD/entity)."""
 
 
 class TzSource(StrEnum):
@@ -144,36 +142,6 @@ def read_system_time(payload: str | bytes) -> DeviceTime:
         tz_raw=_xml_text(root, "timeZone"),
         note=note,
     )
-
-
-def parse_isapi_xml(payload: str) -> ET.Element:
-    """Parse an ISAPI XML body with two bounds (shared entry point for p1-03).
-
-    `xml.etree.ElementTree` does not resolve external entities, so the remaining hazards
-    are size and entity expansion — both refused here rather than delegated to a
-    dependency that would buy a claim, not a control.
-    """
-    if len(payload.encode("utf-8", "replace")) > MAX_ISAPI_XML_BYTES:
-        raise IsapiPayloadError(
-            f"ISAPI XML body exceeds {MAX_ISAPI_XML_BYTES} bytes — refusing to parse"
-        )
-    # Whole payload, not a head window: the first version scanned only the first 16 kB and
-    # a `<!-- 20 kB of padding -->` before the DTD walked straight past it into
-    # `ET.fromstring`, which then EXPANDED the internal entities (measured: a 4x4x4 bomb
-    # declared at offset 20 000 parsed and expanded). ElementTree resolves no *external*
-    # entities, but internal-entity expansion is real, so the DTD refusal has to be
-    # complete. Scanning 64 kB with `in` is not a cost worth negotiating for that.
-    if "<!DOCTYPE" in payload or "<!ENTITY" in payload:
-        raise IsapiPayloadError("ISAPI XML body declares a DTD or entity — refusing to parse")
-    try:
-        # S314 is suppressed on the line below. defusedxml's controls are DTD/entity
-        # expansion and size, both of which this function refuses explicitly above (any
-        # DOCTYPE/ENTITY is rejected before parsing, and the byte cap is enforced).
-        # ElementTree resolves no external entities on its own, so an extra dependency
-        # would add a claim, not a control.
-        return ET.fromstring(payload)  # noqa: S314
-    except ET.ParseError as exc:
-        raise IsapiPayloadError(f"ISAPI XML body is not well-formed XML: {exc}") from exc
 
 
 def _xml_text(root: ET.Element, name: str) -> str | None:

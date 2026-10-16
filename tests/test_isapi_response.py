@@ -95,8 +95,9 @@ def test_cdata_mentioning_doctype_is_refused_conservatively() -> None:
 def test_read_system_time_shaped_padded_dtd_is_refused() -> None:
     """p1-06 pin ported here (tests/test_tz.py::test_read_system_time_refuses_a_padded_-
     dtd_payload): a System/time body with the DTD behind 20 kB of comment padding is a
-    refusal. Since this module now OWNS parse_isapi_xml, the pin lives where the code
-    lives until p1-06 imports this copy and its own copy retires."""
+    refusal. This module owns parse_isapi_xml, and p1-06's tz.py copy is now retired —
+    since t_7b073d11 `gateclerk.tz.parse_isapi_xml` is a re-export of this one, so the tz
+    pin and this one exercise the same guard."""
     payload = f'<?xml version="1.0"?><!--{"p" * 20_000}--><!DOCTYPE Time><Time/>'
     with pytest.raises(IsapiPayloadError):
         parse_isapi_xml(payload)

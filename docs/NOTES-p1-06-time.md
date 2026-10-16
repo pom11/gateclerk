@@ -87,6 +87,12 @@ states both numbers side by side.
   version scanned 16 kB and the reviewer's probe put an entity bomb behind 20 kB of
   padding, where it was parsed and *expanded*. Pinned by
   `test_xml_guard_catches_a_dtd_past_the_head_window`.
+  **Update (t_7b073d11):** this policy is now owned by `gateclerk/isapi_response.py`
+  (p1-03) and `gateclerk.tz` *imports* it — `gateclerk.tz.parse_isapi_xml` is a re-export,
+  kept so existing callers are unaffected. The two copies are deduped; do not re-add a
+  guard in `tz.py`. The tz pins above still run, now through the imported parser, and
+  `test_tz_parse_isapi_xml_is_the_shared_guard_not_a_second_copy` pins the identity so a
+  future re-implementation fails loudly.
 * **Unpadded clock components are accepted** (`2026-10-15T7:46:48`, review round on
   PR #2). A punch must not become `unresolved` over a zero-padding quirk — that failure
   presents as a payroll gap and is invisible later. The relaxation is only half the fix:
