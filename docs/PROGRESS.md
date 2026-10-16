@@ -87,6 +87,24 @@ device truth: docs/OBSERVED.md.)
 - **Hotspot standing**: `docs/DESIGN.md` touched by PR #7 (open) + PR #11 (open) + this
   merged cycle — sequence the next DESIGN.md edits.
 
+### 2026-10-16 evening — follow-up: t_ca64f6c2 (loose fixture floor) merged → `7cecaa7`
+
+- **PR #13 -> `7cecaa7`** (worker backend-engineer, reviewed by orchestrator, execution
+  lens). The `>= 6` floor gap filed above is closed the stronger way: exact serialNo
+  inventory `{7001..7009}` (ordered-list equality + count), not a `== 9` count. My own
+  5-mutation probe on a scratch copy: drop-one (the F6 repro), duplicate-keeping-count-9,
+  renumber, order-swap, and drop-three-to-6 (what the old floor survived) — all now fail;
+  unmutated green. A bare `== 9` would have survived the duplicate mutation. Merged tree:
+  524 passed / ruff clean. Worker hygiene clean (fixture restored + `git status` checked
+  after every leg, worktree untouched by review). Non-blocking notes: the count assertion
+  after the serialNo equality is logically dead (kept for a clearer message), and the
+  ordered-list pin also freezes entry order — stricter than the docstring wording, fine
+  for an audit baseline, easy to relax intentionally if the fixture is ever reordered.
+- **PR #10 body wording fixed** (merged prose, orchestrator edit): it claimed the guard
+  was "an entry-count floor ... a silently shrunk fixture stops reading as green" — now
+  corrected on the PR itself: what shipped there was the loose floor, tightened to an
+  exact inventory in #13. This was the only stale claim left; no repo file carried it.
+
 ### 2026-10-16 00:15 — first review cycle (PR #2 + PR #3)
 - **PR #3 (p1-06b tz dialect) reviewed + merged** → main `b1c7bd6`. Verified on the
   worktree, not from the PR body: 99 tests green, ruff clean, and all four dialects decode
