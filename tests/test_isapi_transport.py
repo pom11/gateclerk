@@ -495,6 +495,37 @@ def test_unknown_endpoint_name_cannot_smuggle_a_path() -> None:
     assert device.served == []
 
 
+def test_shared_client_refuses_a_second_thread() -> None:
+    """gotchas §1.7b: httpx.DigestAuth state is unlocked — a shared client across
+    threads races the nc counter and can replay (nonce, nc). The client owns one
+    digest session and refuses to be used from a second thread instead."""
+    import threading
+
+    device = FakeDevice()
+    device.json_ok("GET", DEVICE_INFO, {"DeviceInfo": {}})
+    client = make_client(device)
+    client.get("device_info")  # binds the owner thread
+
+    errors: list[BaseException] = []
+
+    def intruder() -> None:
+        try:
+            client.get("device_info")
+        except BaseException as exc:  # collected for the assertion below
+            errors.append(exc)
+
+    thread = threading.Thread(target=intruder)
+    thread.start()
+    thread.join()
+    assert len(errors) == 1 and isinstance(errors[0], GateclerkError)
+    assert "thread" in str(errors[0])
+    # The guard refused BEFORE the transport: only the owner-thread call was served.
+    assert len(device.served) == 2
+
+
+# --- offline guarantee ------------------------------------------------------------------------
+
+
 def test_offline_guard_still_bites_a_real_client(network_blocked: type[Exception]) -> None:
     """Meta-test: if someone points IsapiClient at a real host in a unit test, the
     conftest socket wall intercepts it — the MockTransport path is the only way out."""
