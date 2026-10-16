@@ -24,6 +24,7 @@ from typing import Any
 __all__ = [
     "ConfigError",
     "CredentialUnavailable",
+    "EventBoundsError",
     "IsapiAuthError",
     "IsapiBadContent",
     "IsapiBusy",
@@ -33,6 +34,8 @@ __all__ = [
     "IsapiPayloadError",
     "NotImplementedYet",
     "GateclerkError",
+    "SearchProtocolError",
+    "SearchRunawayError",
     "redact_b64",
 ]
 
@@ -169,6 +172,56 @@ class IsapiBusy(IsapiError):
 
 class IsapiNotFound(IsapiError):
     """404 — the endpoint does not exist on this model/firmware."""
+
+
+# --- paging (p1-05) -------------------------------------------------------------------
+
+
+class SearchRunawayError(GateclerkError):
+    """A paged search hit its hard page cap while the device still said MORE.
+
+    The loop bound is a safety net (DESIGN.md: 10k pages), not a plan: a real walk
+    that reaches it means the device is misbehaving (e.g. serving page 1 forever
+    because the `searchID` changed mid-walk — that restarts silently, no error).
+    Continuing would hammer a small embedded box forever and pretend the data was
+    complete; on a payroll pipeline a truncated pull that *looks* complete is worse
+    than a failed one. p1-08 maps this to exit code 5.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        endpoint: str | None = None,
+        search_id: str | None = None,
+        pages: int | None = None,
+        position: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.endpoint = endpoint
+        self.search_id = search_id
+        self.pages = pages
+        self.position = position
+
+
+class EventBoundsError(GateclerkError):
+    """An AcsEvent query was asked for without startTime/endTime.
+
+    Some firmware answers an unbounded event search with `Invalid Content`; worse,
+    an unbounded walk over the full ~10k history is exactly the slow, page-heavy
+    path DESIGN.md tells us never to take. We refuse the query *before* sending it
+    (docs/DESIGN.md "Paging + checkpoint": ALWAYS include startTime/endTime).
+    """
+
+
+class SearchProtocolError(GateclerkError):
+    """A search response we could not read as a search response (missing root key,
+    non-list record list, non-numeric counters).
+
+    Loud on purpose: `parse_body` turns a corrupt body into `IsapiPayloadError`, and
+    a well-formed body under the wrong root key means the device changed protocol on
+    us. Returning "no records" here would read as "nobody clocked in" — never.
+    """
 
 
 # --- error-message redaction ---------------------------------------------------------
