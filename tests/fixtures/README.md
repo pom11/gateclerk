@@ -12,7 +12,7 @@ serial → `MASKED-SER-1`, mac → `00:11:22:33:44:55`, digest `nonce`/`opaque` 
 | `system_time.xml` | System/time — wrong-offset bug specimen (`+02:00` in Bucharest summer), tz rule `CST-2:00:00DST01:00:00,M3.4.1/00:00:00,M10.5.0/23:00:00` |
 | `acs_capabilities.json` | advertised `maxResults @max=30`, `searchID @max=64`, major opts `0,1,2,3,5`, minorEvent/Alarm/Operation sets |
 | `user_count.json` | `{"UserInfoCount":{"userNumber":4}}` (GET-only endpoint) |
-| `user_search_page1.json` | 4 users, status OK; `password` key stripped |
+| `user_search_page1.json` | 4 users, status OK; `password` key **removed by masking**, so this file cannot demonstrate the strip — `tests/test_model.py::test_password_hash_is_stripped_before_anything_can_store_it` uses an inline body that still carries one |
 | `events_major5_page1.json` | **all 30 punches device-wide**: 18× minor=75 (granted, employeeNoString+name), 6× minor=21 open, 6× minor=22 close; `attendanceStatus` absent on every one |
 | `events_more_noise_page1.json` | major=3/minor=1029 heartbeat, `responseStatusStrg:"MORE"`, total 10130 |
 | `events_no_match.json` | empty window: `"NO MATCH"` (space!), **InfoList key absent** |

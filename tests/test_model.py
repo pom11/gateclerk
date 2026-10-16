@@ -453,6 +453,62 @@ def test_non_direction_statuses_are_kept_verbatim(status: str) -> None:
     assert EventRecord.from_json(record.to_json()).attendance_status == status
 
 
+#: Keys the attendance fixture uses to say what the model must produce. They are test
+#: annotations, not device fields, so they are stripped before the entry becomes `raw` —
+#: `raw` is the untouched *device* record (field contract, DESIGN.md).
+FIXTURE_ANNOTATION_KEYS = frozenset({"expected_direction", "expected_source", "_note", "id"})
+
+
+def device_event(case: dict) -> dict:
+    """One fixture entry with its test annotations removed — the record's `raw`."""
+    return {k: v for k, v in case.items() if k not in FIXTURE_ANNOTATION_KEYS}
+
+
+@pytest.mark.parametrize(
+    "case",
+    load_synthetic("attendance_status_events.json")["InfoList"],
+    ids=lambda case: str(case["serialNo"]),
+)
+def test_attendance_fixture_matches_its_expected_columns(case: dict) -> None:
+    """The attendance-mode shape, asserted — not merely shipped.
+
+    This fixture is the only place in the repo where `attendanceStatus` is populated:
+    site-a is in access-control mode, so every recorded event has it absent (OBSERVED.md).
+    A fixture nobody loads would read as coverage for the direction rule while proving
+    nothing, so each entry is built through the same helper p1-08's pipeline will use and
+    checked against the `expected_*` columns the fixture declares.
+    """
+    event = device_event(case)
+    record = record_from_event(event)
+    who = f"serialNo={case['serialNo']} attendanceStatus={case.get('attendanceStatus')!r}"
+    assert record.direction.value == case["expected_direction"], who
+    assert record.direction_source.value == case["expected_source"], who
+    # Verbatim except the empty/absent collapse and a known vendor spelling: the model
+    # must not rewrite a site-customized label, and must not invent one either.
+    assert record.attendance_status == (case.get("attendanceStatus") or None), who
+    # The fixture's own _comment promises the round trip, and `raw` stays the device entry.
+    back = EventRecord.from_json(record.to_json())
+    assert back.direction.value == case["expected_direction"], who
+    assert back.direction_source.value == case["expected_source"], who
+    assert back.raw == event, who
+
+
+def test_attendance_fixture_annotations_never_reach_raw() -> None:
+    """Pins the strip itself, which the test above cannot pin from inside its own body.
+
+    Without this, a broken `device_event` filter would post `expected_direction` into the
+    store's `raw` column — an audit trail carrying a value the device never sent — and the
+    per-entry assertions would still pass, because they read the same filtered dict.
+    """
+    cases = load_synthetic("attendance_status_events.json")["InfoList"]
+    assert len(cases) >= 6, "the fixture lost entries; the direction table is under-covered"
+    for case in cases:
+        annotated = case.keys() & FIXTURE_ANNOTATION_KEYS
+        assert annotated, f"fixture entry {case['serialNo']} declares no expectation"
+        assert not device_event(case).keys() & FIXTURE_ANNOTATION_KEYS, case["serialNo"]
+        assert case.keys() - device_event(case).keys() == annotated, case["serialNo"]
+
+
 def test_direction_without_a_source_is_rejected() -> None:
     """The no-inference rule, made mechanical: a direction nobody attributed is exactly
     the first/last-punch inference this card forbids."""
