@@ -340,6 +340,58 @@ def test_jsonl_roundtrip_and_batch_concatenation() -> None:
     assert [r.to_dict() for r in rejoined] == [r.to_dict() for r in records]
 
 
+def test_to_dict_returns_a_payload_the_caller_may_mutate_freely() -> None:
+    """The copy in `to_dict` is load-bearing, not decoration.
+
+    A caller that annotates the payload before writing it (P2 adds store columns, a
+    log line adds a timestamp) must not be able to reach into the record's `raw`
+    through the dict it was handed — a frozen record whose `raw` can be edited
+    through `to_dict()` is not a frozen record. The copy is deliberately *shallow*
+    (see `to_dict`), so this pins the top-level guarantee and nothing deeper.
+    """
+    record = record_from_event(recorded_events()[0])
+    payload = record.to_dict()
+    payload["raw"]["minor"] = 999
+    payload["raw"]["injected"] = True
+    payload["employee_no"] = "hacked"
+    assert record.raw["minor"] == 75
+    assert "injected" not in record.raw
+    assert record.employee_no == "1"
+    # and the record still serializes to its own truth afterwards
+    assert EventRecord.from_json(record.to_json()).raw == record.raw
+
+
+def test_employee_no_normalization_makes_two_spellings_one_id() -> None:
+    """Same reason as the name, and a sharper edge: `employee_no` is in the fingerprint
+    key, so two spellings of one id would fork one person's punches into two rows.
+
+    Alphanumeric ids with diacritics are the case that matters — site-a's "1".."4"
+    cannot show it, so the id here is deliberately non-ASCII. The decomposed form is
+    built with `chr(0x308)` (combining diaeresis) after an `e`, which is exactly how a
+    macOS filename or an IME produces it.
+    """
+    combining_diaeresis = chr(0x308)
+    precomposed, decomposed_text = "Za" + chr(0xEB), "Zae" + combining_diaeresis
+    first = EventRecord(
+        site=SITE, device_serial=DEVICE_SERIAL, employee_no=precomposed, serial_no=1
+    )
+    second = EventRecord(
+        site=SITE, device_serial=DEVICE_SERIAL, employee_no=decomposed_text, serial_no=1
+    )
+    assert first.employee_no == second.employee_no == precomposed
+    assert first.fingerprint_hash == second.fingerprint_hash
+    assert EventRecord.from_json(first.to_json()).employee_no == precomposed
+
+
+def test_to_jsonl_records_are_independent_of_the_records_they_came_from() -> None:
+    """A pushed line must not change if the caller reuses the record afterwards — the
+    payload is a snapshot, which is what makes a retried push safe."""
+    record = record_from_event(recorded_events()[0])
+    line = to_jsonl([record])
+    assert json.loads(line)["raw"]["minor"] == 75
+    assert json.loads(to_jsonl([record])) == json.loads(line)
+
+
 def test_jsonl_skips_blank_lines_and_names_a_bad_line() -> None:
     records = [record_from_event(recorded_events()[0])]
     # blank lines are skipped but still counted, so the reported number stays grep-able

@@ -26,3 +26,19 @@ un-masked values are ever needed for reconciliation, the operator holds them.
 CI note (policy 2026-10-15): no leak-guard machinery is built — fixtures stay masked
 because masked is simply the right default (staff names are PII), not because CI has
 to police it. If you add fixtures, mask names/serial/mac and move on.
+
+## Synthetic fixtures — `synthetic/`
+
+Shapes the device cannot give us today, so they are authored rather than recorded, and
+labelled as such in each file's `_comment`. Recorded fixtures stay the source of truth
+for anything the device actually emits; these exist so a rule is covered offline before
+it can be observed.
+
+| File | Why it is synthetic |
+|---|---|
+| `attendance_status_events.json` | site-a's terminal is in pure access-control mode, so `attendanceStatus` is absent on every real event (OBSERVED.md). The checkIn/checkOut/breakIn shape only appears if the owner enables attendance mode (DESIGN.md option A). `expected_direction` / `expected_source` are the asserted `EventRecord` values. |
+| `encrypted_person_data.json` | site-a returned plaintext names and has no encryption capability at all (`/ISAPI/Security/encryption/capabilities` → 404), so the base64-blob name cannot be captured here. `expect_encrypted` is the asserted `encrypted_person_data` value; names are always stored verbatim. |
+
+Both are used by `tests/test_model.py` (card p1-07). If a later live probe shows the
+device really does emit one of these shapes, replace the synthetic file with a masked
+recording and say so in `docs/OBSERVED.md`.

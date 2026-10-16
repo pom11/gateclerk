@@ -420,7 +420,9 @@ class EventRecord:
     captured_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        _normalize_event(self)
+        _apply_event_fields(
+            self, _coerce_event_fields({f.name: getattr(self, f.name) for f in fields(self)})
+        )
 
     # --- serialization ---------------------------------------------------------
 
@@ -447,7 +449,7 @@ class EventRecord:
         record would then look legitimately empty, which is the failure this whole card
         is written to make impossible.
         """
-        return _normalize_event(None, dict(payload))
+        return _event_from_fields(_coerce_event_fields(_event_payload(dict(payload))))
 
     def to_json(self, *, indent: int | None = None) -> str:
         """Canonical JSON text. Unicode stays readable — diacritics are names, not noise."""
@@ -489,19 +491,14 @@ class EventRecord:
         return event_keys(self)
 
 
-def _normalize_event(record: EventRecord | None, payload: dict[str, Any] | None = None) -> Any:
-    """Coerce/validate one record in place, or build one from a payload dict.
+def _coerce_event_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one record's field dict and return it.
 
-    One code path for both jobs, so the rules cannot drift between construction and
-    deserialization (a constructor that is stricter than the loader is how a store
-    written today stops being readable tomorrow). Frozen fields are written through
-    `object.__setattr__`, the same way `tz.ResolvedTime` sets its derived field.
+    The single place the record's rules live, shared by construction and
+    deserialization: a constructor stricter than the loader is how a store written
+    today stops being readable tomorrow, and a loader looser than the constructor is
+    how a bad row gets accepted on the way back in.
     """
-    if record is not None:
-        data = {f.name: getattr(record, f.name) for f in fields(EventRecord)}
-    else:
-        data = _event_payload(payload or {})
-
     # --- identity: required, and required to actually say something
     site = _as_str(data["site"], field="site")
     device_serial = _as_str(data["device_serial"], field="device_serial")
@@ -608,12 +605,31 @@ def _normalize_event(record: EventRecord | None, payload: dict[str, Any] | None 
         data["name"]
     )
     data["captured_at"] = _load_datetime(data["captured_at"], field="captured_at")
+    return data
 
-    if record is None:
-        return EventRecord(**data)
-    for key, value in data.items():
-        object.__setattr__(record, key, value)
-    return None
+
+def _event_from_fields(data: dict[str, Any]) -> EventRecord:
+    """Build a record from field values *already* run through `_coerce_event_fields`.
+
+    Bypasses `__post_init__` via `__new__` so the rules are not applied twice: once is
+    plenty, and re-normalizing an already-normalized record would make the constructor a
+    second place for the rules to drift.
+    """
+    record = object.__new__(EventRecord)
+    for name, value in data.items():
+        object.__setattr__(record, name, value)
+    return record
+
+
+def _apply_event_fields(record: EventRecord, data: dict[str, Any]) -> None:
+    """Write coerced values back onto a frozen dataclass.
+
+    `object.__setattr__` is the sanctioned way — the same one `tz.ResolvedTime` uses for
+    its derived field. The alternative is to make the record mutable, and a record a poll
+    loop can edit after handing it to the store is not a record.
+    """
+    for name, value in data.items():
+        object.__setattr__(record, name, value)
 
 
 def _event_payload(payload: dict[str, Any]) -> dict[str, Any]:
