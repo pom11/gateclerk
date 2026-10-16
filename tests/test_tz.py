@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,7 @@ from gateclerk.tz import (
     SKEW_WARN_SECONDS,
     DeviceTime,
     DeviceWindow,
+    EventTimeResult,
     IsapiPayloadError,
     ResolvedTime,
     Skew,
@@ -36,6 +37,7 @@ from gateclerk.tz import (
     parse_isapi_xml,
     parse_user_timestamp,
     read_system_time,
+    resolve_event_time,
     window_for_device,
 )
 
@@ -1054,3 +1056,113 @@ def test_read_system_time_refuses_a_padded_dtd_payload() -> None:
     payload = f'<?xml version="1.0"?><!--{"p" * 20_000}--><!DOCTYPE Time><Time/>'
     with pytest.raises(IsapiPayloadError):
         read_system_time(payload)
+
+
+# --- 11. resolve_event_time: the p1-06d façade (thin view, no second policy) --------
+
+#: site-a's real summer punch shape (OBSERVED.md): wall 16:39, claim +02:00, real +03:00.
+SUMMER_OFFSET_BEARING = "2026-10-15T16:39:00+02:00"
+
+
+def test_facade_utc_is_bit_for_bit_the_resolvers_answer() -> None:
+    """The façade must not re-decide anything: same wall+zone -> identical instant."""
+    inner = TimeResolver(site_tz=BUCHAREST).resolve(SUMMER_OFFSET_BEARING)
+    result = resolve_event_time(SUMMER_OFFSET_BEARING, BUCHAREST, claimed_offset_min=120)
+    assert isinstance(result, EventTimeResult)
+    assert result.utc == inner.utc
+    assert result.tz_source is inner.tz_source
+    assert result.utc == datetime(2026, 10, 15, 13, 39, tzinfo=UTC)
+
+
+def test_wall_naive_is_the_naive_wall_part_the_utc_was_built_from() -> None:
+    """The field exists so a reviewer can see which wall time produced the instant."""
+    result = resolve_event_time(SUMMER_OFFSET_BEARING, BUCHAREST)
+    assert result.wall_naive == naive(2026, 10, 15, 16, 39)
+    assert result.wall_naive is not None and result.wall_naive.tzinfo is None
+    # The claimed +02:00 is NOT what produced the instant: the site zone said +03:00.
+    assert result.utc == datetime(2026, 10, 15, 13, 39, tzinfo=UTC)
+
+
+def test_site_a_golden_case_flags_the_mismatch_without_moving_the_instant() -> None:
+    """OBSERVED.md's real bug through the façade: claim +02:00, zone +03:00.
+
+    The point of the whole card: the flag fires *and* the math is untouched. If a future
+    edit made the façade trust the claim, both assertions cannot hold at once.
+    """
+    result = resolve_event_time(SUMMER_OFFSET_BEARING, BUCHAREST, claimed_offset_min=120)
+    assert result.mismatch is True
+    assert result.claimed_offset_min == 120
+    assert result.tz_source is TzSource.SITE_TZ
+    assert result.utc == datetime(2026, 10, 15, 13, 39, tzinfo=UTC)
+
+
+def test_claimed_offset_defaults_to_the_strings_own_stamp() -> None:
+    """No caller claim -> the string's +02:00 IS the claim, so the flag still fires.
+
+    Silently treating "no caller claim" as "no claim" would report `mismatch=None` for
+    site-a's exact bug — the one thing this flag exists to surface.
+    """
+    from_string = resolve_event_time(SUMMER_OFFSET_BEARING, BUCHAREST)
+    assert from_string.claimed_offset_min == 120
+    assert from_string.mismatch is True
+    explicit = resolve_event_time(SUMMER_OFFSET_BEARING, BUCHAREST, claimed_offset_min=120)
+    assert from_string.utc == explicit.utc
+
+
+def test_winter_claim_that_agrees_is_false_not_none() -> None:
+    """+02:00 is correct in January: agreement must be distinguishable from absence."""
+    result = resolve_event_time("2026-01-15T10:00:00+02:00", BUCHAREST)
+    assert result.mismatch is False
+    assert result.utc == datetime(2026, 1, 15, 8, 0, tzinfo=UTC)
+
+
+def test_naive_string_has_no_claim_so_the_flag_is_none() -> None:
+    """Naive wall time -> nothing was claimed -> None, never False (payroll honesty)."""
+    result = resolve_event_time("2026-10-15T16:39:00", BUCHAREST)
+    assert result.mismatch is None
+    assert result.claimed_offset_min is None
+    assert result.tz_source is TzSource.SITE_TZ
+    assert result.utc == datetime(2026, 10, 15, 13, 39, tzinfo=UTC)
+
+
+def test_garbage_input_is_unresolved_and_never_assumes_utc() -> None:
+    """Card's garbage case: kept as text, no instant invented, nothing compared."""
+    for raw in ("", "not-a-time", "2026-13-45T99:99:99"):
+        result = resolve_event_time(raw, BUCHAREST, claimed_offset_min=120)
+        assert result.tz_source is TzSource.UNRESOLVED, raw
+        assert result.utc is None, raw
+        assert result.wall_naive is None, raw
+        assert result.mismatch is None, raw
+
+
+def test_missing_site_tz_stays_unresolved_without_raising() -> None:
+    """DESIGN.md item 4: no site zone -> flag it, don't guess UTC and don't crash.
+
+    An unknown zone NAME is different: the operator misconfigured the site, and
+    `_coerce_zone` raises — silence there would hide a broken payroll config.
+    """
+    for zone in (None, ""):
+        result = resolve_event_time(SUMMER_OFFSET_BEARING, zone, claimed_offset_min=120)
+        assert result.tz_source is TzSource.UNRESOLVED, zone
+        assert result.utc is None and result.mismatch is None, zone
+    with pytest.raises(TimestampInputError):
+        resolve_event_time(SUMMER_OFFSET_BEARING, "Mars/Olympus_Mons")
+
+
+def test_facade_honours_the_fold_0_choice_through_the_wrapper() -> None:
+    """The p1-06 fold=0 pin, seen through the façade rather than only at the resolver.
+
+    A wrapper that re-derived its own instant could silently pick the *second* pass
+    through the autumn fold and hand a worker a free daylight hour.
+    """
+    result = resolve_event_time("2026-10-25T03:30:00", BUCHAREST)
+    assert result.utc == datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
+    assert result.wall_naive == naive(2026, 10, 25, 3, 30)
+    assert result.mismatch is None, "naive string: nothing claimed, nothing to compare"
+
+
+def test_non_iana_zone_object_is_passed_through_intact() -> None:
+    """A fixed-offset tzinfo must reach the detector as an object, not a stringified key."""
+    result = resolve_event_time(SUMMER_OFFSET_BEARING, timezone(timedelta(hours=4)), 120)
+    assert result.utc == datetime(2026, 10, 15, 12, 39, tzinfo=UTC)
+    assert result.mismatch is True, "claim +02:00 vs a +04:00 site zone"

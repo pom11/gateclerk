@@ -15,12 +15,13 @@ Policy (operator decision, 2026-10-15):
 3. Anything unresolvable is **kept and flagged** (`tz_source="unresolved"`, `utc=None`).
    Never dropped, never defaulted to UTC.
 
-Out of scope here (split out of this card, 2026-10-15): the Hikvision `timeZone` dialect
-table (Windows names / `Etc/GMT±N` / POSIX) and the `tz_offset_mismatch` flag. The seam
-is deliberate — `as_record()` already carries both `tz_offset_min` (the offset we used)
-and `tz_offset_min_device` (the claim), so the card that adds the flag compares two
-columns that are already present and needs no change here. `DeviceTime.tz_raw` carries
-the dialect string unparsed for the same reason.
+Out of scope here (split out of this card, 2026-10-15; since merged elsewhere): the
+Hikvision `timeZone` dialect table lives in tz_dialect.py (p1-06b) and the
+`tz_offset_mismatch` detector in tz_mismatch.py (p1-06c). The seam held — this module
+implements no mismatch policy and imports tz_mismatch at module level **never**; the
+only edge is the function-local one inside `resolve_event_time()` (p1-06d façade), the
+form tests/test_tz_mismatch.py's re-scoped pin accepts: it forbids a top-level import
+and pins that the flag is computed *after* UTC and never fed back into resolution.
 
 Two consequences that are easy to get wrong, both pinned by tests:
 
@@ -58,6 +59,7 @@ __all__ = [
     "SKEW_WARN_SECONDS",
     "DeviceTime",
     "DeviceWindow",
+    "EventTimeResult",
     "IsapiPayloadError",
     "ResolvedTime",
     "Skew",
@@ -69,6 +71,7 @@ __all__ = [
     "parse_isapi_xml",
     "parse_user_timestamp",
     "read_system_time",
+    "resolve_event_time",
     "window_for_device",
 ]
 
@@ -330,6 +333,70 @@ class TimeResolver:
             nonexistent=nonexistent,
             device_string_naive=parsed.tzinfo is None,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class EventTimeResult:
+    """One event's time as the payroll record wants it (p1-06d façade).
+
+    A *derived view* over `ResolvedTime`, not a second policy: `utc` is exactly what
+    `TimeResolver.resolve` decided, `mismatch` exactly what tz_mismatch answered.
+    """
+
+    utc: datetime | None
+    #: The device's wall part, naive — what `utc` was built from. None when unparseable.
+    wall_naive: datetime | None
+    tz_source: TzSource
+    #: The device's claim (minutes east of UTC), kept for audit; never used for math.
+    claimed_offset_min: int | None
+    #: True/False when the claim disagreed/agreed with the site zone; None = no claim.
+    mismatch: bool | None
+
+
+def resolve_event_time(
+    raw_ts: str | None,
+    iana_tz: str | tzinfo | None,
+    claimed_offset_min: int | str | None = None,
+) -> EventTimeResult:
+    """Facade over `TimeResolver` + the p1-06c detector — no policy lives in here.
+
+    Resolution runs first and alone; the flag is computed afterwards from the result and
+    can never move the instant (pinned in tests/test_tz_mismatch.py and test_tz.py). The
+    `tz_mismatch` import is function-local on purpose: tz.py has no module-level edge.
+
+    `claimed_offset_min` is the caller's device claim — minutes, or an offset-stamp/
+    dialect string, forwarded untouched; with no caller claim the string's own stamp is
+    the claim (site-a stamps +02:00 in +03:00 summer — OBSERVED.md — and ignoring that
+    would report "nothing to compare" for the bug this flag exists to surface). The
+    result field is the minutes the flag was actually computed from, so record and flag
+    cannot disagree about what was claimed. `mismatch` is None — not False — when there
+    was no claim or nothing parsed: "agrees" about missing data would be a false
+    reassurance in payroll output (tz_mismatch.py's rule, kept, not overridden).
+    """
+    resolver = TimeResolver(site_tz=iana_tz)
+    resolved = resolver.resolve(raw_ts)
+    wall, _stamp, _note = _parse_time_string(raw_ts)
+    wall_naive = None if wall is None else wall.replace(tzinfo=None)
+    claim: int | str | None = (
+        resolved.device_offset_minutes if claimed_offset_min is None else claimed_offset_min
+    )
+
+    from gateclerk.tz_mismatch import claimed_offset_minutes, is_offset_mismatch
+
+    # The resolver decides whether a site zone exists (its `zone` is None exactly when
+    # it resolved `unresolved`); no zone -> nothing to compare -> None, not a raise.
+    # The tzinfo object goes to the detector directly, never its name.
+    zone = resolver.zone
+    mismatch = (
+        None if wall_naive is None or zone is None else is_offset_mismatch(claim, wall_naive, zone)
+    )
+    return EventTimeResult(
+        utc=resolved.utc,
+        wall_naive=wall_naive,
+        tz_source=resolved.tz_source,
+        claimed_offset_min=claimed_offset_minutes(claim),
+        mismatch=mismatch,
+    )
 
 
 def _coerce_zone(zone: str | tzinfo | None) -> tzinfo | None:
