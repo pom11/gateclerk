@@ -274,7 +274,15 @@ def test_no_host_shape_escapes_with_an_uncaught_exception(host: str) -> None:
     a documented code (2 config / 3 auth / 4 device) or is accepted and served (0, via
     the mock), but never exits 1 with a traceback. What a host *may* legally be is
     p1-02's config grammar — deliberately not re-litigated here; this pins only that the
-    CLI converts everything it refuses, instead of escaping."""
+    CLI converts everything it refuses, instead of escaping.
+
+    SCOPE HONESTY (review round 2): the autouse `redirect_transport` fixture above swaps
+    in FakeDevice's MockTransport, so nothing here enters the real socket path and no
+    host name is ever IDNA-encoded. Shapes that pass httpx's URL parser and die later —
+    `.localhost`, `xn--$bad`, a 64-char label — are covered at the layer they actually
+    fail in by tests/test_cli_idna_hosts.py, which runs the real transport in a guarded
+    child process.
+    """
     code, out = run(
         [
             "device",

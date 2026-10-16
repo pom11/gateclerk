@@ -568,13 +568,35 @@ def creds_explain(
     render(rows, fmt=output.value, columns=("rung", "source", "where", "detail"))
 
 
+#: Exception classes that mean "click/typer refused your command line" (exit 2), for
+#: whichever typer layout is installed. typer >= 0.25 vendors click as `typer._click`, so
+#: its UsageError derives from the public `typer.exceptions.TyperException` and the plain
+#: `import click` below fails; older typer re-exported click's UsageError, which derives
+#: from RuntimeError and is NOT a TyperException — hence the optional click rung rather
+#: than one class name. `typer.exceptions.UsageError` (what this file used to name) has
+#: never existed in any typer release: on typer 0.27 the `except` clause itself raised
+#: AttributeError, so `main()` exited 1 with a traceback on every usage error.
+def _usage_error_classes() -> tuple[type[BaseException], ...]:
+    classes: list[type[BaseException]] = [typer.exceptions.TyperException]
+    try:
+        import click  # optional rung: only present on typer < 0.25
+    except ImportError:
+        pass
+    else:  # pragma: no cover — depends on the installed typer layout
+        classes.append(click.UsageError)
+    return tuple(classes)
+
+
+_USAGE_ERRORS = _usage_error_classes()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console entry point. Returns an exit code instead of calling sys.exit()."""
     try:
         result = app(args=argv, prog_name="gateclerk", standalone_mode=False)
     except typer.Exit as exc:  # raised by --version and by every stub
         return int(exc.exit_code)
-    except typer.exceptions.UsageError as exc:
+    except _USAGE_ERRORS as exc:  # click/typer refused the command line: exit 2
         exc.show()
         return int(exc.exit_code)
     return 0 if result is None else int(result)
