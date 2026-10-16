@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SYNTHETIC capability XML (attribute idiom): this endpoint answered JSON on site-a;
+     the XML fallback shape was never observed there, so it is modelled from the two
+     ISAPI XSD idioms (limits as attributes here, as child nodes in the sibling
+     fixture) rather than claimed as a device capture. Same values as the recorded
+     site-a caps so the JSON/XML parity assertion is meaningful. -->
+<AcsEventCap version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+ <AcsEventCond>
+  <searchID min="1" max="64"/>
+  <searchResultPosition min="0" max="150000"/>
+  <maxResults min="1" max="30"/>
+  <major opt="0,1,2,3,5"/>
+  <minorAlarm opt="1028,1029,1030"/>
+  <minorOperation opt="80,112,113,1024,1025,1029"/>
+  <minorEvent opt="1,9,21,22,23,75,76,80"/>
+  <startTime min="1" max="32"/>
+  <endTime min="1" max="32"/>
+  <employeeNoString min="0" max="32"/>
+ </AcsEventCond>
+ <InfoList maxSize="30">
+  <time min="1" max="32"/>
+  <currentVerifyMode opt="face,card,fp,cardOrFaceOrFp"/>
+  <attendanceStatus opt="undefined,checkIn,checkOut"/>
+ </InfoList>
+</AcsEventCap>

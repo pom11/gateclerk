@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -53,11 +53,14 @@ __all__ = [
     "DEFAULT_MAX_RESULTS",
     "DEFAULT_SEARCH_ID_MAX",
     "CapabilityCache",
+    "CapabilityDiscoveryError",
     "DeviceCapabilities",
     "capability_cache",
+    "device_identity",
     "discover",
     "parse_access_control_capabilities",
     "parse_acs_event_capabilities",
+    "xml_capabilities_to_dict",
 ]
 
 #: Floor used when a device gives no `maxResults @max` (DESIGN.md: "we clamp to the
@@ -160,14 +163,26 @@ def _xml_field_to_table(node: ET.Element) -> dict[str, Any]:
     ISAPI capability XML appears in the wild in two idioms — `<maxResults max="30"/>`
     and `<maxResults><max>30</max></maxResults>` — and the XML capability shape was
     never actually observed on site-a (this endpoint answers JSON there). Refusing
-    either idiom means the fallback fails exactly when it is needed, so both are read
-    and attributes win when they disagree (the vendor XSD renders limits as attributes).
+    either idiom means the fallback fails exactly when it is needed, so both are read.
+
+    Only limit/opt child tags (`min`/`max`/`opt`/…) collapse into `@` entries; any other
+    child is a *nested field* (e.g. `<InfoList maxSize="30"><time>…</time></InfoList>`)
+    and recurses, so a group element carrying one attribute never swallows its children
+    as attribute text.
     """
     table: dict[str, Any] = {}
     for attr, value in node.attrib.items():
         table[f"@{strip_ns(attr)}"] = value
     for child in node:
-        table[f"@{strip_ns(child.tag)}"] = (child.text or "").strip() or None
+        key = strip_ns(child.tag)
+        if key in _LIMIT_CHILD_TAGS:
+            table[f"@{key}"] = (child.text or "").strip() or None
+        else:
+            table[key] = (
+                _xml_field_to_table(child)
+                if (len(child) or child.attrib)
+                else ((child.text or "").strip() or None)
+            )
     return table
 
 
@@ -270,11 +285,7 @@ class DeviceCapabilities:
         """A fresh searchID for one logical search — the caller keeps it byte-identical
         across that search's pages (references §1.2: changing it mid-walk silently
         restarts page 1)."""
-        budget = (
-            self.search_id_max
-            if self.search_id_max is not None
-            else DEFAULT_SEARCH_ID_MAX
-        )
+        budget = self.search_id_max if self.search_id_max is not None else DEFAULT_SEARCH_ID_MAX
         head = prefix[: max(0, budget - 8)]
         return self.clamp_search_id(f"{head}{uuid.uuid4().hex}")
 
@@ -360,7 +371,12 @@ class DeviceCapabilities:
                 ),
             },
         ]
-        for major, label in ((1, "minorAlarm"), (2, "minorException"), (3, "minorOperation"), (5, "minorEvent")):
+        for major, label in (
+            (1, "minorAlarm"),
+            (2, "minorException"),
+            (3, "minorOperation"),
+            (5, "minorEvent"),
+        ):
             advertised = self.minors.get(major)
             rows.append(
                 {
@@ -398,10 +414,31 @@ def _find_cond_table(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
+def _find_info_list(payload: Mapping[str, Any], *, depth: int = 0) -> Mapping[str, Any]:
+    """The `InfoList` field table, wherever it sits.
+
+    In the recorded site-a body `InfoList` is a **sibling** of `AcsEventCond` (both under
+    `AcsEvent`), while some firmware nests it inside — and `verify_modes` /
+    `attendance_statuses` / `maxSize` live there, so looking for it in exactly one place
+    silently yields "the device advertised no verify modes" on the other shape. Bounded
+    walk, same rule as the cond table.
+    """
+    if depth > 3:
+        return {}
+    direct = payload.get("InfoList")
+    if isinstance(direct, Mapping):
+        return direct
+    for value in payload.values():
+        if isinstance(value, Mapping):
+            found = _find_info_list(value, depth=depth + 1)
+            if found:
+                return found
+    return {}
+
+
 def _extract(payload: Mapping[str, Any], *, format_note: str | None) -> DeviceCapabilities:
     cond = _find_cond_table(payload)
-    info_list = cond.get("InfoList")
-    info_fields: Mapping[str, Any] = info_list if isinstance(info_list, Mapping) else {}
+    info_fields = _find_info_list(payload)
 
     minors: dict[int, frozenset[int]] = {}
     minor_raw: dict[str, str] = {}
@@ -410,7 +447,9 @@ def _extract(payload: Mapping[str, Any], *, format_note: str | None) -> DeviceCa
         parsed = _as_opt_ints(opt)
         if parsed:
             minors[major] = parsed
-            minor_raw[field_name] = opt if isinstance(opt, str) else ",".join(str(v) for v in sorted(parsed))
+            minor_raw[field_name] = (
+                opt if isinstance(opt, str) else ",".join(str(v) for v in sorted(parsed))
+            )
 
     return DeviceCapabilities(
         raw=payload,
@@ -422,7 +461,9 @@ def _extract(payload: Mapping[str, Any], *, format_note: str | None) -> DeviceCa
         minors=minors,
         minor_options_raw=minor_raw,
         info_list_max_size=_as_int(
-            info_fields.get("maxSize") if isinstance(info_fields, Mapping) else None
+            info_fields.get("maxSize", info_fields.get("@maxSize"))
+            if isinstance(info_fields, Mapping)
+            else None
         ),
         event_attribute_options=_as_opt_strs(_opt(cond, "eventAttribute")),
         verify_modes=_as_opt_strs(_opt(info_fields, "currentVerifyMode")),
@@ -455,18 +496,30 @@ def parse_access_control_capabilities(body: bytes | str) -> tuple[Mapping[str, A
     Advisory only (ring capacity feeds DESIGN.md open question 4, the rolling-event
     question) — a firmware without this endpoint is expected on some models, so the
     caller treats `IsapiNotFound` as data, not failure.
+
+    The capacity is read from the `AcsEvent` group specifically, not from any
+    `maxCapacity` in the body: this endpoint enumerates several groups (Face, Card,
+    AcsEvent...) each with its own `maxCapacity`, and whichever one a stack walk pops
+    first would otherwise decide the number — an event-ring capacity of "3000" when the
+    face library is 3000 is exactly the kind of confidently-wrong number we refuse.
     """
     payload = parse_body(body)
-    capacity: int | None = None
-    stack: list[Any] = [payload]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, Mapping):
-            for key, value in node.items():
-                if strip_ns(str(key)) == "maxCapacity":
-                    capacity = _as_int(value) if capacity is None else capacity
-                if isinstance(value, Mapping):
-                    stack.append(value)
+
+    def find_acs_event(node: Mapping[str, Any], depth: int = 0) -> Mapping[str, Any] | None:
+        if depth > 3:
+            return None
+        inner = node.get("AcsEvent")
+        if isinstance(inner, Mapping):
+            return inner
+        for value in node.values():
+            if isinstance(value, Mapping):
+                found = find_acs_event(value, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    group = find_acs_event(payload)
+    capacity = _as_int(group.get("maxCapacity")) if group is not None else None
     return payload, capacity
 
 
@@ -587,15 +640,13 @@ def discover(
     except IsapiError as exc:  # a hard failure here is *not* fatal: caps stay advisory
         access_error = str(exc)
 
-    caps = DeviceCapabilities(
-        **{
-            **{k: v for k, v in caps.__dict__.items()},
-            "access_control_raw": access_raw,
-            "access_control_error": access_error,
-            "acs_event_capacity": capacity,
-            "serial": serial,
-            "firmware": firmware,
-            "model": model,
-        }
+    caps = replace(
+        caps,
+        access_control_raw=access_raw,
+        access_control_error=access_error,
+        acs_event_capacity=capacity,
+        serial=serial,
+        firmware=firmware,
+        model=model,
     )
     return cache.put(serial, firmware, caps)
