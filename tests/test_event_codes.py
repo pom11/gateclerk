@@ -553,19 +553,27 @@ def test_write_command_refuses_before_touching_the_doc(
     `gen_code_reference.py --write`, whole suite stayed green (the doc is generated from
     the same string, so regeneration *corroborated* the lie). The suite now fails on that
     mutation regardless; this pins the other half — that the `--write` command itself
-    refuses, rather than only the test noticing afterwards. Runs the real `main()` with a
-    patched table and a redirected doc path, then asserts the doc was never written."""
+    refuses, rather than only the test noticing afterwards.
+
+    The fake doc carries the generator's own splice markers on purpose. An earlier draft
+    of this test used a bare sentinel string and passed even with the gate deleted,
+    because `main()` raises SystemExit for a *missing anchor* too — the wrong cause, the
+    same green. With the markers present, the only SystemExit left is the gate's."""
     mod = gen_reference()
     target = tmp_path / "acs-event-codes.md"
-    target.write_text("SENTINEL\n", encoding="utf-8")
+    target.write_text(
+        f"{mod.START}\n{mod.END}\nAlarms/exceptions worth surfacing\n", encoding="utf-8"
+    )
+    pristine = target.read_text(encoding="utf-8")
     mutated = dict(EVENT_CODE_TABLE)
     mutated[(5, 16)] = replace(EVENT_CODE_TABLE[(5, 16)], src="mmi:notWhatTheCatalogSays")
     monkeypatch.setattr(mod, "EVENT_CODE_TABLE", mutated)
     monkeypatch.setattr(mod, "DOC", target)
     monkeypatch.setattr(sys, "argv", ["gen_code_reference.py", "--write"])
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as raised:
         mod.main()
-    assert target.read_text(encoding="utf-8") == "SENTINEL\n", "--write edited the doc anyway"
+    assert "(5,16)" in str(raised.value), f"exited for the wrong reason: {raised.value}"
+    assert target.read_text(encoding="utf-8") == pristine, "--write edited the doc anyway"
 
 
 def test_doc_node_red_column_agrees_with_the_src_token() -> None:

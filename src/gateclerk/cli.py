@@ -81,8 +81,11 @@ NOT_IMPLEMENTED_EXIT = 3
 CONFIG_ERROR_EXIT = 2
 
 #: Also from p1-08's contract, declared here because p1-04's `device capabilities` needs
-#: it now: the device answered, and said no (or said something we refused to parse).
-#: Distinct from 2 so a script can tell "fix your config" from "the box/its firmware".
+#: it now: the read failed at the protocol/transport boundary rather than in the request —
+#: the box answered and said no (or said something we refused to parse), or the host name
+#: never made it to the resolver at all (unresolvable, or unencodable: `[Errno 8]`,
+#: `UnicodeError`/`idna.IDNAError` from the idna step). Distinct from 2 so a script can
+#: tell "fix your config" from "the box, its firmware, or the name you gave me".
 DEVICE_ERROR_EXIT = 4
 
 #: p1-08's contract, same reasoning: a terminal 401 (circuit open / lockout risk) is its
