@@ -63,6 +63,30 @@ device truth: docs/OBSERVED.md.)
   p1-05, p1-07, p1-06d, t_7b073d11 dedupe, t_d1c511fc docs. Next review wave = their PRs;
   then p1-08 CLI -> p1-09 suite -> owner's P1-10 live smoke.
 
+### 2026-10-16 evening — review cycle 3: PR #10 (p1-07 output contract) merged → `3a45790`
+
+- **PR #10 p1-07 EventRecord/UserRecord -> `3a45790`.** Round 1 requested changes
+  (fixture `attendance_status_events.json` was dead data while the README claimed it was
+  asserted); round 2 (execution lens) approved at `f3bb1f3`. Verified myself: 523 tests
+  green (test_model.py 119), ruff check+format clean, CI pass at head, diff still exactly
+  the 6 card files, model/fixtures/DESIGN byte-identical to the round-1 head I had
+  already probed. My own 20-probe mutation run (scratch copy, never the worktree):
+  strip-test falsifiable, expectation keys can't vanish silently, status-table mutations
+  all fail — **one real gap**: the entry-count floor is `>= 6` against 9 entries, so
+  deleting one fixture entry keeps the suite green while the comment + handoff claim it
+  is caught. Non-blocking (every status is also covered inline); filed as **t_ca64f6c2**,
+  merged before the card so the contract isn't held hostage by one line of prose.
+  Worker self-report discipline held again: two of my three "SURVIVED" readings were
+  probe bugs on my side (operator precedence; a neutered-duplicate assertion) — re-probed
+  before believing them, same lesson the worker recorded for their S2.
+- **Contract now on main, P2/P3 read it**: `RECORD_JSON_KEYS` (27 keys) pinned by
+  enumeration vs DESIGN.md; tz block consumed verbatim from `as_record()` (rename fails
+  CI); `direction` derivable only from `attendanceStatus`, contradicting attribution
+  rejected; `employee_no` NFC-normalized (fingerprint identity); password hash stripped
+  before storage; JSONL lossless for the p1-08 CLI.
+- **Hotspot standing**: `docs/DESIGN.md` touched by PR #7 (open) + PR #11 (open) + this
+  merged cycle — sequence the next DESIGN.md edits.
+
 ### 2026-10-16 00:15 — first review cycle (PR #2 + PR #3)
 - **PR #3 (p1-06b tz dialect) reviewed + merged** → main `b1c7bd6`. Verified on the
   worktree, not from the PR body: 99 tests green, ruff clean, and all four dialects decode
