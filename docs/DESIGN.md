@@ -255,12 +255,25 @@ NTP anyway; only the tz rule is wrong).
   deployed agent locks the admin account nobody can then use at the door.)
 - **Throttling**: these devices have a small concurrent-session limit and prefer serial
   requests. P1 is single-connection, serial, with a small inter-page delay (default
-  100 ms) and backoff on `deviceBusy` / `activeOperator` / `invalidOperation`.
+  100 ms) and backoff on the busy family only: `deviceBusy` (vendor `statusCode 2`,
+  gotchas §2.2) and `activeOperator` (absent from the vendor table, §2.3 — bucket it
+  busy, never as an auth failure). **Not** `invalidOperation`: that is `statusCode 4`,
+  terminal per the table and per the "Retry classes" line below. *(Amended at the p1-03
+  merge — the previous text listed `invalidOperation` among the backoff subcodes, which
+  contradicted the vendor table and the shipped `_BUSY_SUBCODES` in
+  `src/gateclerk/isapi_response.py`; retrying a 4-class code is how polling becomes a
+  door-terminal lockout.)*
 - **`Invalid Content` / `badParameters`**: almost always our request shape, not the
   device's. Include the request body verbatim in the error we raise.
-- **Half-open TCP**: the device drops idle keep-alives; set an explicit read timeout
-  (default 30 s) and `Connection: close` rather than pooling aggressively to a box that
-  will RST us.
+- **Half-open TCP**: the device drops idle keep-alives. Keep **connection reuse ON**
+  (digest `nonce`/`nc` are sessionful — closing per request forces a 401 re-pay on every
+  paged call, and the reuse is what makes a 20-page search 21 requests instead of 40),
+  set explicit timeouts — connect 10 s / read 30 s, both configurable — and recover from
+  a dropped keep-alive with **one transparent retry** on `httpx.TransportError`, same
+  client, same request bytes. *(Amended at the p1-03 merge — superseded text here
+  prescribed `Connection: close`; the shipped `IsapiClient` keeps the pool open, and
+  gotchas §1.7c shows `Connection: close` does not break digest state either way, so the
+  safer reuse policy costs nothing.)*
 - **Encrypted person data**: RESOLVED for site-a — the 2026-10-15 probe returned plain
   readable names + `employeeNoString` "1".."4" (no `security=1&iv=` blob scheme in play).
   Keep the `encrypted_person_data` flag in the model: sites B/C (or a firmware change)

@@ -116,7 +116,8 @@ or upgrades.
 | `src/gateclerk/output.py` | p1-01 | json / rich-table rendering |
 | `src/gateclerk/exceptions.py` | p1-01 | shared ISAPI error vocabulary |
 | `src/gateclerk/config.py` | p1-02 | config + credential resolution (Keychain/env/flags) |
-| `src/gateclerk/isapi.py` | p1-03 | httpx digest transport, retries, error envelope |
+| `src/gateclerk/isapi_response.py` | p1-03 | ISAPI response truth: XML/JSON sniffing, the three envelope shapes, XML guard, envelope→typed-error mapping |
+| `src/gateclerk/isapi_transport.py` | p1-03 | `IsapiClient`: digest session, timeouts, bounded retries, 401 circuit, read-only verbs from the registry |
 | `src/gateclerk/tz_dialect.py` | p1-06b | Hikvision tz dialect → **diagnostic** offsets only (never UTC math) |
 | `src/gateclerk/time.py` | p1-06 | site-tz resolver: naive device wall time + site IANA zone → UTC |
 | `src/gateclerk/models.py` | p1-07 | `EventRecord` / `UserRecord` — the output contract |
