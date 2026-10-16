@@ -358,6 +358,101 @@ def test_unclassified_http_500_is_terminal_isapi_error_with_body_snippet() -> No
     assert "webs said nope" in str(err)
 
 
+# --- subcode -> class boundary (the lockout-safety edge) --------------------------------
+#
+# Ordered by gateclerk-orch in REVIEW ROUND 1 of PR #5 (t_a8cdd1a9): only `deviceBusy` was
+# exercised, and this mapping table decides whether a code gets a backoff loop or stops.
+# Retrying a vendor class-4 code is how a polling loop becomes a door-terminal lockout
+# (gotchas §2.4), so both sides of the boundary are pinned here (transport-level request
+# counts for the same two subcodes are in test_isapi_transport.py).
+
+#: Names hard-coded rather than read from `_BUSY_SUBCODES` — a test that imported the
+#: private set and asserted the module's own verdict on it would only prove the module
+#: agrees with itself. These are the vendor table rows (gotchas §2.2) plus
+#: `activeOperator` (not in that table, §2.3; adjudicated busy-never-auth by DESIGN.md,
+#: pinned separately below without the `statusCode==2` crutch so the table alone decides).
+BUSY_FAMILY = (
+    "deviceBusy",
+    "serviceUnavailable",
+    "noMemory",
+    "upgrading",
+    "beingExportedByAnotherUser",
+)
+#: Vendor `statusCode` 4 (Invalid Operation) minus `notSupport`, which has its own
+#: earlier rule (HTTP 400 + notSupport -> IsapiNotFound, pinned above).
+TERMINAL_OPERATION_FAMILY = ("invalidOperation", "lowPrivilege", "badAuthorization")
+
+
+def flat_envelope(sub_status_code: str, status_code: int | None) -> str:
+    """Invented (labelled per this file's convention): a JSON-flat envelope carrying the
+    subcode under test, in the shape `webs` really uses for class 2/4 replies. Pass
+    `status_code=None` to omit the field and leave the subcode table alone to decide."""
+    status = "" if status_code is None else f'"statusCode":{status_code},'
+    return (
+        f'{{{status}"statusString":"envelope for {sub_status_code}",'
+        f'"subStatusCode":"{sub_status_code}"}}'
+    )
+
+
+@pytest.mark.parametrize("sub_status_code", BUSY_FAMILY)
+def test_busy_family_subcodes_map_to_busy(sub_status_code: str) -> None:
+    """HTTP 200 with a busy-family envelope is still `IsapiBusy`: the mapping table
+    decides the class, not the status line (gotchas §3.3 — the two disagree by design, so
+    a rule that leaned on HTTP status alone would silently stop retrying a busy device)."""
+    err = make(http_status=200, body=flat_envelope(sub_status_code, 2))
+    assert isinstance(err, IsapiBusy)
+    assert "subStatusCode" in str(err), "the message names the subcode that decided the class"
+
+
+def test_being_exported_by_another_user_is_busy_despite_vendor_class_4() -> None:
+    """The one row where the subcode table is load-bearing *against* `statusCode`: the
+    vendor table (gotchas §2.2) files `beingExportedByAnotherUser` under class 4 but
+    marks it 'Yes — wait for other operator', and the code gives it its own
+    `_BUSY_WAIT_SUBCODES` set. A rule driven only by `statusCode` would call this
+    terminal; a rule that folded it into the class-4 fallthrough would stop polling a
+    device that is simply busy exporting. Neither is what a waiter needs."""
+    err = make(http_status=200, body=flat_envelope("beingExportedByAnotherUser", 4))
+    assert isinstance(err, IsapiBusy)
+
+
+def test_active_operator_is_busy_and_never_an_auth_failure() -> None:
+    """DESIGN.md Throttling: `activeOperator` is 'someone else holds the operator slot'
+    — a wait. Reading it as auth would spend the 401 budget (and the lockout circuit) on
+    a code that has nothing to do with credentials. Pinned WITHOUT `statusCode` and under
+    HTTP 200 on purpose: that is the only shape where `_BUSY_SUBCODES` alone decides, so
+    dropping the name from the table fails here instead of hiding behind the
+    `statusCode==2` rule. (Undocumented subcode, gotchas §2.3 — the table entry itself is
+    the thing under test.)"""
+    err = make(http_status=200, body=flat_envelope("activeOperator", None))
+    assert isinstance(err, IsapiBusy)
+    assert not isinstance(err, IsapiAuthError)
+
+
+@pytest.mark.parametrize("sub_status_code", TERMINAL_OPERATION_FAMILY)
+def test_class_4_subcodes_are_never_the_retryable_class(sub_status_code: str) -> None:
+    """The negative half of the boundary, and the reason this test exists: if anyone ever
+    folds a class-4 subcode into `_BUSY_SUBCODES`, it acquires a bounded backoff loop
+    against a device that will never change its answer (gotchas §2.4 — 'retrying a
+    4-class code is how a polling loop becomes a lockout')."""
+    err = make(http_status=200, body=flat_envelope(sub_status_code, 4))
+    assert isinstance(err, IsapiError)
+    assert not isinstance(err, IsapiBusy | IsapiAuthError | IsapiNotFound)
+
+
+def test_invalid_operation_under_http_400_is_terminal() -> None:
+    """The shape our own `error_total_notsupport.json` shows: class 4 riding an HTTP 400.
+    The generic-400 rule lands it in `IsapiBadContent` (terminal, never retried) — the
+    load-bearing property is *not busy*, and that is what pins the docstring claim on
+    `IsapiBusy` (`invalidOperation` is not in the backoff family)."""
+    err = make(
+        http_status=400,
+        body='{"statusCode":4,"statusString":"Invalid Operation",'
+        '"subStatusCode":"invalidOperation","errorCode":1073741830,"errorMsg":"invalid operation"}',
+    )
+    assert isinstance(err, IsapiError)
+    assert not isinstance(err, IsapiBusy)
+
+
 def test_success_returns_no_error() -> None:
     assert make(http_status=200, body=fixture("user_count.json")) is None
     assert make(http_status=200, body=fixture("events_major5_page1.json")) is None
