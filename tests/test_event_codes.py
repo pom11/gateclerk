@@ -11,6 +11,7 @@ Load-bearing properties these tests pin:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from gateclerk.event_codes import (
     AUTH_PASS_MINORS,
     EVENT_CODE_TABLE,
     NON_AUTH_VERIFY_MODES,
+    PUNCH_MAJOR,
     CodeInfo,
     Outcome,
     classify_batch,
@@ -345,3 +347,273 @@ def test_classification_is_serialisable_for_downstream_storage() -> None:
     assert json.dumps(row)  # p1-07/p1-08 will serialise exactly this shape
     assert row["punch_candidate"] is True and row["outcome"] == "granted"
     assert row["serial_no"] == 5742 and row["event_time"] == "2026-10-12T14:11:16+02:00"
+
+
+# --- provenance: no guessed codes, mechanically enforced (review round 1, finding 2) -------
+#
+# The card's premise is "no guessed codes". These tests make that a machine-checked
+# property instead of a docstring promise: every shipped row must carry catalog
+# provenance (`src`), must appear in the generated §3.1 table of
+# docs/references/acs-event-codes.md, and that table must agree with the vendored
+# catalogs under tests/fixtures/vendor/. A row no catalog names cannot survive: it has
+# no src and no doc row, and an unnamed code behaves correctly anyway
+# (info + unknown_code + kept).
+
+VENDOR = Path(__file__).parent / "fixtures/vendor"
+REFERENCE_DOC = Path(__file__).resolve().parents[1] / "docs/references/acs-event-codes.md"
+
+_DOC_ROW = re.compile(
+    r"^\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([a-z]+)\s*\|\s*([A-Z0-9_]+)\s*\|\s*([a-z]+)\s*\|\s*`([^`]+)`\s*\|"
+)
+
+
+def vendor_catalogs() -> tuple[dict[int, str], dict[tuple[int, int], dict[str, str]]]:
+    """(node-red major-5 hex names, mmisobuj (major,minor) -> {name, outcome})."""
+    nodered = json.loads((VENDOR / "node-red-MAJOR_EVENT-0x5.json").read_text(encoding="utf-8"))
+    nr: dict[int, str] = {}
+    for entry in nodered:
+        value = entry["Value"].strip()
+        if " to " in value:  # the CUSTOM1..64 range entry, not a single code
+            continue
+        nr[int(value, 16)] = entry["ShortDescription"]
+    mmi_raw = json.loads((VENDOR / "hikvision-acs-event-types.json").read_text(encoding="utf-8"))
+    mmi: dict[tuple[int, int], dict[str, str]] = {}
+    for major, minors in mmi_raw.items():
+        for minor, meta in minors.items():
+            mmi[(int(major), int(minor))] = meta
+    return nr, mmi
+
+
+def reference_doc_rows() -> dict[tuple[int, int], dict[str, str]]:
+    """Parse the generated §3.1 table out of the reference doc (a data file like any
+    fixture — the reviewer must not be able to edit the doc into agreement by hand)."""
+    rows: dict[tuple[int, int], dict[str, str]] = {}
+    for line in REFERENCE_DOC.read_text(encoding="utf-8").splitlines():
+        m = _DOC_ROW.match(line)
+        if not m:
+            continue
+        rows[(int(m.group(1)), int(m.group(2)))] = {
+            "nr": m.group(3).strip(),
+            "mmi_name": m.group(4).strip(),
+            "mmi_outcome": m.group(5),
+            "gateclerk_name": m.group(6),
+            "gateclerk_outcome": m.group(7),
+            "src": m.group(8),
+        }
+    return rows
+
+
+def test_every_table_row_carries_catalog_provenance() -> None:
+    """No row may exist without a `src:` naming the catalog identifier it was read from.
+
+    This is the direct enforcement of 'no guessed codes': the earlier draft shipped ~20
+    rows whose names appear in NO catalog, and nothing failed. Now the provenance is
+    data on the row and a test reads it."""
+    for (major, minor), info in EVENT_CODE_TABLE.items():
+        assert info.src, f"({major},{minor}) {info.name} has no catalog provenance"
+        assert info.src.startswith(("nr:", "mmi:", "nr+mmi:")), (
+            f"({major},{minor}) src {info.src!r} must be prefixed nr:/mmi:/nr+mmi:"
+        )
+
+
+def test_every_table_row_is_reproduced_in_the_reference_doc() -> None:
+    """Every (major, minor) we name — GRANTED, DENIED or INFO — must appear in the
+    reference doc's generated §3.1 table, with our exact name and outcome. A reviewer
+    reading that table can tell vendor-cited from curated; an unsourced row cannot hide
+    in either place."""
+    doc_rows = reference_doc_rows()
+    assert doc_rows, "the generated §3.1 table must exist in the reference doc"
+    missing = [k for k in EVENT_CODE_TABLE if k not in doc_rows]
+    assert not missing, f"rows missing from docs/references/acs-event-codes.md §3.1: {missing}"
+    for (major, minor), info in EVENT_CODE_TABLE.items():
+        row = doc_rows[(major, minor)]
+        assert row["gateclerk_name"] == info.name, (major, minor)
+        assert row["gateclerk_outcome"] == info.outcome.value, (major, minor)
+        assert row["src"] == info.src, (major, minor)
+
+
+def test_named_codes_trace_to_a_vendored_catalog() -> None:
+    """The doc table itself is checked against the vendored catalog fixtures: every row
+    we name must be a code the catalogs actually contain. This closes the doc so that a
+    fabricated label cannot be laundered into existence by adding it to the .md."""
+    nr, mmi = vendor_catalogs()
+    for (major, minor), info in EVENT_CODE_TABLE.items():
+        in_mmi = (major, minor) in mmi
+        in_nr = major == 5 and minor in nr
+        assert in_mmi or in_nr, (
+            f"({major},{minor}) {info.name} named in EVENT_CODE_TABLE but present in "
+            "neither vendored catalog — an unnamed code stays info+unknown_code instead"
+        )
+
+
+def test_outcome_follows_the_catalog_except_where_declared() -> None:
+    """The mmisobuj catalog is the only source that states an outcome per code. Our
+    outcome must equal it, unless the row's deviation is declared in the doc's §3.2
+    table (which records the reason — majors 1/2 are never DENIED, invalid-card is,
+    etc.). The deviations list is parsed from the doc, so both the deviation and its
+    justification live where a reviewer reads them."""
+    _, mmi = vendor_catalogs()
+    declared = declared_deviations()
+    for (major, minor), info in EVENT_CODE_TABLE.items():
+        meta = mmi.get((major, minor))
+        if meta is None:
+            continue  # single-source row (node-red only): no catalog outcome to compare
+        if meta["outcome"] != info.outcome.value:
+            assert (major, minor) in declared, (
+                f"({major},{minor}) outcome {info.outcome.value} deviates from "
+                f"mmisobuj's {meta['outcome']!r} without a §3.2 declaration"
+            )
+
+
+def declared_deviations() -> set[tuple[int, int]]:
+    """(major, minor) pairs listed in the doc's generated §3.2 deviations table."""
+    pairs: set[tuple[int, int]] = set()
+    in_32 = False
+    for line in REFERENCE_DOC.read_text(encoding="utf-8").splitlines():
+        if line.startswith("### 3.2"):
+            in_32 = True
+            continue
+        if in_32 and line.startswith("### "):
+            break
+        if in_32:
+            m = re.match(
+                r"^\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*[a-z]+\s*\|\s*[a-z]+\s*\|\s*.+\|\s*$", line
+            )
+            if m:
+                pairs.add((int(m.group(1)), int(m.group(2))))
+    return pairs
+
+
+def test_generated_block_is_byte_identical_to_the_generator_output() -> None:
+    """The §3.1/§3.2 block in the doc must equal `scripts/gen_code_reference.py`'s
+    output right now. This pins the doc against hand-edits from BOTH directions: edit a
+    row's catalog name in the .md and this fails; edit the code table and re-generation
+    is the only sanctioned way to move the doc. (Tampering the generator itself is a
+    code-review problem, same as tampering a test.)"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "gen_code_reference",
+        Path(__file__).resolve().parents[1] / "scripts" / "gen_code_reference.py",
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    block = mod.build_block()
+    text = REFERENCE_DOC.read_text(encoding="utf-8")
+    assert block in text, (
+        "the generated block in docs/references/acs-event-codes.md has drifted from "
+        "`uv run python scripts/gen_code_reference.py --write` — re-run the generator"
+    )
+
+
+def test_deviations_are_exactly_the_declared_ones() -> None:
+    """The other direction: a §3.2 row whose reason no longer applies (because the code
+    table came back into agreement) must be pruned, not left claiming a deviation."""
+    _, mmi = vendor_catalogs()
+    for major, minor in declared_deviations():
+        info = EVENT_CODE_TABLE.get((major, minor))
+        assert info is not None, f"§3.2 declares ({major},{minor}) but the table has no such row"
+        meta = mmi.get((major, minor))
+        assert meta is not None and meta["outcome"] != info.outcome.value, (
+            f"§3.2 still declares a deviation for ({major},{minor}) that no longer exists"
+        )
+
+
+def test_alarms_and_exceptions_are_never_granted_or_denied() -> None:
+    """Majors 1/2 never carry an auth outcome for us, even where mmisobuj stamps a code
+    `denied` by name-matching (e.g. (1,1036)). An alarm is not a refused credential."""
+    for (major, minor), info in EVENT_CODE_TABLE.items():
+        if major in (1, 2):
+            assert info.outcome is Outcome.INFO, (major, minor, info.name)
+
+
+def test_granted_rows_are_catalog_pass_or_success_codes() -> None:
+    """`granted` may only be imported for codes the catalogs actually name PASS/SUCCESS.
+
+    mmisobuj's `granted` column is name-matched and marks even a firmware upgrade
+    `granted` ((5,175) remoteExtendModuleUpgradeSucc); a bulk import of that column
+    would turn an upgrade into a timesheet punch. This pins the rule that whatever we
+    mark GRANTED, the catalog word for it contains pass/success."""
+    nr, mmi = vendor_catalogs()
+    for (major, minor), info in EVENT_CODE_TABLE.items():
+        if major != PUNCH_MAJOR or info.outcome is not Outcome.GRANTED:
+            continue
+        words = ""
+        if (major, minor) in mmi:
+            words += mmi[(major, minor)]["name"].lower()
+        if minor in nr:
+            words += " " + nr[minor].lower()
+        assert "pass" in words or "success" in words, (
+            f"({major},{minor}) {info.name} marked GRANTED but no catalog calls it a "
+            "pass/success — GRANTED is only ever imported for real auth passes"
+        )
+
+
+def test_catalog_granted_upgrades_are_not_in_our_table() -> None:
+    """The concrete counter-example: (5,175) is `granted` in mmisobuj but is a firmware
+    upgrade. If it ever enters our table, this fires — it must stay unnamed
+    (info + unknown_code), never a punch."""
+    for major, minor in ((5, 175), (5, 177), (5, 224), (5, 219)):
+        assert (major, minor) not in EVENT_CODE_TABLE
+        got = classify_event(
+            {
+                "major": 5,
+                "minor": minor,
+                "employeeNoString": "1",
+                "serialNo": 1,
+                "currentVerifyMode": "cardOrFaceOrFp",
+            }
+        )
+        assert got.unknown_code and not got.punch_candidate
+
+
+def test_renamed_rows_keep_their_corrected_names() -> None:
+    """Names that were invented in the first draft (they appear in NO catalog) must come
+    back corrected, not 'helpfully' restored: (5,154) is a TIMEOUT in both catalogs,
+    (5,34) and (5,105) are catalog-named PASSES the earlier INFO label silently dropped,
+    and (3,90) is localUpgrade — LOCAL_LOGOUT is (3,81)."""
+    assert name_for(5, 154) == "COMBINED_VERIFY_TIMEOUT"
+    assert outcome_for(5, 154) is Outcome.DENIED
+    assert name_for(3, 90) == "LOCAL_UPGRADE"
+    assert name_for(3, 81) == "LOCAL_LOGOUT"
+    # The silent-drop class: both are GRANTED catalog passes now.
+    assert outcome_for(5, 34) is Outcome.GRANTED
+    assert outcome_for(5, 105) is Outcome.GRANTED
+    assert {34, 105} <= AUTH_PASS_MINORS
+    rec = {
+        "major": 5,
+        "minor": 34,
+        "employeeNoString": "1",
+        "serialNo": 1,
+        "currentVerifyMode": "cardOrFaceOrFp",
+    }
+    assert classify_event(rec).punch_candidate is True
+
+
+def test_no_row_names_a_code_that_only_our_own_table_invents() -> None:
+    """Cross-check every shipped NAME against the catalogs' wording, not just the code.
+
+    A row like (5,142) DEVICE_TAMPER passes a code-existence check while still inventing
+    a label (the catalogs call 142 localFaceModelingFail), so name agreement is required
+    too: our name must share at least one word (case-insensitive) with a catalog name for
+    the same code. No abbreviation table: every shipped name already shares a stem with
+    the catalog wording, which is exactly what this guard is for."""
+    nr, mmi = vendor_catalogs()
+
+    def words(name: str) -> set[str]:
+        return {tok for tok in name.upper().split("_") if len(tok) > 2}
+
+    for (major, minor), info in EVENT_CODE_TABLE.items():
+        ours = {w.lower() for w in words(info.name)}
+        candidates: set[str] = set()
+        if (major, minor) in mmi:
+            candidates |= {
+                w.lower() for w in re.split(r"(?=[A-Z])", mmi[(major, minor)]["name"]) if len(w) > 2
+            }
+        if major == 5 and minor in nr:
+            candidates |= {w.lower() for w in nr[minor].split("_") if len(w) > 2}
+        assert ours & candidates, (
+            f"({major},{minor}) {info.name} shares no word with any catalog name for "
+            f"this code ({mmi.get((major, minor), {}).get('name')} / {nr.get(minor)})"
+        )
