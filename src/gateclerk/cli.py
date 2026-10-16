@@ -19,12 +19,19 @@ import typer
 
 from gateclerk import __version__
 from gateclerk import config as cfg
+from gateclerk.capabilities import discover
 from gateclerk.config import KeychainReader, resolve_credentials, site_from_args
-from gateclerk.exceptions import ConfigError, CredentialUnavailable
+from gateclerk.exceptions import (
+    ConfigError,
+    CredentialUnavailable,
+    IsapiAuthError,
+    GateclerkError,
+)
+from gateclerk.isapi_transport import IsapiClient
 from gateclerk.output import CHOICES as OUTPUT_CHOICES
 from gateclerk.output import OutputFormat, make_console, render
 
-__all__ = ["CONFIG_ERROR_EXIT", "NOT_IMPLEMENTED_EXIT", "app", "main"]
+__all__ = ["CONFIG_ERROR_EXIT", "DEVICE_ERROR_EXIT", "NOT_IMPLEMENTED_EXIT", "app", "main"]
 
 app = typer.Typer(
     name="gateclerk",
@@ -71,6 +78,15 @@ NOT_IMPLEMENTED_EXIT = 3
 #: credential failure is a different class of "you have not told me how to reach it" from
 #: a device error.
 CONFIG_ERROR_EXIT = 2
+
+#: Also from p1-08's contract, declared here because p1-04's `device capabilities` needs
+#: it now: the device answered, and said no (or said something we refused to parse).
+#: Distinct from 2 so a script can tell "fix your config" from "the box/its firmware".
+DEVICE_ERROR_EXIT = 4
+
+#: p1-08's contract, same reasoning: a terminal 401 (circuit open / lockout risk) is its
+#: own class — the transport already refused to retry, and a human has to intervene.
+AUTH_TERMINAL_EXIT = 3
 
 # Port / timeout / tz come from gateclerk.config so the CLI default and the config default
 # cannot drift apart (p1-01 left these literal here; p1-02 owns the values now).
@@ -199,6 +215,61 @@ def _resolve_creds(
         raise _config_exit(output, str(exc)) from exc
 
 
+def _device_exit(console_output: OutputFormat, message: str) -> typer.Exit:
+    """Report a device/protocol failure (exit 4): the box answered, and it was not usable."""
+    if console_output is OutputFormat.JSON:
+        render([{"error": message, "exit_code": DEVICE_ERROR_EXIT}], fmt="json")
+    else:
+        make_console().print(f"[red]error:[/red] {message}", markup=True)
+    return typer.Exit(code=DEVICE_ERROR_EXIT)
+
+
+def _auth_exit(console_output: OutputFormat, message: str) -> typer.Exit:
+    """Report a terminal 401 (exit 3, p1-08's contract) with the lockout warning attached.
+
+    The number 3 is also NOT_IMPLEMENTED_EXIT for the *stub* commands — deliberately not
+    resolved here: within an implemented command 3 can only mean terminal-auth (a stub
+    never authenticates), and p1-08 owns the final table. Flagged on the board so the
+    orchestrator renumbers deliberately, not by accident, when the stubs die.
+    """
+    hint = (
+        " (the transport circuit-opened to protect against a terminal account lockout — "
+        "verify the credential before retrying; see gateclerk creds check)"
+    )
+    if console_output is OutputFormat.JSON:
+        render(
+            [{"error": message + hint, "exit_code": AUTH_TERMINAL_EXIT}],
+            fmt="json",
+        )
+    else:
+        make_console().print(f"[red]error:[/red] {message}{hint}", markup=True)
+    return typer.Exit(code=AUTH_TERMINAL_EXIT)
+
+
+def _client_for(
+    target: cfg.DeviceTarget,
+    creds: cfg.Credentials,
+    *,
+    timeout: float,
+    output: OutputFormat,
+) -> IsapiClient:
+    """Build the read-only client for one device.
+
+    `reveal()` is called here and nowhere else: the plaintext exists from this line to the
+    transport's digest object (p1-02's seam). A construction failure is a config problem
+    (a bad base_url), so it exits 2 like any other "you have not told me how to reach it".
+    """
+    try:
+        return IsapiClient(
+            f"http://{target.host}:{target.port}",
+            creds.user,
+            creds.password.reveal(),
+            read_timeout=timeout,
+        )
+    except ValueError as exc:
+        raise _config_exit(output, str(exc)) from exc
+
+
 # --- root ---------------------------------------------------------------------------
 
 
@@ -271,6 +342,66 @@ def device_time(
         "cards p1-03 (transport) + p1-06 (tz/skew)",
         host=target.host,
         port=target.port,
+    )
+
+
+@device_app.command("capabilities")
+def device_capabilities(
+    host: HostArg = None,
+    site: SiteOpt = None,
+    config: ConfigOpt = None,
+    port: PortOpt = DEFAULT_PORT,
+    user: UserOpt = None,
+    password: PasswordOpt = None,
+    timeout: TimeoutOpt = DEFAULT_TIMEOUT,
+    output: OutputOpt = OutputFormat.TABLE,
+    json_flag: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Raw capability dump (the evidence trail for docs/OBSERVED.md). "
+            "Shorthand for --output json.",
+        ),
+    ] = False,
+    refresh: Annotated[
+        bool,
+        typer.Option(
+            "--refresh",
+            help="Ignore the in-process (serial, firmware) cache and re-read the device.",
+        ),
+    ] = False,
+) -> None:
+    """Read the device's own capability advertisement (card p1-04).
+
+    Card size we may ask for, searchID length, the queryable major set and the minor
+    code sets all come from here — never from a guessed table. `--json` prints the raw
+    bodies too, which is what gets pasted into docs/OBSERVED.md after a live run.
+    """
+    target = _resolve_site(
+        host=host, site=site, port=port, sites_file=config, output=output
+    ).target()
+    creds = _resolve_creds(target, user=user, password=password, output=output)
+    fmt = OutputFormat.JSON if json_flag else output
+    with _client_for(target, creds, timeout=timeout, output=fmt) as client:
+        try:
+            caps = discover(client, force_refresh=refresh)
+        except IsapiAuthError as exc:
+            raise _auth_exit(fmt, str(exc)) from exc
+        except GateclerkError as exc:
+            raise _device_exit(fmt, str(exc)) from exc
+    if fmt is OutputFormat.JSON:
+        render([caps.as_dict()], fmt=fmt.value)
+        return
+    render(
+        [
+            {
+                "capability": "device",
+                "value": " ".join(str(p) for p in (caps.model, caps.serial, caps.firmware) if p),
+            },
+            *caps.summary_rows(),
+        ],
+        fmt=fmt.value,
+        columns=("capability", "value"),
     )
 
 
