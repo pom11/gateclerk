@@ -155,7 +155,16 @@ class IsapiBadContent(IsapiError):
 
 
 class IsapiBusy(IsapiError):
-    """deviceBusy / activeOperator / invalidOperation — back off and retry, bounded."""
+    """The retryable busy family — deviceBusy / serviceUnavailable / noMemory /
+    upgrading / activeOperator (plus the beingExportedByAnotherUser wait) — back off
+    and retry, bounded.
+
+    NOT `invalidOperation`: that is vendor `statusCode` 4, terminal per the table in
+    docs/references/isapi-client-gotchas.md §2.2 and DESIGN.md's Throttling line —
+    retrying a 4-class code is how a polling loop becomes a door-terminal lockout.
+    `_BUSY_SUBCODES` in `gateclerk.isapi_response` is the mapping table; both sides of
+    the boundary are pinned in tests (test_isapi_response.py + test_isapi_transport.py).
+    """
 
 
 class IsapiNotFound(IsapiError):

@@ -397,6 +397,86 @@ def test_busy_exhaustion_raises_isapi_busy() -> None:
     assert len(device.served) == 3, "challenge + 2 busy attempts, then stop"
 
 
+# --- subcode -> class boundary at the transport (lockout-safety edge) --------------------
+#
+# Ordered by gateclerk-orch in REVIEW ROUND 1 of PR #5 (t_a8cdd1a9): the mapping table in
+# isapi_response.py decides which codes get a backoff loop, and until now only
+# `deviceBusy` was exercised end-to-end. These pin the two codes on the boundary with
+# the device request count as the assertion — the count is what a lockout is made of.
+
+
+def envelope_response(http_status: int, status_code: int, sub_status_code: str) -> httpx.Response:
+    """Invented (labelled per this repo's fixture convention): an XML error envelope in
+    the shape `webs` really answers with — the recorded deviceBusy transcript
+    (gotchas §8) is HTTP 503 + statusCode 2 + subStatusCode."""
+    return httpx.Response(
+        http_status,
+        content=(
+            f'<?xml version="1.0"?><ResponseStatus><statusCode>{status_code}</statusCode>'
+            f"<statusString>{sub_status_code}</statusString>"
+            f"<subStatusCode>{sub_status_code}</subStatusCode></ResponseStatus>"
+        ).encode(),
+        headers={"Content-Type": "application/xml"},
+    )
+
+
+def test_active_operator_is_retried_like_devicebusy_then_succeeds() -> None:
+    """DESIGN.md Throttling buckets `activeOperator` busy ('someone else holds the
+    operator slot' is a wait, never an auth failure). End-to-end proof: the same bounded
+    exponential backoff `deviceBusy` gets, and the request count is challenge + 2 busy
+    + success — nothing extra."""
+    device = FakeDevice()
+    sleeps: list[float] = []
+    busy = envelope_response(503, 2, "activeOperator")
+    device.add_raw("POST", EVENT_SEARCH, device.challenge(), busy, busy)
+    device.json_ok("POST", EVENT_SEARCH, {"AcsEvent": {"responseStatusStrg": "OK"}})
+    client = make_client(
+        device,
+        sleep=sleeps.append,
+        busy_max_attempts=3,
+        busy_backoff_base=1.0,
+        busy_backoff_cap=8.0,
+    )
+    out = client.search("acs_event_search", {"AcsEventCond": {"searchID": "s"}})
+    assert out["AcsEvent"]["responseStatusStrg"] == "OK"
+    assert sleeps == [1.0, 2.0], "same exponential schedule deviceBusy gets"
+    assert len(device.served) == 4, "challenge + 2 busy + success, and NO extra attempt"
+    assert device.challenges == 0 and not client.circuit_open(), (
+        "the raw 401 was the digest handshake; a busy-family code must not provoke an "
+        "auth failure of its own or open the lockout circuit"
+    )
+
+
+def test_active_operator_exhaustion_raises_isapi_busy_bounded() -> None:
+    """Bounded half: a device stuck on `activeOperator` stops us at busy_max_attempts —
+    the bound that keeps an operator-slot hold from becoming an infinite poll."""
+    device = FakeDevice()
+    busy = envelope_response(503, 2, "activeOperator")
+    device.add_raw("POST", EVENT_SEARCH, device.challenge(), busy, busy)
+    client = make_client(device, sleep=lambda _s: None, busy_max_attempts=2)
+    with pytest.raises(IsapiBusy):
+        client.search("acs_event_search", {"AcsEventCond": {"searchID": "s"}})
+    assert len(device.served) == 3, "challenge + 2 attempts, then stop — never a 3rd"
+
+
+def test_invalid_operation_is_terminal_and_never_retried() -> None:
+    """The lockout-safety half of the boundary (gotchas §2.2/§2.4, DESIGN.md Throttling
+    'Not invalidOperation'): vendor class 4 answers HTTP 400 + statusCode 4 — the shape
+    our own error_total_notsupport.json shows — and MUST reach the device exactly once.
+    A backoff loop here hammers a device that will never change its answer, which is how
+    polling becomes a door-terminal lockout."""
+    device = FakeDevice()
+    sleeps: list[float] = []
+    terminal = envelope_response(400, 4, "invalidOperation")
+    device.add_raw("POST", EVENT_SEARCH, device.challenge(), terminal)
+    client = make_client(device, sleep=sleeps.append, busy_max_attempts=6)
+    with pytest.raises(IsapiError) as excinfo:
+        client.search("acs_event_search", {"AcsEventCond": {"searchID": "s"}})
+    assert not isinstance(excinfo.value, IsapiBusy), "the retry class is decided by the subcode"
+    assert len(device.served) == 2, "challenge + ONE delivery — no retry, no backoff"
+    assert sleeps == [], "the busy backoff must never engage for a class-4 code"
+
+
 def test_status_code_3_is_retried_exactly_once() -> None:
     """DESIGN.md retry table: statusCode 3 -> once, then surface (vendor class 3,
     gotchas §7.4). Two deviceError replies = give up after exactly one retry."""
