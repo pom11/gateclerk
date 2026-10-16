@@ -14,6 +14,11 @@ Three hard guarantees, all mechanical rather than advisory:
    the `main()`/console-script entry point, which the in-process CliRunner does not use.
    The child refuses to resolve a name or build a socket; the only way a test there can
    pass is if the code handles the failure without ever needing either.
+4. The run must import `gateclerk` from the checkout it lives in, never from another
+   checkout's editable install. See `_source_guard.py`: the main checkout installs
+   gateclerk editable, so a bare `pytest` in a git worktree imports MAIN's `src/gateclerk`
+   and can print a green suite for code the worktree does not contain (this happened on
+   t_7b073d11). `pytest_configure` below aborts before collection when it detects that.
 """
 
 from __future__ import annotations
@@ -25,8 +30,11 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
+
+from _source_guard import mismatch_message, resolve_package_origin
 
 
 class NetworkBlockedError(RuntimeError):
@@ -38,6 +46,26 @@ def _blocked(*args: object, **kwargs: object) -> None:
         "offline test tried to use the network — tests must run against fixtures "
         "(tests/fixtures/) or httpx.MockTransport; see docs/DESIGN.md 'Testing'"
     )
+
+
+def enforce_source_guard(checkout_root: Path) -> None:
+    """Raise `pytest.UsageError` unless `gateclerk` resolves under `checkout_root`.
+
+    Takes the plain root path rather than a `Config` so the decision is testable without
+    fabricating a pytest session; the hook below is the only caller.
+    """
+    message = mismatch_message(resolve_package_origin(), checkout_root)
+    if message is not None:
+        raise pytest.UsageError(message)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Abort the session (exit 4, nothing collected or run) on a wrong-checkout gateclerk.
+
+    Runs before collection, so no green result can ever be printed for a tree that
+    the imported package does not belong to. See tests/_source_guard.py for why.
+    """
+    enforce_source_guard(Path(config.rootpath))
 
 
 @pytest.fixture(autouse=True)

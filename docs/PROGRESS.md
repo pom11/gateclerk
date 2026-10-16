@@ -29,6 +29,15 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-16 late evening — PR #17 source guard merged (d40eef8); watching p1-08
+
+- `pytest` now **exits 4 pre-collection** if `gateclerk` would import from outside the
+  checkout (main's editable install used to make worktree runs falsely green — the
+  t_7b073d11 episode). Reproduced both directions by orchestrator before merging.
+  Use `uv run --frozen pytest` in worktrees from now on (CI already does).
+- Running: p1-08 CLI (healthy, ~1h in, editing cli.py). Then p1-09 suite, then P1-10
+  live smoke (owner). Fleet note: 3 serving nodes since 21:26 — slower turns only.
+
 ## 2026-10-16 evening — review cycle 4: PRs #7/#8/#9/#14/#15/#16 merged, main at 743 tests
 
 - **Queue had gone stale 3h** — watcher fired `!WATCH` but a background process attached to
