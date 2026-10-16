@@ -299,8 +299,14 @@ NTP anyway; only the tz rule is wrong).
 - **`Invalid Content` / `badParameters`**: almost always our request shape, not the
   device's. Include the request body verbatim in the error we raise.
 - **Half-open TCP**: the device drops idle keep-alives. Keep **connection reuse ON**
-  (digest `nonce`/`nc` are sessionful — closing per request forces a 401 re-pay on every
-  paged call, and the reuse is what makes a 20-page search 21 requests instead of 40),
+  (closing per request does **not** force a 401 re-pay — digest state lives on the auth
+  object, and gotchas §1.7c pays one challenge across five GETs even with the device
+  answering `Connection: close` every time. What closing costs is the pull toward the
+  fresh-auth-per-call workaround, which "doubles every request" (10 vs 6 for five GETs,
+  gotchas §1.7a): a 20-page search stops being 21 requests and becomes 40. The digest
+  failure actually worth managing is the nonce on that long-lived auth object — a stale
+  nonce with an ever-climbing `nc` — and that is independent of TCP keep-alive
+  (gotchas §1.7a)),
   set explicit timeouts — connect 10 s / read 30 s, both configurable — and recover from
   a dropped keep-alive with **one transparent retry** on `httpx.TransportError`, same
   client, same request bytes. *(Amended at the p1-03 merge — superseded text here
