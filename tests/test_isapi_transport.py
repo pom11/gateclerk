@@ -669,11 +669,15 @@ def test_every_registry_path_uses_only_get_or_the_advertised_search_posts() -> N
     methods = {ep.method.value for ep in REGISTRY.values()}
     assert methods == {"GET", "POST"}
     posts = {name for name, ep in REGISTRY.items() if ep.method.value == "POST"}
-    assert posts == set(SEARCH_ENDPOINTS) == {
-        "user_info_search",
-        "acs_event_search",
-        "acs_event_total_num",
-    }
+    assert (
+        posts
+        == set(SEARCH_ENDPOINTS)
+        == {
+            "user_info_search",
+            "acs_event_search",
+            "acs_event_total_num",
+        }
+    )
 
 
 def test_unknown_endpoint_name_cannot_smuggle_a_path() -> None:

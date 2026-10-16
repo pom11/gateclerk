@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from gateclerk.capabilities import DeviceCapabilities, device_identity, discover
@@ -147,8 +147,11 @@ class RunContext:
         if self.inter_page_delay < 0:
             raise ValueError(f"inter-page delay must be >= 0, got {self.inter_page_delay}")
         # Fail here rather than on page 40: an unresolvable zone resolves EVERY event in
-        # the run to `unresolved`, which reads like data instead of like a typo.
-        TimeResolver(site_tz=self.site_tz).zone
+        # the run to `unresolved`, which reads like data instead of like a typo. A bad zone
+        # *name* already raises out of the resolver; this refuses the other route to the
+        # same silent outcome — a zone that was given but resolves to nothing.
+        if self.site_tz is not None and TimeResolver(site_tz=self.site_tz).zone is None:
+            raise ValueError(f"site timezone {self.site_tz!r} resolves to no zone")
 
     def with_logger(self, logger: RequestLogger | None) -> RunContext:
         """Same context, logging (frozen dataclass, so: a copy)."""
@@ -541,9 +544,7 @@ def _matches(
         return False
     if verify is not None and not _verify_matches(record.verify_mode, verify):
         return False
-    if outcome is not None and record.outcome.value != outcome.strip().lower():
-        return False
-    return True
+    return outcome is None or record.outcome.value == outcome.strip().lower()
 
 
 def _verify_matches(verify_mode: str | None, wanted: str) -> bool:
@@ -740,10 +741,22 @@ def _search_reader(client: Any, endpoint: str = "acs_event_search") -> PageReade
 
 
 def _count_getter(client: Any) -> Callable[[], dict[str, Any]]:
-    """The advisory `UserInfo/Count` reader p1-05's post-pull sanity check wants."""
+    """The advisory `UserInfo/Count` reader p1-05's post-pull sanity check wants.
+
+    Made non-raising here, at the CLI's seam: `collect_users` calls `count_get()` plainly,
+    so an `IsapiNotFound` from a firmware with no count endpoint (OBSERVED.md records that
+    shape for this endpoint's neighbours) would escape as exit 4 and fail a roster pull over
+    a number that only decorates it. `paging`'s own rule is warn-not-fail; returning `{}` is
+    how that rule reaches the engine without editing the engine.
+    """
 
     def get() -> dict[str, Any]:
-        return client.get("user_info_count")
+        try:
+            return client.get("user_info_count")
+        except IsapiError as exc:
+            if isinstance(exc, IsapiAuthError):
+                raise
+            return {}
 
     return get
 

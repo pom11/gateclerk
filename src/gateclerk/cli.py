@@ -30,15 +30,14 @@ because the card names them as groups (`users list`, `device info`).
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import httpx
 import typer
 
-from gateclerk import __version__
+from gateclerk import __version__, pipeline
 from gateclerk import config as cfg
-from gateclerk import pipeline
 from gateclerk.capabilities import device_identity
 from gateclerk.config import KeychainReader, resolve_credentials, site_from_args
 from gateclerk.exceptions import (
@@ -51,13 +50,11 @@ from gateclerk.exceptions import (
     SearchRunawayError,
 )
 from gateclerk.isapi_transport import IsapiClient
-from gateclerk.model import RECORD_JSON_KEYS
 from gateclerk.output import CHOICES as OUTPUT_CHOICES
 from gateclerk.output import OutputFormat, make_console, render
-from gateclerk.paging import DEFAULT_CHUNK, DEFAULT_MAX_PAGES, parse_chunk
+from gateclerk.paging import DEFAULT_CHUNK, parse_chunk
 from gateclerk.pipeline import DEFAULT_SITE_LABEL, RequestLogger, RunContext
 from gateclerk.tz import (
-    DEFAULT_SITE_TZ,
     SKEW_WARN_SECONDS,
     TimestampInputError,
     UserTimestamp,
@@ -222,7 +219,7 @@ VerboseOpt = Annotated[
     ),
 ]
 SiteLabelOpt = Annotated[
-    str,
+    str | None,
     typer.Option(
         "--site-label",
         help=f"Free-text label stamped onto every record (default: the --site name, else "
@@ -292,8 +289,7 @@ def _runaway_exit(fmt: OutputFormat, message: str) -> typer.Exit:
     """Report the paging cap (exit 5): the device kept saying MORE past 10k pages."""
     _error_payload(
         fmt,
-        message
-        + " (the paging engine refused to loop forever on a device that misbehaves; "
+        message + " (the paging engine refused to loop forever on a device that misbehaves; "
         "narrow --since/--until or check the device's log ring)",
         RUNAWAY_EXIT,
     )
@@ -475,7 +471,9 @@ def _logger_for(verbose: bool, creds: cfg.Credentials | None) -> RequestLogger |
     return RequestLogger(secrets=tuple(secrets))
 
 
-def _validate_choice(fmt: OutputFormat, value: str | None, *, flag: str, allowed: tuple[str, ...]) -> None:
+def _validate_choice(
+    fmt: OutputFormat, value: str | None, *, flag: str, allowed: tuple[str, ...]
+) -> None:
     """Reject an unknown `--verify`/`--outcome` as exit 2 rather than filtering to nothing.
 
     An empty result set is the most dangerous output this tool produces — it looks like a
@@ -510,9 +508,7 @@ def _resolve_window(
     return start, end
 
 
-def _resolved_site_tz(
-    *, tz: str | None, site: cfg.SiteConfig, fmt: OutputFormat
-) -> str:
+def _resolved_site_tz(*, tz: str | None, site: cfg.SiteConfig, fmt: OutputFormat) -> str:
     """--tz beats sites.toml's `iana_tz`, which beats the compiled-in default.
 
     Validated by constructing the context (which resolves the zone before any socket), so
@@ -525,6 +521,18 @@ def _resolved_site_tz(
     except TimestampInputError as exc:
         raise _config_exit(fmt, str(exc)) from exc
     return chosen
+
+
+def _now() -> datetime:
+    """The clock `captured_at` is stamped from — one module-level name, so a test can
+    freeze it instead of tolerating a timestamp race.
+
+    `RunContext.now` was already injectable (p1-08's own design); this is the seam that
+    lets the CLI's own test suite use it. The default is the real wall clock, and nothing
+    else in this module reads the time, so a frozen clock is provably the only thing a
+    test changes.
+    """
+    return datetime.now(UTC)
 
 
 def _context(
@@ -546,6 +554,7 @@ def _context(
             page_delay_ms=site_config.page_delay_ms,
             max_records=max_records,
             logger=logger,
+            now=_now,
         )
     except (ValueError, TimestampInputError) as exc:
         raise _config_exit(logger_format(logger), str(exc)) from exc
@@ -614,9 +623,7 @@ def device_info(
     not "the device sent JSON".
     """
     fmt = OutputFormat.JSON if json_flag else output
-    site_config = _resolve_site(
-        host=host, site=site, port=port, sites_file=config, output=fmt
-    )
+    site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
     target = site_config.target()
     creds = _resolve_creds(target, user=user, password=password, output=fmt)
     logger = _logger_for(verbose, creds)
@@ -682,9 +689,7 @@ def device_time(
       thing whose drift actually corrupts punch order.
     """
     fmt = OutputFormat.JSON if json_flag else output
-    site_config = _resolve_site(
-        host=host, site=site, port=port, sites_file=config, output=fmt
-    )
+    site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
     target = site_config.target()
     creds = _resolve_creds(target, user=user, password=password, output=fmt)
     site_tz = _resolved_site_tz(tz=tz, site=site_config, fmt=fmt)
@@ -785,15 +790,17 @@ def device_capabilities(
     the caller that asked for JSON.
     """
     fmt = OutputFormat.JSON if json_flag else output
-    site_config = _resolve_site(
-        host=host, site=site, port=port, sites_file=config, output=fmt
-    )
+    site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
     target = site_config.target()
     creds = _resolve_creds(target, user=user, password=password, output=fmt)
     logger = _logger_for(verbose, creds)
-    with _Guard(fmt):
-        with _client_for(target, creds, timeout=timeout, output=fmt, logger=logger) as client:
-            caps = pipeline.read_capabilities(client, force_refresh=refresh)
+    # One parenthesised `with` for both: the guard has to outlive the client, and
+    # listing them as siblings says that in the shape of the code.
+    with (
+        _Guard(fmt),
+        _client_for(target, creds, timeout=timeout, output=fmt, logger=logger) as client,
+    ):
+        caps = pipeline.read_capabilities(client, force_refresh=refresh)
     if fmt is OutputFormat.JSON or fmt is OutputFormat.JSONL:
         render([caps.as_dict()], fmt=fmt.value)
         return
@@ -824,7 +831,7 @@ def users_list(
     timeout: TimeoutOpt = DEFAULT_TIMEOUT,
     output: OutputOpt = OutputFormat.TABLE,
     verbose: VerboseOpt = False,
-    site_label: SiteLabelOpt = DEFAULT_SITE_LABEL,
+    site_label: SiteLabelOpt = None,
     employee_no: Annotated[
         str | None,
         typer.Option(
@@ -849,9 +856,7 @@ def users_list(
     it, so it cannot reach this table, this json, or a jsonl file.
     """
     fmt = output
-    site_config = _resolve_site(
-        host=host, site=site, port=port, sites_file=config, output=fmt
-    )
+    site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
     target = site_config.target()
     creds = _resolve_creds(target, user=user, password=password, output=fmt)
     logger = _logger_for(verbose, creds)
@@ -931,7 +936,7 @@ def events(
             "feeds gateclerk.model.from_jsonl() losslessly.",
         ),
     ] = OutputFormat.TABLE,
-    site_label: SiteLabelOpt = DEFAULT_SITE_LABEL,
+    site_label: SiteLabelOpt = None,
     employee_no: Annotated[
         str | None,
         typer.Option(
@@ -1015,9 +1020,7 @@ def events(
     answer, and only a filter typo should be able to look like a failure.
     """
     fmt = format
-    site_config = _resolve_site(
-        host=host, site=site, port=port, sites_file=config, output=fmt
-    )
+    site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
     target = site_config.target()
     _validate_choice(fmt, verify, flag="--verify", allowed=VERIFY_CHOICES)
     _validate_choice(fmt, outcome, flag="--outcome", allowed=OUTCOME_CHOICES)
@@ -1158,9 +1161,7 @@ def _print_count_crosscheck(
         why = " (client-side filter applied)" if filtered and not capped else ""
         if capped:
             why = " (--max-results capped the output)"
-    console.print(
-        f"count: device says {device_count}, printed {shown} ({verb}{why})", markup=False
-    )
+    console.print(f"count: device says {device_count}, printed {shown} ({verb}{why})", markup=False)
 
 
 # --- creds (p1-02): diagnostics that never open a socket ------------------------------

@@ -71,9 +71,7 @@ class Endpoint:
 #: card that asks for a callable path is what keeps the allowlist a decision rather than
 #: drift. `AcsEvent/Total` — the name you would guess — is `400 notSupport` on this firmware
 #: and is registered nowhere.
-SEARCH_ENDPOINTS = frozenset(
-    {"user_info_search", "acs_event_search", "acs_event_total_num"}
-)
+SEARCH_ENDPOINTS = frozenset({"user_info_search", "acs_event_search", "acs_event_total_num"})
 
 REGISTRY: dict[str, Endpoint] = {
     e.name: e

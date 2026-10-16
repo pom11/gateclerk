@@ -18,6 +18,7 @@ Deliberately no business logic here: it takes rows of plain dicts.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from enum import StrEnum
 from typing import Any, TextIO
@@ -50,6 +51,27 @@ except ImportError:  # pragma: no cover - the base-install path
 def make_console(**kwargs: Any) -> Console:
     """A Console that never wraps data into unreadable columns and never colours pipes."""
     return Console(no_color=True, highlight=False, soft_wrap=True, **kwargs)
+
+
+#: The table's width floor for a non-terminal stream (a pipe, a CI log, a captured test
+#: run). Rich falls back to 80 columns there, and the events table is nine columns wide
+#: with two ISO-8601 timestamps in it: at 80 it renders as `serial`/`_no` and
+#: `2026-0`/`5-21T1` — technically "both timestamps visible", practically unreadable, and
+#: unreadable is exactly what the payroll triage view exists to prevent. A real terminal
+#: keeps its own width (this floor only lifts it, never narrows it).
+TABLE_MIN_WIDTH = 200
+
+
+def _table_console(stream: TextIO | None) -> Console:
+    """The console the table renderer prints to, wide enough to show what it has.
+
+    `width` is passed only when the target is not a terminal: on a terminal rich's own
+    detection is right and overriding it would clip a user who made their window wide.
+    """
+    handle = stream if stream is not None else sys.stdout
+    if hasattr(handle, "isatty") and handle.isatty():
+        return make_console(file=stream)
+    return make_console(file=stream, width=TABLE_MIN_WIDTH)
 
 
 class OutputFormat(StrEnum):
@@ -110,7 +132,7 @@ def _render_table(
     columns: Sequence[str] | None,
     stream: TextIO | None,
 ) -> None:
-    console = make_console(file=stream)
+    console = _table_console(stream)
     if not rows:
         console.print("(no rows)", markup=False)
         return

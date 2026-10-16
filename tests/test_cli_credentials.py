@@ -6,8 +6,9 @@ resolution and the `creds` diagnostic group — and the rule that matters most o
 that reads door-hardware credentials: **nothing that prints may contain the password**,
 including on the failure path.
 
-`device info` etc. still exit 3 (p1-01's contract): they resolve the *site*, not the
-credential, so a CI runner with no Keychain never turns a stub into an exit 2.
+`device info` and friends are implemented as of card p1-08, so a command that cannot
+resolve a credential fails with exit 2 and prints the exact command to run — and the tests
+below pin that the failure names the host the site resolved, never the password.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from gateclerk.cli import CONFIG_ERROR_EXIT, NOT_IMPLEMENTED_EXIT, app
+from gateclerk.cli import CONFIG_ERROR_EXIT, app
 from gateclerk.config import DEFAULT_ISAPI_USER
 
 runner = CliRunner()
@@ -86,6 +87,44 @@ def json_rows(out: str) -> list[dict[str, object]]:
     return [json.loads(line) for line in clean(out).strip().splitlines() if line.strip()]
 
 
+def captured_client_urls(
+    monkeypatch: pytest.MonkeyPatch, args: list[str], env: dict[str, str] | None = None
+) -> list[str]:
+    """Run `args` with `IsapiClient` replaced by a recorder; return the base_urls asked for.
+
+    The recorder answers every read with an empty body, so the command runs to its "the
+    device told me nothing" path without a socket (which conftest would make raise anyway).
+    What comes back is the base_url the CLI *asked to build* — the only place a dropped
+    `sites.toml` port, or a guessed host, shows up while the run stays offline.
+    """
+    import gateclerk.cli as cli_mod
+
+    seen: list[str] = []
+
+    class _Recorder:
+        def __init__(self, base_url: str, *_a: object, **_kw: object) -> None:
+            seen.append(base_url)
+
+        def __enter__(self) -> _Recorder:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, _name: str) -> dict[str, object]:
+            return {}
+
+        def get_response(self, _name: str) -> object:
+            return type("R", (), {"content": b"{}", "status_code": 200})()
+
+        def search(self, _name: str, _payload: object) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(cli_mod, "IsapiClient", _Recorder)
+    run(args, env)
+    return seen
+
+
 @pytest.fixture
 def sites_file(tmp_path: Path) -> Path:
     path = tmp_path / "sites.toml"
@@ -121,15 +160,27 @@ def test_device_info_help_shows_the_credential_flags() -> None:
     assert "default: 30.0" in cleaned, "read timeout default is 30s"
 
 
-def test_site_flag_resolves_host_from_sites_toml(sites_file: Path) -> None:
-    """--site supplies the host; the stub still exits 3 and echoes the resolved host."""
+def test_site_flag_resolves_host_from_sites_toml(
+    sites_file: Path, monkeypatch: pytest.MonkeyPatch, no_security: None
+) -> None:
+    """--site supplies the host, and the site's PORT travels with it.
+
+    p1-01 wrote this against the scaffold stub, which echoed the resolved target. The
+    command is implemented now, so the same two facts are pinned where they still have to
+    hold: the credential error names the host `--site` resolved, and the client is built on
+    the site's port (8080) rather than the flag default (80). A dropped port would send the
+    request to the wrong device — the exact class of bug this file exists to catch.
+    """
     code, out = run(["device", "info", "--site", "site-a", "--config", str(sites_file)])
-    assert code == NOT_IMPLEMENTED_EXIT, clean(out)
-    cleaned = clean(out)
-    assert HOST in cleaned, "the resolved host must reach the command"
-    assert "not implemented" in cleaned.lower()
-    assert "p1-0" in cleaned, "a stub must still name the card that implements it"
-    assert "8080" in cleaned, "the site's port must be honoured, not the flag default"
+    assert code == CONFIG_ERROR_EXIT, clean(out)
+    assert HOST in clean(out), "the resolved host must reach the command"
+
+    urls = captured_client_urls(
+        monkeypatch,
+        ["device", "info", "--site", "site-a", "--config", str(sites_file)],
+        env={"GATECLERK_192_0_2_10_PASSWORD": "fakepw", "GATECLERK_USER": "admin"},
+    )
+    assert urls == [f"http://{HOST}:8080"], f"site port not honoured: {urls}"
 
 
 def test_site_and_host_are_mutually_exclusive(sites_file: Path) -> None:
@@ -170,16 +221,16 @@ def test_bad_site_block_surfaces_the_validation_message(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("group", "command"),
-    [("device", "info"), ("device", "time"), ("users", "list"), ("events", "search")],
+    "argv",
+    [["device", "info"], ["device", "time"], ["users", "list"], ["events"]],
 )
-def test_site_and_config_flags_are_shared_across_device_commands(group: str, command: str) -> None:
+def test_site_and_config_flags_are_shared_across_device_commands(argv: list[str]) -> None:
     """p1-08 builds on one spelling of these; per-command drift is the bug this pins."""
-    code, out = run([group, command, "--help"])
+    code, out = run([*argv, "--help"])
     assert code == 0
     joined = squashed(out)
     for flag in ("--host", "--site", "--config", "--user", "--password"):
-        assert flag in joined, f"{group} {command} lacks {flag}"
+        assert flag in joined, f"{argv} lacks {flag}"
 
 
 # --- creds check ------------------------------------------------------------------------
