@@ -458,6 +458,13 @@ def test_non_direction_statuses_are_kept_verbatim(status: str) -> None:
 #: `raw` is the untouched *device* record (field contract, DESIGN.md).
 FIXTURE_ANNOTATION_KEYS = frozenset({"expected_direction", "expected_source", "_note", "id"})
 
+#: The fixture entries that must exist, by serialNo. Each one is the only end-to-end path
+#: (through `record_from_event` + the raw round trip) for the status it carries, so the
+#: inventory is pinned exactly rather than floored: dropping, duplicating, renumbering or
+#: swapping an entry fails the suite. A count floor cannot promise that — with 9 entries a
+#: `>= 6` floor let 1..3 entries disappear silently.
+FIXTURE_SERIAL_NOS = frozenset({7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, 7009})
+
 
 def device_event(case: dict) -> dict:
     """One fixture entry with its test annotations removed — the record's `raw`."""
@@ -499,9 +506,19 @@ def test_attendance_fixture_annotations_never_reach_raw() -> None:
     Without this, a broken `device_event` filter would post `expected_direction` into the
     store's `raw` column — an audit trail carrying a value the device never sent — and the
     per-entry assertions would still pass, because they read the same filtered dict.
+
+    It also pins the fixture inventory exactly (see FIXTURE_SERIAL_NOS): every entry must
+    be present exactly once, so dropping, duplicating or renumbering one fails here even
+    though the inline direction table would not notice.
     """
     cases = load_synthetic("attendance_status_events.json")["InfoList"]
-    assert len(cases) >= 6, "the fixture lost entries; the direction table is under-covered"
+    serials = [case["serialNo"] for case in cases]
+    assert serials == sorted(FIXTURE_SERIAL_NOS), (
+        f"fixture inventory changed: expected {sorted(FIXTURE_SERIAL_NOS)}, got {serials}"
+    )
+    assert len(cases) == len(FIXTURE_SERIAL_NOS), (
+        f"fixture entry count changed: {len(cases)} vs {len(FIXTURE_SERIAL_NOS)} pinned ids"
+    )
     for case in cases:
         annotated = case.keys() & FIXTURE_ANNOTATION_KEYS
         assert annotated, f"fixture entry {case['serialNo']} declares no expectation"
