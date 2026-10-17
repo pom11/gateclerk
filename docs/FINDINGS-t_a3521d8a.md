@@ -20,7 +20,43 @@ bounded recovery budget. Step 3: keep the wrong-password lockout invariant green
 
 ## Findings so far
 
-(none yet — appended as they land)
+### F1 — the mechanism is shape (c): 401 + error envelope + NO `WWW-Authenticate` (MECHANISM DETERMINED, offline)
+
+Probe: `FakeDevice.retire_after=N` (new repeatable use-cap seam) driven through the
+CURRENT, unmodified `IsapiClient` for all three shapes (`n=5`, 14 GETs each). Real
+device never contacted.
+
+```
+shape=stale_true     -> 14/14 calls OK, died_at=None, circuit=False, req=17, retirements=2
+shape=stale_false    -> 14/14 calls OK, died_at=None, circuit=False, req=17, retirements=2
+shape=envelope_only  -> dies on call 6 (= N+1), circuit_open=True, req=7, retirements=1
+```
+
+Why: `httpx.DigestAuth.auth_flow` (`.venv/.../httpx/_auth.py:201-222`) re-pays **any**
+401 that carries a `WWW-Authenticate: Digest` header — it never reads `stale` at all
+(gotchas §1.5 said this; now re-confirmed against 0.28.1). So shapes (a) and (b) are
+already survivable today, stale-flag spelling notwithstanding: the replay costs ONE
+extra request per retirement and the walk continues.
+
+Shape (c) is the repro: with no `WWW-Authenticate`, `auth_flow` returns at `_auth.py:201`
+without re-paying, so the 401 reaches `_call`, which takes the
+`isinstance(error, IsapiAuthError)` branch (`isapi_transport.py:323-327`) → `_open_circuit()`
+→ raise. Exit 3 at exactly request N+1 with a CORRECT password and the device unlocked
+— i.e. the live symptom, reproduced deterministically offline.
+
+Second-order detail that makes (c) a *permanent* failure rather than a hiccup, and is
+the reason a naive "just resend the request" cannot work: `_last_challenge` still holds
+the DEAD nonce after a no-challenge 401, so the next request re-presents it with a
+climbing `nc` and 401s forever (gotchas §1.7a "worked for an hour, then 401 forever
+until restart"). The recovery must therefore **drop the auth state**, not just resend.
+
+### F2 — consequence for the fix
+
+(a)/(b) need no new transport behaviour beyond "do not open the circuit on a 401 that
+was survived" (they never reach our error path). (c) needs the auth-state reset + one
+re-bootstrap. Both must stay inside one bounded budget so a wrong password still costs
+exactly the p1-03 attempt budget.
+
 
 ## Plan / next steps
 
