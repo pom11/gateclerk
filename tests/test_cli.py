@@ -18,6 +18,7 @@ import re
 import pytest
 from typer.testing import CliRunner
 
+from _cli_surface import command_at, declared_flags, declared_param
 from gateclerk import __version__
 from gateclerk.cli import CONFIG_ERROR_EXIT, app
 
@@ -166,25 +167,29 @@ def test_output_rejects_unknown_format() -> None:
 
 
 def test_connection_flags_are_shared_across_commands() -> None:
-    """--host/--port/--user/--password/--timeout exist on every device-reading command."""
+    """--host/--port/--user/--password/--timeout exist on every device-reading command.
+
+    Read from Click's parameter objects rather than from the rendered help: Typer renders
+    help through Rich, and on a GitHub Actions runner Rich is told it has a terminal and
+    crops rows it cannot fit, which has already made a flag-presence test on that render
+    fail in CI while passing locally. See tests/_cli_surface.py.
+    """
     for cmd, _args in DEVICE_COMMANDS:
-        code, out = run([*cmd, "--help"])
-        assert code == 0
-        squashed = _squash(out)
+        declared = declared_flags(command_at(app, cmd))
         for flag in ("--host", "--port", "--user", "--password", "--timeout"):
-            assert flag in squashed, f"{cmd} is missing {flag}"
+            assert flag in declared, f"{cmd} is missing {flag}"
 
 
 def test_shared_flag_defaults_match_the_design() -> None:
     """Port 80 / 30s read timeout / Europe-Bucharest are DESIGN.md decisions, not whims."""
     for cmd, _args in DEVICE_COMMANDS:
-        code, out = run([*cmd, "--help"])
-        assert code == 0
-        cleaned = _clean(out)
-        assert "default: 80" in cleaned, "ISAPI default port must be 80 (HTTP, TLS out of scope)"
-        assert "default: 30.0" in cleaned, "read timeout default is 30s"
-    code, out = run(["events", "--help"])
-    assert "Europe/Bucharest" in _clean(out)
+        assert declared_param(command_at(app, cmd), "--port").default == 80, (
+            "ISAPI default port must be 80 (HTTP, TLS out of scope)"
+        )
+        assert declared_param(command_at(app, cmd), "--timeout").default == 30.0, (
+            "read timeout default is 30s"
+        )
+    assert declared_param(command_at(app, ["events"]), "--tz").default == "Europe/Bucharest"
 
 
 def test_ansi_helpers_survive_the_output_ci_actually_produced() -> None:
