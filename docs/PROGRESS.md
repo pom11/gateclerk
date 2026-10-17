@@ -29,6 +29,20 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-17 morning — p1-08 CLI merged (PR #18 -> 79ab6ff); "stall" was a dispatcher bug
+
+- The 03:49-quiet card was DONE: PR #18 open since 00:41, branch pushed, worktree clean,
+  last commit 03:39. What repeated at 03:50-03:53: dispatcher relaunches a `review`-status
+  card into the worker's own session -> ~60s crash x3 -> gave_up -> blocked. Worker's
+  reasoning in its last output was correct (kept review-not-done so p1-09 couldn't false-
+  release before merge). **Pattern: review-status + no orchestrator action = crash-loop.**
+  Heartbeats + worktree git are the truth; a quiet RUNNING after a PR is pushed = waiting.
+- Reviewed + merged PR #18 with full gate: 841 passed on merged tree, ruff clean, CI green.
+  Verified: stderr-only verbose w/ Authorization fully dropped, --count advisory (never a
+  loop bound), third POST (AcsEventTotalNum) added in the open — DESIGN.md invariant +
+  both guard tests moved two->three together, still falsifiable.
+- Now: p1-09 (ready, dispatcher has it), then P1-10 live smoke = owner.
+
 ## 2026-10-16 late evening — PR #17 source guard merged (d40eef8); watching p1-08
 
 - `pytest` now **exits 4 pre-collection** if `gateclerk` would import from outside the
