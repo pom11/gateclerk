@@ -29,6 +29,24 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-17 evening — P1-10 live run: P0 found + dispatched (device REQUIRES offset startTime)
+
+- Owner ran steps 1-4 green (model/serial/fw OK, skew -0.9s, count agrees, names
+  plaintext). **Step 5 = P0**: device rejects our naive `startTime` → 400
+  badJsonContent errorMsg=startTime; +03:00/+02:00 both 200. Every live events pull
+  fails today. Offline missed it because FakeDevice accepts any body — mock lenience =
+  false green.
+- Evidence on main: OBSERVED.md "Event-window startTime form: offset REQUIRED"
+  (67d29a5). DESIGN.md's "+ offsets" was right; p1-05's naive-pair default retired.
+- Fix card t_12286c0d (p1-05b, running): flip build_event_cond + count probe to
+  site-offset pair, make FakeDevice reject naive like the device, body-pin test +
+  recorded 400 fixture. I review+merge → owner re-runs 5-8 + the +02/+03 A/B (does the
+  device INTERPRET the offset or merely require it — sparse window couldn't tell).
+- p1-06c UI gap noted: `device time` shows no mismatch flag (compute_skew exists; the
+  flag display belongs to the p1-08 surface — small follow-up card after p1-05b merges).
+- Step 9 (auth-negative) = owner by hand. Card t_353633f8 stays open until owner
+  completes it post-5-8.
+
 ## 2026-10-17 afternoon — p1-09 merged (PR #19 -> b3a271a). P1 offline work COMPLETE; P1-10 = owner
 
 - Gate on merged tree: **986 passed / 4 skipped / 1 deselected** (exactly as claimed),
