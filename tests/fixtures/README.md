@@ -18,6 +18,7 @@ serial → `MASKED-SER-1`, mac → `00:11:22:33:44:55`, digest `nonce`/`opaque` 
 | `events_no_match.json` | empty window: `"NO MATCH"` (space!), **InfoList key absent** |
 | `events_reverse_order.json` | `timeReverseOrder:true` → newest-first |
 | `error_total_notsupport.json` | `AcsEvent/Total` → 400 `subStatusCode:"notSupport"` |
+| `error_naive_start_time.json` | AcsEvent with a **naive** `startTime` → 400 `statusCode:6`, `subStatusCode:"badJsonContent"`, `errorMsg:"startTime"` (owner live probe 2026-10-17, OBSERVED.md "Event-window startTime form: offset REQUIRED" — the shape FakeDevice now answers any naive event bound with) |
 
 Mask map (real names → `User E<n>`) is deliberately **not** in this repo; it lives only
 in the operator's local capture (`~/.hermes/.../device-probe/raw_capture.json`). If the

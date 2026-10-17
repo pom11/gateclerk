@@ -33,6 +33,7 @@ shape under test is the device's, not our imagination.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import timedelta
@@ -45,6 +46,7 @@ import pytest
 from fakedevice import BASE_URL, FakeDevice
 from gateclerk.exceptions import (
     EventBoundsError,
+    IsapiBadContent,
     SearchProtocolError,
     SearchRunawayError,
 )
@@ -74,6 +76,7 @@ from gateclerk.tz import (
 FIXTURE_DIR = Path(__file__).parent / "fixtures/recorded/site-a-ds-k1t341amf-s"
 
 EVENT_PATH = "/ISAPI/AccessControl/AcsEvent?format=json"
+TOTAL_PATH = "/ISAPI/AccessControl/AcsEventTotalNum?format=json"
 PASSWORD = "fakepw"  # placeholder policy (tests/test_repo_hygiene.py)
 
 SITE_TZ = "Europe/Bucharest"
@@ -401,18 +404,30 @@ def _window(start: str, end: str) -> DeviceWindow:
     return window_for_device(since, until, site_tz=SITE_TZ)
 
 
-def test_build_event_cond_always_carries_bounds_in_device_naive_wall() -> None:
+def test_build_event_cond_sends_bounds_with_the_site_offset_by_default() -> None:
+    """The wire form is the offset-bearing site pair (p1-05b, live P0).
+
+    2026-10-17 live proof (OBSERVED.md "Event-window startTime form: offset REQUIRED"):
+    `"startTime":"2026-10-10T00:00:00"` -> HTTP 400 `statusCode=6`,
+    `subStatusCode=badJsonContent`, `errorMsg=startTime`; the same window stamped
+    `+03:00` returned 200. So the offset pair is the DEFAULT here and the naive pair
+    is reachable only explicitly — a caller that wants naive must say so.
+    """
     cond = build_event_cond(_window("2026-10-12T00:00:00", "2026-10-12T23:59:59"))
-    assert cond["startTime"] == "2026-10-12T00:00:00"
-    assert cond["endTime"] == "2026-10-12T23:59:59", (
-        "device-naive wall terms (window_for_device) — the thing the device compares "
-        "against; site-offset strings would shift the window by the fw offset bug"
+    assert cond["startTime"] == "2026-10-12T00:00:00+03:00", (
+        "site-tz wall time stamped with the site offset (Bucharest Oct = +03) — the "
+        "only form this firmware accepts; a naive default here fails every live pull"
     )
-    with_offset = build_event_cond(
-        _window("2026-10-12T00:00:00", "2026-10-12T23:59:59"), with_offset=True
+    assert cond["endTime"] == "2026-10-12T23:59:59+03:00"
+
+    naive = build_event_cond(
+        _window("2026-10-12T00:00:00", "2026-10-12T23:59:59"), with_offset=False
     )
-    assert with_offset["startTime"].endswith("+03:00"), (
-        "explicit-offset variant (Bucharest Oct = +03)"
+    assert (
+        naive["startTime"] == "2026-10-12T00:00:00" and naive["endTime"] == "2026-10-12T23:59:59"
+    ), (
+        "the struct still exposes the raw wall pair (audit/test use); it is simply no "
+        "longer what the engine puts on the wire"
     )
 
 
@@ -501,6 +516,141 @@ def test_unbounded_event_query_never_reaches_the_wire() -> None:
         client.search("acs_event_search", {"AcsEventCond": {"searchID": "x", "maxResults": 10}})
 
 
+# --- p1-05b: the offset-bearing window on the wire (live P0, OBSERVED.md 2026-10-17) -------
+#
+# The device 400s a naive AcsEvent startTime (`badJsonContent`, `errorMsg=startTime`);
+# the offset-bearing site pair returns 200. These pins cover the three halves of that
+# fact: every body the engine emits carries `+HH:MM` (engine), the fake now REJECTS a
+# naive body like the device does (anti-false-green), and the recorded 400 parses into
+# IsapiBadContent with errorMsg surfaced (error path).
+
+_OFFSET_BOUND = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
+
+
+def test_every_event_body_the_engine_sends_carries_offset_bearing_bounds() -> None:
+    """Engine-level body pin: through the REAL client, every AcsEvent POST the device
+    sees has startTime AND endTime stamped `+HH:MM` (OBSERVED.md, live proof
+    2026-10-17). FakeDevice's own strictness makes a regression here fail LOUDLY
+    (400 mid-walk) even if this assertion were deleted — that redundancy is the
+    point: the old suite was green while every live pull failed."""
+    device = FakeDevice()
+    device.json_ok(
+        "POST",
+        EVENT_PATH,
+        event_envelope(
+            searchID="s", responseStatusStrg="OK", numOfMatches=1, InfoList=[{"serialNo": 1}]
+        ),
+    )
+    client = IsapiClient(BASE_URL, "admin", PASSWORD, transport=device.transport, sleep=no_sleep)
+    since = parse_user_timestamp("2026-10-11T00:00:00", site_tz=SITE_TZ)
+    until = parse_user_timestamp("2026-10-13T00:00:00", site_tz=SITE_TZ)  # 2 chunks
+    list(
+        iter_event_windows(
+            lambda body: client.search("acs_event_search", body),
+            since=since,
+            until=until,
+            chunk="1d",
+            inter_page_delay=0.0,
+            sleep=no_sleep,
+        )
+    )
+    posted = [json.loads(s.body) for s in device.served if s.path == EVENT_PATH]
+    assert len(posted) >= 2, "two chunks -> both walked through the real digest client"
+    for body in posted:
+        cond = body["AcsEventCond"]
+        for name in ("startTime", "endTime"):
+            assert _OFFSET_BOUND.match(cond[name]), (
+                f"{name}={cond[name]!r} lacks the site-tz offset — this firmware 400s "
+                "a naive bound (OBSERVED.md 'Event-window startTime form: offset REQUIRED')"
+            )
+
+
+def test_fakedevice_rejects_a_naive_event_body_exactly_like_the_device() -> None:
+    """The anti-false-green pin: FakeDevice used to answer ANY body shape — that is
+    how the offline suite stayed green while every live `gateclerk events` pull failed.
+    A hand-built naive body now gets the device's recorded 400 envelope; the offset
+    pair is served (the canary that the trap only bites the naive shape)."""
+    device = FakeDevice()
+    event_ok = event_envelope(
+        searchID="s", responseStatusStrg="OK", numOfMatches=1, InfoList=[{"serialNo": 1}]
+    )
+    device.json_ok("POST", EVENT_PATH, event_ok)
+    # The count route must be registered too: the strictness check runs at HANDLER
+    # time, after the route lookup — exactly like the firmware, where a MISSING
+    # endpoint answers notSupport and a PRESENT one parses the body. Without a route
+    # here the naive probe would pin the 404 envelope instead of the 400.
+    device.json_ok("POST", TOTAL_PATH, {"AcsEventTotalNum": {"totalNum": 7}})
+    client = IsapiClient(BASE_URL, "admin", PASSWORD, transport=device.transport, sleep=no_sleep)
+
+    with pytest.raises(IsapiBadContent) as excinfo:
+        client.search(
+            "acs_event_search",
+            {
+                "AcsEventCond": {
+                    "searchID": "x",
+                    "startTime": "2026-10-10T00:00:00",
+                    "endTime": "2026-10-11T00:00:00",
+                    "maxResults": 10,
+                }
+            },
+        )
+    err = str(excinfo.value)
+    assert "statusCode=6" in err and "badJsonContent" in err and "errorMsg=startTime" in err, (
+        f"the fake must answer the device's exact envelope: {err}"
+    )
+    assert excinfo.value.envelope.get("errorMsg") == "startTime"
+
+    with pytest.raises(IsapiBadContent) as excinfo:
+        client.search(
+            "acs_event_total_num",
+            {
+                "AcsEventTotalNumCond": {
+                    "startTime": "2026-10-10T00:00:00",
+                    "endTime": "2026-10-11T00:00:00",
+                    "major": 5,
+                }
+            },
+        )
+    assert "errorMsg=endTime" not in str(excinfo.value), (
+        "startTime is checked first — the device named startTime, so must we"
+    )
+    assert "errorMsg=startTime" in str(excinfo.value)
+
+    # Canary: the SAME window with offsets is served, so the 400 above bites the
+    # naive shape specifically — not every request (a fake that rejects everything
+    # is as useless as one that rejects nothing).
+    ok = client.search(
+        "acs_event_search",
+        {
+            "AcsEventCond": {
+                "searchID": "x",
+                "startTime": "2026-10-10T00:00:00+03:00",
+                "endTime": "2026-10-11T00:00:00+03:00",
+                "maxResults": 10,
+            }
+        },
+    )
+    assert ok["AcsEvent"]["responseStatusStrg"] == "OK"
+
+
+def test_recorded_naive_start_time_400_parses_into_isapi_bad_content() -> None:
+    """The owner's live 400 (error_naive_start_time.json, verbatim) must classify as
+    IsapiBadContent with errorMsg=startTime surfaced in the message — that pairing is
+    how an operator reading a crash knows WHICH field the firmware hated."""
+    from gateclerk.isapi_response import envelope_to_error, parse_envelope
+
+    raw = (FIXTURE_DIR / "error_naive_start_time.json").read_bytes()
+    err = envelope_to_error(
+        http_status=400,
+        envelope=parse_envelope(raw, http_status=400),
+        endpoint="acs_event_search",
+        raw_body=raw,
+    )
+    assert isinstance(err, IsapiBadContent)
+    assert "errorMsg=startTime" in str(err)
+    assert err.envelope.get("subStatusCode") == "badJsonContent"
+
+
 def test_cursor_fields_cannot_be_smuggled_by_caller() -> None:
     """The engine owns the cursor — a caller passing maxResults/searchID in cond
     would break the silent-clamp safety (mid-walk changes restart/skip), so it is
@@ -581,11 +731,11 @@ def test_iter_event_windows_pages_inside_each_chunk_with_fresh_ids_and_bounds() 
     assert len(chunks) == 2 and all(isinstance(c, ChunkResult) for c in chunks)
     first, second = chunks
     assert [c["AcsEventCond"]["startTime"] for c in sent] == [
-        "2026-10-11T00:00:00",
-        "2026-10-11T00:00:00",
-        "2026-10-12T00:00:00",
-        "2026-10-12T00:00:00",
-    ], "every request carries bounds; paging happens INSIDE each chunk"
+        "2026-10-11T00:00:00+03:00",
+        "2026-10-11T00:00:00+03:00",
+        "2026-10-12T00:00:00+03:00",
+        "2026-10-12T00:00:00+03:00",
+    ], "every request carries offset-bearing bounds; paging happens INSIDE each chunk"
     assert first.search_id != second.search_id, "new chunk = new logical search = fresh searchID"
     assert [c.max_serial_no for c in chunks] == [42, 95]
     assert [c.pages for c in chunks] == [2, 2]

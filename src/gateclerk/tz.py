@@ -25,9 +25,11 @@ and pins that the flag is computed *after* UTC and never fed back into resolutio
 
 Two consequences that are easy to get wrong, both pinned by tests:
 
-* **Query windows are built in device-naive-wall terms** (`window_for_device`) because
-  the device filters `startTime`/`endTime` against its own wall clock. Sending UTC would
-  shift every window by the device's offset error.
+* **Query windows are built from the site wall clock** (`window_for_device`) and sent
+  on the wire **with the site offset stamped** — the live run of 2026-10-17 (OBSERVED.md
+  "Event-window startTime form: offset REQUIRED") proved this firmware 400s a naive
+  `startTime` (`badJsonContent`, `errorMsg=startTime`). Sending UTC would shift every
+  window by the device's offset error; sending naive strings is rejected outright.
 * **Skew compares wall clocks in the site zone** (`compute_skew`), not self-labelled
   instants — comparing instants would report the offset bug as a 3600 s "skew".
 
@@ -583,11 +585,17 @@ def parse_user_timestamp(
 class DeviceWindow:
     """A `--since/--until` pair in every form the pipeline needs.
 
-    `since_device_local`/`until_device_local` go in the AcsEvent search body:
-    **device-naive-wall**, because that is what the device compares `startTime`/`endTime`
-    against. The `_site_iso` pair is the same wall time with the *site* offset appended,
-    for firmware that insists on an explicit offset (p1-05 should prefer the naive pair
-    unless a live run proves otherwise).
+    The wire form for `startTime`/`endTime` is the **`_site_iso` pair** — site-tz wall
+    time stamped with the site offset. The live run of 2026-10-17 (OBSERVED.md
+    "Event-window startTime form: offset REQUIRED") proved this firmware rejects the
+    naive pair outright: 400 `statusCode=6`, `subStatusCode=badJsonContent`,
+    `errorMsg=startTime`. The p1-05 note "prefer the naive pair unless a live run
+    proves otherwise" is retired by that proof; event callers must pass
+    `with_offset=True` (the default from p1-05b onward).
+
+    The naive `since_device_local`/`until_device_local` pair stays on the struct: it
+    is the raw wall reading the device's *clock* displays, which the audit path and
+    the strict-reject pin in tests/fakedevice.py still reference.
     """
 
     since_utc: datetime
@@ -599,6 +607,14 @@ class DeviceWindow:
     site_tz: str | None = None
 
     def search_pair(self, *, with_offset: bool = False) -> tuple[str, str]:
+        """The `(startTime, endTime)` strings for a query body.
+
+        `with_offset=True` — the only form this firmware accepts on the event
+        endpoints (OBSERVED.md, live proof 2026-10-17). The naive default exists so
+        the struct's raw wall pair stays reachable for audit and test use; the
+        production callers (`paging.build_event_cond`, `pipeline.event_total_count`)
+        all ask for the offset explicitly.
+        """
         return (
             (self.since_site_iso, self.until_site_iso)
             if with_offset
