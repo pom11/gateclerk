@@ -29,9 +29,11 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import gateclerk.cli as cli_mod
+from _cli_surface import command_at, declared_flags, declared_param, declared_prose
 from fakedevice import BASE_URL, FakeDevice
 from gateclerk.cli import (
     AUTH_TERMINAL_EXIT,
@@ -1107,18 +1109,44 @@ def test_no_command_issues_a_write_or_an_unregistered_path(
     ],
 )
 def test_command_help_documents_its_flags_and_exits_zero(argv: list[str]) -> None:
+    """Each command declares the shared connection flags, and the help path runs.
+
+    Flag presence comes from Click's parameter list, not from the rendered help:
+    Typer renders help through Rich, which on a GitHub Actions runner is told it has
+    a terminal and then *elides* rows it cannot fit (seen in CI: an options block
+    collapsed to `...` and `--host` vanished from the text). A substring test on that
+    render measures Rich's layout, not the command. `--help` is still invoked, because
+    "the help path runs and prints" is a real contract too.
+    """
     code, out = run([*argv, "--help"])
     assert code == 0, out
-    joined = re.sub(r"\s+", " ", out)
-    for flag in ("--host", "--port", "--user", "--password", "--timeout", "--site", "--config"):
-        assert flag in joined, f"{argv} help lost {flag}"
-    assert "default: 80" in out and "default: 30.0" in out
+    assert out.strip(), f"{argv} --help printed nothing"
+    cmd = command_at(app, argv)
+    declared = declared_flags(cmd)
+    for flag in (
+        "--host",
+        "--port",
+        "--user",
+        "--password",
+        "--timeout",
+        "--site",
+        "--config",
+    ):
+        assert flag in declared, f"{argv} does not declare {flag}"
+    # Defaults are DESIGN.md decisions, asserted as values rather than as a
+    # substring of a rendered "default: 80".
+    assert declared_param(cmd, "--port").default == 80
+    assert declared_param(cmd, "--timeout").default == 30.0
 
 
 def test_events_help_names_the_window_flags_and_every_format() -> None:
+    """The window flags are the whole user-facing contract, so they are pinned as
+    declarations (see the note in the shared-flag test about why the render is not
+    the source of truth)."""
     code, out = run(["events", "--help"])
     assert code == 0
-    joined = re.sub(r"\s+", " ", out)
+    assert out.strip(), "events --help printed nothing"
+    declared = declared_flags(command_at(app, ["events"]))
     for flag in (
         "--since",
         "--until",
@@ -1134,10 +1162,12 @@ def test_events_help_names_the_window_flags_and_every_format() -> None:
         "--site-label",
         "--tz",
     ):
-        assert flag in joined, f"events help missing {flag}"
-    for fmt in ("table", "json", "jsonl"):
-        assert fmt in joined
-    assert "Europe/Bucharest" in out
+        assert flag in declared, f"events does not declare {flag}"
+    # The card's three formats are the option's declared choices, and the timezone
+    # default is the value, not a rendered string.
+    fmt_param = declared_param(command_at(app, ["events"]), "--format")
+    assert set(fmt_param.type.choices) == {"table", "json", "jsonl"}
+    assert declared_param(command_at(app, ["events"]), "--tz").default == "Europe/Bucharest"
 
 
 def test_events_no_longer_lives_under_a_search_subcommand() -> None:
@@ -1146,8 +1176,12 @@ def test_events_no_longer_lives_under_a_search_subcommand() -> None:
     # 0 before it validates the extra argument at all.
     code, _ = run(["events", "search", "--host", HOST, "--user", "admin", "--password", FAKE_PW])
     assert code != 0, "`events` is a command now, not a group"
-    code, out = run(["--help"])
-    assert code == 0 and re.search(r"\bevents\b", out)
+    # Declared, not rendered: `events` must be a top-level command of the app.
+    root = typer.main.get_command(app)
+    assert "events" in getattr(root, "commands", {}), "events is not a top-level command"
+    assert getattr(command_at(app, ["events"]), "commands", None) is None, (
+        "`events` must be a command, not a group"
+    )
 
 
 def test_no_help_text_advertises_a_write() -> None:
@@ -1166,9 +1200,12 @@ def test_no_help_text_advertises_a_write() -> None:
         ["device", "time"],
         ["device", "capabilities"],
     ):
-        code, out = run([*argv, "--help"])
-        assert code == 0
-        lowered = re.sub(r"\s+", " ", out).lower()
+        # Word boundaries are the whole test: a naive `"put " in text` fires on
+        # "out**put** format", which every command prints. The prose comes from the
+        # command definition rather than the rendered screen because a tripwire that
+        # reads a render Rich may have truncated can pass *because* the offending line
+        # was elided — which is the one failure direction this must never allow.
+        lowered = declared_prose(command_at(app, argv)).lower()
         for verb in verbs:
             assert re.search(verb, lowered) is None, f"{argv} help mentions {verb}"
 
