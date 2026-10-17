@@ -1,0 +1,135 @@
+{
+ "AcsEvent": {
+  "searchID": "gateclerk-scenario-max10",
+  "totalMatches": 60,
+  "responseStatusStrg": "MORE",
+  "numOfMatches": 10,
+  "InfoList": [
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-20T011:10:00+02:00",
+    "cardType": 1,
+    "name": "User E25",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "25",
+    "type": 0,
+    "serialNo": 9541,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkIn"
+   },
+   {
+    "major": 5,
+    "minor": 21,
+    "time": "2026-06-20T011:11:00+02:00",
+    "doorNo": 1,
+    "type": 0,
+    "serialNo": 9542,
+    "currentVerifyMode": "invalid"
+   },
+   {
+    "major": 5,
+    "minor": 1,
+    "time": "2026-06-20T011:13:00+02:00",
+    "cardType": 1,
+    "name": "User E25",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "25",
+    "type": 0,
+    "serialNo": 9543,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkOut"
+   },
+   {
+    "major": 5,
+    "minor": 22,
+    "time": "2026-06-20T011:14:00+02:00",
+    "doorNo": 1,
+    "type": 0,
+    "serialNo": 9544,
+    "currentVerifyMode": "invalid"
+   },
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-20T011:16:00+02:00",
+    "cardType": 1,
+    "name": "User E25",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "25",
+    "type": 0,
+    "serialNo": 9545,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkIn"
+   },
+   {
+    "major": 5,
+    "minor": 21,
+    "time": "2026-06-20T011:17:00+02:00",
+    "doorNo": 1,
+    "type": 0,
+    "serialNo": 9546,
+    "currentVerifyMode": "invalid"
+   },
+   {
+    "major": 5,
+    "minor": 1,
+    "time": "2026-06-20T011:19:00+02:00",
+    "cardType": 1,
+    "name": "User E25",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "25",
+    "type": 0,
+    "serialNo": 9547,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkOut"
+   },
+   {
+    "major": 5,
+    "minor": 22,
+    "time": "2026-06-20T011:20:00+02:00",
+    "doorNo": 1,
+    "type": 0,
+    "serialNo": 9548,
+    "currentVerifyMode": "invalid"
+   },
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-20T011:22:00+02:00",
+    "cardType": 1,
+    "name": "User E25",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "25",
+    "type": 0,
+    "serialNo": 9549,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkIn"
+   },
+   {
+    "major": 5,
+    "minor": 21,
+    "time": "2026-06-20T011:23:00+02:00",
+    "doorNo": 1,
+    "type": 0,
+    "serialNo": 9550,
+    "currentVerifyMode": "invalid"
+   }
+  ]
+ }
+}

@@ -1,0 +1,70 @@
+{
+ "UserInfoSearch": {
+  "searchID": "gateclerk-scenario-roster",
+  "totalMatches": 4,
+  "responseStatusStrg": "OK",
+  "numOfMatches": 4,
+  "UserInfo": [
+   {
+    "employeeNo": "1",
+    "name": "User E1",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   },
+   {
+    "employeeNo": "2",
+    "name": "User E2",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   },
+   {
+    "employeeNo": "3",
+    "name": "User E3",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": false,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   },
+   {
+    "employeeNo": "4",
+    "name": "User E4",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   }
+  ]
+ }
+}

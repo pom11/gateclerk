@@ -1,0 +1,40 @@
+{
+ "AcsEvent": {
+  "searchID": "gateclerk-scenario-enc",
+  "totalMatches": 2,
+  "responseStatusStrg": "OK",
+  "numOfMatches": 2,
+  "InfoList": [
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-18T08:00:00+02:00",
+    "cardType": 1,
+    "name": "VGhpc0lzQ0lwaGVyTm90QVBlcnNvbk5hbWU=",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "0007A",
+    "type": 0,
+    "serialNo": 9401,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no"
+   },
+   {
+    "major": 5,
+    "minor": 1,
+    "time": "2026-06-18T08:01:00+02:00",
+    "cardType": 1,
+    "name": "User E1",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "1",
+    "type": 0,
+    "serialNo": 9402,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no"
+   }
+  ]
+ }
+}

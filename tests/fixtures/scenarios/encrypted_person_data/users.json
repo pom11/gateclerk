@@ -1,0 +1,40 @@
+{
+ "UserInfoSearch": {
+  "searchID": "gateclerk-scenario-roster",
+  "totalMatches": 2,
+  "responseStatusStrg": "OK",
+  "numOfMatches": 2,
+  "UserInfo": [
+   {
+    "employeeNo": "0007A",
+    "name": "VGhpc0lzQ0lwaGVyTm90QVBlcnNvbk5hbWU=",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   },
+   {
+    "employeeNo": "1",
+    "name": "User E1",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   }
+  ]
+ }
+}

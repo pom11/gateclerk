@@ -1,0 +1,74 @@
+{
+ "AcsEvent": {
+  "searchID": "gateclerk-scenario-naive",
+  "totalMatches": 4,
+  "responseStatusStrg": "OK",
+  "numOfMatches": 4,
+  "InfoList": [
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-16T07:31:00",
+    "cardType": 1,
+    "name": "User E1",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "1",
+    "type": 0,
+    "serialNo": 9101,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkIn"
+   },
+   {
+    "major": 5,
+    "minor": 1,
+    "time": "2026-06-16T08:02:00",
+    "cardType": 1,
+    "name": "User E2",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "2",
+    "type": 0,
+    "serialNo": 9102,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkIn"
+   },
+   {
+    "major": 5,
+    "minor": 1,
+    "time": "2026-06-16T16:58:00",
+    "cardType": 1,
+    "name": "User E1",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "1",
+    "type": 0,
+    "serialNo": 9103,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkOut"
+   },
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-16T17:30:00",
+    "cardType": 1,
+    "name": "User E2",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "2",
+    "type": 0,
+    "serialNo": 9104,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no",
+    "attendanceStatus": "checkOut"
+   }
+  ]
+ }
+}
