@@ -1,0 +1,70 @@
+{
+ "UserInfoSearch": {
+  "searchID": "gateclerk-scenario-roster",
+  "totalMatches": 4,
+  "responseStatusStrg": "OK",
+  "numOfMatches": 4,
+  "UserInfo": [
+   {
+    "employeeNo": "11",
+    "name": "Ghimeniţcă",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   },
+   {
+    "employeeNo": "12",
+    "name": "Pătrașcu Andrei",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   },
+   {
+    "employeeNo": "13",
+    "name": "Dumitreșcu Ioana",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   },
+   {
+    "employeeNo": "14",
+    "name": "Ștefănescu Bogdan",
+    "userType": "normal",
+    "rightLimit": 0,
+    "doorRight": "1",
+    "Valid": {
+     "enable": true,
+     "beginTime": "2026-01-01T00:00:00",
+     "endTime": "2035-12-31T23:59:59"
+    },
+    "belongGroup": "",
+    "FloorNumbers": "",
+    "RoomNumbers": ""
+   }
+  ]
+ }
+}

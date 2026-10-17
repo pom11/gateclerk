@@ -1,0 +1,70 @@
+{
+ "AcsEvent": {
+  "searchID": "gateclerk-scenario-clamp",
+  "totalMatches": 11,
+  "responseStatusStrg": "OK",
+  "numOfMatches": 4,
+  "InfoList": [
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-21T07:14:00+02:00",
+    "cardType": 1,
+    "name": "User E2",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "2",
+    "type": 0,
+    "serialNo": 9708,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no"
+   },
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-21T07:16:00+02:00",
+    "cardType": 1,
+    "name": "User E3",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "3",
+    "type": 0,
+    "serialNo": 9709,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no"
+   },
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-21T07:18:00+02:00",
+    "cardType": 1,
+    "name": "User E1",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "1",
+    "type": 0,
+    "serialNo": 9710,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no"
+   },
+   {
+    "major": 5,
+    "minor": 75,
+    "time": "2026-06-21T07:20:00+02:00",
+    "cardType": 1,
+    "name": "User E2",
+    "cardReaderNo": 1,
+    "doorNo": 1,
+    "employeeNoString": "2",
+    "type": 0,
+    "serialNo": 9711,
+    "userType": "normal",
+    "currentVerifyMode": "cardOrFaceOrFp",
+    "mask": "no"
+   }
+  ]
+ }
+}

@@ -24,6 +24,13 @@ Scenarios are installed per test:
   raising Exceptions (transport-error simulation).
 * `accepted_nonces` / `challenge_nonce` / `stale_flag` — rotate these to expire a nonce
   mid-session and watch the client's recovery.
+* `expire_after=N` — the machine-readable version of the same scenario: the fake
+  retires the nonce after N accepted responses (one stale="true" re-challenge, fired
+  exactly once), so a whole-CLI walk can exercise stale-nonce recovery without a test
+  interleaving mutations between requests it does not control.
+* `busy_503()` / `invalid_content()` (module-level) — the two wire shapes the retry
+  tests need: the `deviceBusy` family (vendor statusCode 2, HTTP 503) and the
+  `Invalid Content`/`badParameters` envelope (statusCode 6, terminal).
 """
 
 from __future__ import annotations
@@ -42,6 +49,40 @@ FAKE_HOST = "192.0.2.10"  # TEST-NET (tests/test_repo_hygiene.py allowlist)
 BASE_URL = f"http://{FAKE_HOST}"
 
 _AUTH_RE = re.compile(r'(\w+)=(?:"([^"]*)"|([^",]+))')
+
+
+def busy_503() -> httpx.Response:
+    """The wire shape of the busy family: HTTP 503 + vendor statusCode 2.
+
+    Shared home for it (was duplicated in test_isapi_transport.py) because the p1-09
+    scenario suite replays the same retry path through the full CLI.
+    """
+    return httpx.Response(
+        503,
+        content=b'<?xml version="1.0"?><ResponseStatus><statusCode>2</statusCode>'
+        b"<statusString>Device Busy</statusString><subStatusCode>deviceBusy</subStatusCode>"
+        b"</ResponseStatus>",
+        headers={"Content-Type": "application/xml"},
+    )
+
+
+def invalid_content(
+    request_url: str = "/ISAPI/AccessControl/AcsEvent?format=json",
+) -> httpx.Response:
+    """The JSON error envelope for `Invalid Content`/badParameters (statusCode 6).
+
+    Terminal per the retry-class table (gotchas §7.4): retrying this class is how
+    polling becomes a door-terminal lockout, so the client must surface it, not loop.
+    """
+    return httpx.Response(
+        400,
+        json={
+            "requestURL": request_url,
+            "statusCode": 6,
+            "statusString": "Invalid Content",
+            "subStatusCode": "badParameters",
+        },
+    )
 
 
 def parse_digest_header(value: str) -> dict[str, str]:
@@ -118,6 +159,15 @@ class FakeDevice:
         self.stale_flag = "false"
         #: nonces the fake will currently accept as valid credentials
         self.accepted_nonces: set[str] = {NONCE}
+        #: when set to N, the fake retires the nonce after N accepted (authorized)
+        #: responses — the `webs` nonce-rotation behaviour, mid-session, with no test
+        #: having to interleave its own mutations between requests. The rotation drops
+        #: the current nonce, advertises a fresh one with stale="true", and happens
+        #: exactly once (the client then re-pays and continues).
+        self.expire_after: int | None = None
+        self._authorized_served = 0
+        #: rotation already fired (it happens exactly once per scenario)
+        self._rotated = False
         #: scenario name -> (method, path+query) -> Response | list[Response]
         self.routes: dict[str, list] = {}
         #: raw responses served BEFORE the auth check (to simulate server-side 401s:
@@ -254,6 +304,25 @@ class FakeDevice:
             )
             authorized = bool(digest.get("response")) and digest.get("response") == want
         if not authorized:
+            self.challenges += 1
+            return self.unauthenticated_401()
+
+        # Nonce rotation (expire_after): the session has been accepted N times, so the
+        # box retires the nonce on the NEXT authorized request — 401 with stale="true"
+        # and a fresh nonce, exactly like a `webs` session that outlived its nonce.
+        # The client's stale recovery pays it once (p1-03) and every recorded request
+        # afterwards carries the new nonce; the rotation fires exactly once.
+        self._authorized_served += 1
+        if (
+            self.expire_after is not None
+            and not self._rotated
+            and self._authorized_served > self.expire_after
+        ):
+            self._rotated = True
+            fresh = f"{NONCE}-ROTATED"
+            self.accepted_nonces = {fresh}
+            self.challenge_nonce = fresh
+            self.stale_flag = "true"
             self.challenges += 1
             return self.unauthenticated_401()
 
