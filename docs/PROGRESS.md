@@ -29,6 +29,23 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-17 late — p1-05b merged by owner with live proof (e75e3a3); digest nonce bug carded
+
+- PR #20 merged by OWNER after a live run on the branch (steps 5,6,7 pass: startTime
+  goes out as `+03:00`, idempotent re-run, clean empty). Retro-review posted on
+  t_12286c0d: scope exact, strict-fake pin good, gates re-run on main (1003 passed /
+  4 skipped, ruff clean). Step 9 passed too: wrong password -> rc 3, ONE request,
+  device stayed unlocked — lockout-safety proven on the real device.
+- **Step 8 = new bug, carded t_a3521d8a (P1-03b)**: deterministic 401 with the CORRECT
+  password at ~190th request (`--chunk 1h`), same window twice, exit 3, device
+  unlocked -> nonce use-cap + our 401-terminal policy kills the walk. Mechanism OPEN
+  (challenge stale=true / stale=false / envelope-only — never captured): reproduce
+  offline via FakeDevice seams, fix = bounded re-challenge recovery while wrong
+  password still exits 3 after one try. OBSERVED.md section added (6e67863), explicit
+  NO-device-re-probe rule (lockout accounting).
+- P1-10 closes after this fix + owner's 1h-chunk backfill re-run. Still owed by owner
+  at that re-run: the +02:00-vs-+03:00 dense-window A/B (interpret vs require).
+
 ## 2026-10-17 evening — P1-10 live run: P0 found + dispatched (device REQUIRES offset startTime)
 
 - Owner ran steps 1-4 green (model/serial/fw OK, skew -0.9s, count agrees, names
