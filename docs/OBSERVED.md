@@ -98,6 +98,30 @@ Paging envelope observed:
 Empty window → `{"responseStatusStrg":"NO MATCH","totalMatches":0,"numOfMatches":0}` and
 the `InfoList` key is **absent** (not empty list) — handle both.
 
+## Event-window `startTime` form: offset REQUIRED (owner live probe 2026-10-17, VERIFIED)
+
+The AcsEvent search **rejects a naive `startTime`**: body `"startTime":"2026-10-10T00:00:00"`
+→ HTTP 400, `statusCode=6 Invalid Content`, `subStatusCode=badJsonContent`,
+`errorMsg=startTime`. Stamping the site-tz offset (`+03:00`) on the same window returns
+200; the device's claimed offset (`+02:00`) is accepted too. One read-only POST per form
+(owner, P1-10 step 5, fw V3.2.30): Sep 1..Oct 17 → 10 major=5 events, both offset forms.
+
+Consequences, both load-bearing:
+1. `DeviceWindow.search_pair()`'s naive default (p1-05) fails **every** live events pull,
+   and also the `--count` probe (same body shape). The offline suite missed it because
+   FakeDevice accepted naive — a mock more lenient than the device is a false-green
+   machine (same class as the worktree-editable-import bug). FakeDevice must reject naive.
+2. Send the **offset-bearing site pair** (`since_site_iso`/`until_site_iso`): site-tz wall
+   time stamped with the site offset. DESIGN.md's "always with `startTime`/`endTime` +
+   offsets" was right; the "prefer the naive pair unless a live run proves otherwise"
+   clause in tz.py/paging.py notes is hereby retired by this live proof.
+
+OPEN (cheap A/B during the P1-10 re-run): does the device *interpret* the offset when
+filtering or merely require presence? `+02:00` vs `+03:00` returned the same count on a
+sparse 6-week window; a dense-window A/B (one read-only POST pair on a busy day) settles
+whether the label shifts the effective window by an hour. Until proven otherwise we send
+site `+03:00` — self-consistent with site-tz-is-truth.
+
 ## Server-side filter truth (probe 2026-10-15, second round) — filter CLIENT-side
 
 `AcsEventCond.employeeNo` (no suffix) is **SILENTLY IGNORED** on this fw:
