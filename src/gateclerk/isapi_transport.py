@@ -6,7 +6,7 @@ Callers pass an **endpoint name** from `gateclerk.endpoints` — never a path, n
 verb. The verb comes from the closed registry, so the read-only guarantee
 (DESIGN.md "Constraints / invariants") is enforced here as well as in the registry
 test: there is no code path by which this client issues PUT/DELETE, and the only POST
-it will make is to one of the two stateless search endpoints.
+it will make is to one of the stateless search endpoints in `SEARCH_ENDPOINTS`.
 
 The rules this implementation encodes, each traceable to docs/DESIGN.md,
 docs/OBSERVED.md or docs/references/isapi-client-gotchas.md:

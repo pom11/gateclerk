@@ -4,21 +4,35 @@ Read-only attendance reader: Hikvision face/card terminals → normalized punch 
 heading to Business Central in a later phase. `gateclerk` = time attendance, read-only.
 
 The contract is [docs/DESIGN.md](docs/DESIGN.md). The phase list is
-[ROADMAP.md](ROADMAP.md). Everything below is P1 scaffolding; the device-reading
-commands are stubs until their own cards land.
+[ROADMAP.md](ROADMAP.md). The read commands are live as of card p1-08; there are no
+write commands and there never will be — this tool is read-only by design.
 
 ## Quickstart
 
 ```bash
 uv sync --extra fast            # python 3.12 is fetched by uv, not your system python
 uv run gateclerk --version        # gateclerk 0.1.0
-uv run gateclerk --help           # device | users | events
-uv run gateclerk device info --host 192.0.2.10   # exit 3 = 'not implemented yet' (p1-03)
+uv run gateclerk --help           # device | users | events | creds
 uv run ruff check . && uv run pytest          # both offline, both must stay green
 ```
 
-`--output json` on any read command gives one JSON object per line — the stable,
-pipeable form. `--output table` (default) is the human view.
+Against a real controller on the site LAN, with credentials resolved as below:
+
+```bash
+uv run gateclerk device info  --host 192.0.2.10                 # model, serial, firmware
+uv run gateclerk device time  --host 192.0.2.10 --tz Europe/Bucharest
+uv run gateclerk users list   --site site-a --config sites.toml
+uv run gateclerk events --host 192.0.2.10 \
+    --since 2026-05-21T00:00:00 --until 2026-05-22T00:00:00 --output jsonl > punches.jsonl
+```
+
+`--output json` (or the `--json` switch) on any read command gives one JSON object per
+line — the stable, pipeable form; `--output table` (default) is the human view.
+`--output jsonl` is the same stream with the record keys `gateclerk.model.from_jsonl()`
+consumes, so `gateclerk events ... --output jsonl | python -c 'from gateclerk.model import
+from_jsonl, sys; print(len(from_jsonl(sys.stdin.read())))'` round-trips it. Every field
+carries the provenance the payroll question needs (`tz_source`, `direction_source`,
+`tz_offset_min_device`) and the untouched device row in `raw`.
 
 ## Credentials
 
@@ -75,10 +89,12 @@ before any request is built.
 
 ## Read-only, enforced by CI
 
-This tool must never change device state: only `GET`, plus the two stateless search
-`POST`s (`UserInfo/Search`, `AcsEvent`). Every callable path is declared in
-`src/gateclerk/endpoints.py`, and `tests/test_endpoints_registry.py` fails the build if a
-mutating verb ever appears there. Adding a write path is a design change, not a diff.
+This tool must never change device state: only `GET`, plus the stateless search `POST`s
+declared in `gateclerk.endpoints.SEARCH_ENDPOINTS` (`UserInfo/Search`, `AcsEvent`, and
+`AcsEventTotalNum` — the `--count` cross-check, which displays a number and is never a
+loop bound). Every callable path is declared in `src/gateclerk/endpoints.py`, and
+`tests/test_endpoints_registry.py` fails the build if a mutating verb ever appears there.
+Adding a write path is a design change, not a diff.
 
 ## Tests
 
@@ -111,18 +127,26 @@ or upgrades.
 
 | Path | Owner card | What it is |
 |---|---|---|
-| `src/gateclerk/cli.py` | p1-01 | command tree + shared connection flags (stubs) |
+| `src/gateclerk/cli.py` | p1-01, p1-08 | command tree, shared connection flags, the exit-code contract, rendering choice |
+| `src/gateclerk/pipeline.py` | p1-08 | the command pipeline: device reads, record assembly, the paged walks, the request log |
 | `src/gateclerk/endpoints.py` | p1-01 | the read-only endpoint registry |
-| `src/gateclerk/output.py` | p1-01 | json / rich-table rendering |
+| `src/gateclerk/output.py` | p1-01 | json / jsonl / rich-table rendering |
 | `src/gateclerk/exceptions.py` | p1-01 | shared ISAPI error vocabulary |
 | `src/gateclerk/config.py` | p1-02 | config + credential resolution (Keychain/env/flags) |
 | `src/gateclerk/isapi_response.py` | p1-03 | ISAPI response truth: XML/JSON sniffing, the three envelope shapes, XML guard, envelope→typed-error mapping |
 | `src/gateclerk/isapi_transport.py` | p1-03 | `IsapiClient`: digest session, timeouts, bounded retries, 401 circuit, read-only verbs from the registry |
+| `src/gateclerk/capabilities.py` | p1-04 | capability discovery + the event-code classifier |
+| `src/gateclerk/paging.py` | p1-05 | the paged-search engine: cursor, chunking, termination rules, page cap |
 | `src/gateclerk/tz_dialect.py` | p1-06b | Hikvision tz dialect → **diagnostic** offsets only (never UTC math) |
-| `src/gateclerk/time.py` | p1-06 | site-tz resolver: naive device wall time + site IANA zone → UTC |
-| `src/gateclerk/models.py` | p1-07 | `EventRecord` / `UserRecord` — the output contract |
+| `src/gateclerk/tz.py` | p1-06 | site-tz resolver: naive device wall time + site IANA zone → UTC |
+| `src/gateclerk/tz_mismatch.py` | p1-06d | the offset-mismatch flag, computed after resolution and unable to move the instant |
+| `src/gateclerk/model.py` | p1-07 | `EventRecord` / `UserRecord` + `to_jsonl` / `from_jsonl` — the output contract |
 
 ## Status
 
-P1 in progress. `gateclerk --version` works; `device info`, `device time`, `users list`
-and `events search` exit `3` with a pointer to the card that implements them.
+P1 in progress. `gateclerk --version` works, and as of card p1-08 the read commands are live:
+`device info`, `device time`, `device capabilities`, `users list` and `gateclerk events
+--since ... --until ...` against a real controller. Exit codes: `0` ok, `2` config/input,
+`3` auth (check the credential before the account locks), `4` device error, `5` the paging
+engine refused to loop on a misbehaving device. There is no local store yet — that is P2 —
+so `--output jsonl` is where the records go.

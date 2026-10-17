@@ -38,9 +38,19 @@ def test_every_registered_method_is_get_or_an_advertised_search_post() -> None:
     assert set(REGISTRY) >= SEARCH_ENDPOINTS, "search endpoint names must exist in REGISTRY"
 
 
-def test_exactly_two_search_post_endpoints() -> None:
+def test_exactly_the_advertised_search_post_endpoints() -> None:
+    """The POST allowlist, pinned by name. Adding one is a reviewed decision.
+
+    Three: the two searches the paging engine walks, plus `AcsEventTotalNum`, the advisory
+    count probe card p1-08's `--count` flag asks for. p1-05's handoff named that split
+    explicitly ("3rd POST is a reviewed registry decision … belongs with p1-08 --count"), so
+    the count endpoint arrives with the flag that consumes it rather than being folded into
+    the engine that never calls it. All three take a stateless search-shaped body; none
+    mutates device state (OBSERVED.md VERIFIED for the count probe: it returns `{totalNum}`
+    for a window and nothing else).
+    """
     posts = {name for name, ep in REGISTRY.items() if ep.method is HttpMethod.POST}
-    assert posts == {"user_info_search", "acs_event_search"}
+    assert posts == {"user_info_search", "acs_event_search", "acs_event_total_num"}
 
 
 def test_no_forbidden_verbs_anywhere_in_the_registry() -> None:
@@ -109,6 +119,10 @@ def test_registry_is_exactly_the_documented_surface() -> None:
         ("user_info_count", "GET", "/ISAPI/AccessControl/UserInfo/Count"),
         ("user_info_search", "POST", "/ISAPI/AccessControl/UserInfo/Search"),
         ("acs_event_search", "POST", "/ISAPI/AccessControl/AcsEvent"),
+        # Added by card p1-08 (the `--count` cross-check), together with the DESIGN.md
+        # invariant wording that had to name it: the call table already documented this POST,
+        # and OBSERVED.md VERIFIED it. Advisory display only — never a loop bound.
+        ("acs_event_total_num", "POST", "/ISAPI/AccessControl/AcsEventTotalNum"),
     }, (
         "the callable surface changed. If this is a NEW read endpoint: update the set here "
         "and docs/DESIGN.md's endpoint table together. If it is a WRITE: stop — this repo "

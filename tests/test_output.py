@@ -87,8 +87,16 @@ def test_unknown_format_raises() -> None:
         render(rows(), fmt="yaml", stream=io.StringIO())
 
 
-def test_output_format_choices_are_the_documented_pair() -> None:
-    assert CHOICES == ("json", "table")
+def test_output_format_choices_are_the_documented_triple() -> None:
+    """Card p1-08 added `jsonl`; the CLI's `--format`/`--output` metavar is generated from
+    this tuple, so a drift here is a drift in what operators can type.
+
+    `jsonl` is a *second spelling* of the json stream, not a second renderer
+    (`gateclerk.model.to_jsonl`/`from_jsonl` are one compact object per line, which is what
+    `--format json` already prints), which is why the two share a code path and the tuple
+    has three names for two renderers.
+    """
+    assert CHOICES == ("json", "jsonl", "table")
 
 
 def test_stdlib_fallback_matches_whichever_backend_is_active() -> None:

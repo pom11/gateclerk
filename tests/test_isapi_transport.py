@@ -657,13 +657,27 @@ def test_client_cannot_issue_a_write_even_if_asked() -> None:
     assert device.served == [], "refused calls must never reach the transport"
 
 
-def test_every_registry_path_uses_only_get_or_the_two_search_posts() -> None:
+def test_every_registry_path_uses_only_get_or_the_advertised_search_posts() -> None:
     """Card DoD 'read-only guard test green', read from the transport side: the set of
-    methods the CLIENT is even capable of constructing is {GET} union {the two POSTs}."""
+    methods the CLIENT is even capable of constructing is {GET} union {the search POSTs}.
+
+    The POST set is enumerated here as well as in `test_endpoints_registry.py` on purpose:
+    this file is the transport's own view, and a registry entry that the client would refuse
+    to call (or would call with the wrong verb) is caught from both sides. Three POSTs since
+    card p1-08 added the `AcsEventTotalNum` count probe for `--count`.
+    """
     methods = {ep.method.value for ep in REGISTRY.values()}
     assert methods == {"GET", "POST"}
     posts = {name for name, ep in REGISTRY.items() if ep.method.value == "POST"}
-    assert posts == set(SEARCH_ENDPOINTS) == {"user_info_search", "acs_event_search"}
+    assert (
+        posts
+        == set(SEARCH_ENDPOINTS)
+        == {
+            "user_info_search",
+            "acs_event_search",
+            "acs_event_total_num",
+        }
+    )
 
 
 def test_unknown_endpoint_name_cannot_smuggle_a_path() -> None:

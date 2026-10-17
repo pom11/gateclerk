@@ -154,10 +154,43 @@ class FakeDevice:
         """Register responses for `method path?query`; repeats pop the list, last sticks."""
         self.routes.setdefault(_key(method, path), []).extend(responses)
 
+    def reset(self, method: str, path: str, *responses: httpx.Response) -> None:
+        """`add` but REPLACE: throw away anything already registered for this route.
+
+        Added for the CLI command suite (card p1-08), whose per-test devices come up
+        pre-seeded with the default pages for every endpoint: a paging test that then
+        `add`s its own page queue would have its pages served AFTER the default one, and
+        assert against a walk that silently started from the fixture instead of from the
+        queue it built. Replacing the route is what makes "these are the pages this test
+        serves" true.
+        """
+        self.routes[_key(method, path)] = list(responses)
+
+    def reset_json(self, method: str, path: str, payload: dict | list, **kw: object) -> None:
+        """`json_ok` but REPLACE — see `reset`."""
+        self.reset(method, path, httpx.Response(200, json=payload, **kw))  # type: ignore[arg-type]
+
     def add_raw(self, method: str, path: str, *items: httpx.Response | Exception) -> None:
         """Serve these before checking Authorization at all (server-initiated 401s,
         lockout bodies); an Exception item is raised instead (transport errors)."""
         self.raw.setdefault(_key(method, path), []).extend(items)
+
+    def reset_raw(self, method: str, path: str, *items: httpx.Response | Exception) -> None:
+        """`add_raw` but REPLACE, and repeat the LAST item so an error STAYS an error.
+
+        A raw queue drains: one queued 503 means "503, then everything is fine again". For
+        a test that wants "this endpoint is broken" — which is what a device-error or
+        lockout scenario actually models — a single item would make the second request in
+        the same command succeed and the asserted exit code never appear. Repeating the
+        last item is what makes `reset_raw("GET", ..., 503)` mean "always 503".
+        """
+        key = _key(method, path)
+        self.raw[key] = list(items)
+        if items and not isinstance(items[-1], Exception):
+            # Enough copies to cover any retry the transport is allowed (it retries once on
+            # transport errors and once on a 5xx) without any test noticing the queue ran
+            # out; the last item is what a draining queue leaves in place anyway.
+            self.raw[key].extend([items[-1]] * 9)
 
     def unauthenticated_401(self) -> httpx.Response:
         return self.challenge()
