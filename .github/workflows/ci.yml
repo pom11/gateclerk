@@ -64,12 +64,20 @@ jobs:
         run: uv run --frozen pytest -v
 
       - name: Pytest with the optional [fast] extra (orjson path)
+        # The sync legitimately downloads orjson, so it runs with the proxy vars
+        # UNSET (the wall lives on the test invocations, not on package fetching).
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          NO_PROXY: ""
+        run: |
+          uv sync --frozen --extra fast
+      - name: Pytest + orjson import check ([fast] env)
         env:
           HTTP_PROXY: "http://127.0.0.1:9"
           HTTPS_PROXY: "http://127.0.0.1:9"
           NO_PROXY: ""
         run: |
-          uv sync --frozen --extra fast
           # --no-sync so this step runs against exactly the env synced above, with no
           # implicit re-resolve between the sync and the test.
           uv run --frozen --no-sync pytest -q
