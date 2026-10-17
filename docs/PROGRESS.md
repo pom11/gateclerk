@@ -29,6 +29,17 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-17 afternoon — p1-09 merged (PR #19 -> b3a271a). P1 offline work COMPLETE; P1-10 = owner
+
+- Gate on merged tree: **986 passed / 4 skipped / 1 deselected** (exactly as claimed),
+  ruff clean, CI green, tz coverage 98.23% vs 95 floor reproduced. Fixture hygiene
+  verified (TEST-NET, MASKED serials/nonces); corpus README pin test present; CI proxy
+  blackhole is a documented SECOND wall behind netoff. Honest-run bug (Bucharest fold
+  03:xx) caught by the suite itself.
+- **NEXT = P1-10 live smoke (owner-run, human-only).** Everything merged; CLI is the
+  thing under test. Steps + gotchas in t_353633f8 (TCC Local-Network permission,
+  auth-negative once then web-UI check, never commit out/, redact per card rules).
+
 ## 2026-10-17 morning — p1-08 CLI merged (PR #18 -> 79ab6ff); "stall" was a dispatcher bug
 
 - The 03:49-quiet card was DONE: PR #18 open since 00:41, branch pushed, worktree clean,
