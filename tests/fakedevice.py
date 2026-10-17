@@ -28,6 +28,13 @@ Scenarios are installed per test:
   retires the nonce after N accepted responses (one stale="true" re-challenge, fired
   exactly once), so a whole-CLI walk can exercise stale-nonce recovery without a test
   interleaving mutations between requests it does not control.
+* `retire_after=N` + `retire_shape=…` — the REPEATABLE nonce use-cap (card t_a3521d8a):
+  the fake accepts each nonce for N authorized responses and then rejects, in one of
+  the three shapes `RETIRE_STALE_TRUE` / `RETIRE_STALE_FALSE` / `RETIRE_ENVELOPE_ONLY`,
+  issuing a fresh nonce each time. Unlike `expire_after` it fires again every N uses,
+  because the live symptom is a deterministic 401 at the ~190th request of a walk
+  (docs/OBSERVED.md "Digest nonce use-cap") — a one-shot rotation cannot reproduce a
+  walk that dies at request N. Recorded 401 bodies: `tests/fixtures/README.md`.
 * `busy_503()` / `invalid_content()` (module-level) — the two wire shapes the retry
   tests need: the `deviceBusy` family (vendor statusCode 2, HTTP 503) and the
   `Invalid Content`/`badParameters` envelope (statusCode 6, terminal).
@@ -104,6 +111,48 @@ _EVENT_COND_KEYS = {
     "/ISAPI/AccessControl/AcsEvent": "AcsEventCond",
     "/ISAPI/AccessControl/AcsEventTotalNum": "AcsEventTotalNumCond",
 }
+
+# --- nonce-retirement shapes (card t_a3521d8a) --------------------------------------
+#
+# The live symptom (docs/OBSERVED.md "Digest nonce use-cap", owner run 2026-10-17):
+# a long backfill walks ~190 requests with the CORRECT password and then dies on a
+# 401 — deterministic count, device stays unlocked. That reads as the device retiring
+# the digest nonce after N uses. We never captured the 401 itself, so the mechanism is
+# OPEN and all three candidate shapes are modelled here rather than guessed at:
+#
+#   RETIRE_STALE_TRUE    — 401 + `WWW-Authenticate: Digest … stale="true"` + fresh
+#                          nonce. The RFC-correct "your nonce aged out" answer.
+#   RETIRE_STALE_FALSE   — 401 + a Digest challenge whose stale is "false". Hikvision
+#                          `webs` is known to spell stale="false" even on challenges
+#                          where the nonce actually changed (fixture
+#                          digest_challenge_401.txt shows the lowercase spelling);
+#                          a client that only trusts stale="true" would not recover.
+#   RETIRE_ENVELOPE_ONLY — 401 with the ISAPI `userCheck`/envelope body and NO
+#                          `WWW-Authenticate` header at all. No challenge to pay: the
+#                          only sane client move is to re-bootstrap from scratch.
+#
+# The shapes and their bodies are invented-but-labelled (no live capture exists);
+# each is recorded as a fixture under
+# tests/fixtures/recorded/site-a-ds-k1t341amf-s/ (see tests/fixtures/README.md) so the
+# wire form a test asserts is the same text the fake emits.
+
+RETIRE_STALE_TRUE = "stale_true"
+RETIRE_STALE_FALSE = "stale_false"
+RETIRE_ENVELOPE_ONLY = "envelope_only"
+RETIRE_SHAPES = (RETIRE_STALE_TRUE, RETIRE_STALE_FALSE, RETIRE_ENVELOPE_ONLY)
+
+#: Body for shape (c) — a 401 that carries an ISAPI envelope and no challenge. The
+#: `userCheck`-ish fields mirror the recorded challenge fixture
+#: (`digest_challenge_401.txt`) and the lockout vocabulary of DESIGN.md; nothing
+#: device-real, nothing observed (this shape is exactly what we never captured).
+_ENVELOPE_ONLY_401_BODY = (
+    b"<ResponseStatus><statusCode>4</statusCode>"
+    b"<statusString>Invalid Operation</statusString>"
+    b"<subStatusCode>authFailed</subStatusCode>"
+    b"<lockStatus>unlock</lockStatus><unlockTime>0</unlockTime>"
+    b"<retryLoginTime>4</retryLoginTime></ResponseStatus>"
+)
+
 #: An offset-bearing ISO-8601 bound: `+HH:MM`/`-HH:MM` (the forms OBSERVED.md recorded
 #: accepted) or `Z`. Anything else — above all the naive `2026-10-10T00:00:00` — is the
 #: shape the device answers with `badJsonContent`/`errorMsg=startTime`.
@@ -237,6 +286,23 @@ class FakeDevice:
         self._authorized_served = 0
         #: rotation already fired (it happens exactly once per scenario)
         self._rotated = False
+        # --- the repeatable nonce use-cap (card t_a3521d8a) -------------------------
+        #: when set to N, every nonce is accepted for exactly N authorized responses
+        #: and then retired — again and again, for as long as the session runs. This
+        #: is the shape the live 401 at request ~190 needs (docs/OBSERVED.md "Digest
+        #: nonce use-cap"): `expire_after` cannot reproduce a walk that dies at N.
+        self.retire_after: int | None = None
+        #: which of RETIRE_SHAPES the rejection answers with (see the block above
+        #: RETIRE_STALE_TRUE for why all three exist)
+        self.retire_shape: str = RETIRE_STALE_TRUE
+        #: authorized responses already served under the CURRENT nonce
+        self._nonce_uses = 0
+        #: keeps every issued nonce name unique, so a client can never "recognise" a
+        #: retired nonce again and a test can assert which nonce paid which request
+        self._nonce_serial = 0
+        #: how many retirements have fired — the pin for "exactly one recovery per
+        #: retirement" (card t_a3521d8a tests)
+        self.retirements = 0
         #: scenario name -> (method, path+query) -> Response | list[Response]
         self.routes: dict[str, list] = {}
         #: raw responses served BEFORE the auth check (to simulate server-side 401s:
@@ -265,6 +331,38 @@ class FakeDevice:
                 b"<lockStatus>unlock</lockStatus><unlockTime>0</unlockTime>"
                 b"<retryLoginTime>6</retryLoginTime></userCheck>"
             ),
+        )
+
+    def envelope_only_401(self) -> httpx.Response:
+        """Shape (c): a 401 with an ISAPI envelope and NO `WWW-Authenticate`.
+
+        Nothing to pay — a client that only knows how to answer a challenge has no
+        move here except to drop its auth state and re-bootstrap. Recorded (invented,
+        labelled) as `digest_envelope_only_401.txt`; docs/OBSERVED.md leaves this shape
+        OPEN, which is why the fake can emit it and a test can pin what we do about it.
+        """
+        return httpx.Response(
+            401,
+            headers={"Server": "webs", "Content-Type": "application/xml"},
+            content=_ENVELOPE_ONLY_401_BODY,
+        )
+
+    def _retire_nonce(self) -> httpx.Response:
+        """Fire one nonce use-cap: drop the current nonce, mint a fresh one, answer
+        in the configured shape. Called on an otherwise-authorized request."""
+        self.retirements += 1
+        self._nonce_uses = 0
+        self._nonce_serial += 1
+        fresh = f"{NONCE}-RET{self._nonce_serial}"
+        self.accepted_nonces = {fresh}
+        self.challenge_nonce = fresh
+        if self.retire_shape == RETIRE_ENVELOPE_ONLY:
+            # No challenge is offered, so `challenges` (challenges SENT) does not move.
+            return self.envelope_only_401()
+        self.challenges += 1
+        return self.challenge(
+            nonce=fresh,
+            stale="true" if self.retire_shape == RETIRE_STALE_TRUE else "false",
         )
 
     # -- scenario helpers -----------------------------------------------------------
@@ -372,6 +470,11 @@ class FakeDevice:
                 uri=path,
             )
             authorized = bool(digest.get("response")) and digest.get("response") == want
+        # The use-cap counter counts requests the box ACCEPTED the credentials on. A
+        # wrong password must not consume a nonce: otherwise a lockout-safety test could
+        # make a retirement fire on bad credentials and blame the recovery budget.
+        if authorized:
+            self._authorized_served += 1
         if not authorized:
             self.challenges += 1
             return self.unauthenticated_401()
@@ -381,7 +484,6 @@ class FakeDevice:
         # and a fresh nonce, exactly like a `webs` session that outlived its nonce.
         # The client's stale recovery pays it once (p1-03) and every recorded request
         # afterwards carries the new nonce; the rotation fires exactly once.
-        self._authorized_served += 1
         if (
             self.expire_after is not None
             and not self._rotated
@@ -394,6 +496,15 @@ class FakeDevice:
             self.stale_flag = "true"
             self.challenges += 1
             return self.unauthenticated_401()
+
+        # Repeatable nonce use-cap (retire_after) — the t_a3521d8a scenario. Same
+        # trigger, but it fires EVERY N authorized responses and in a chosen shape,
+        # because the live symptom is a deterministic 401 at the ~190th request of a
+        # long walk and nothing else.
+        if self.retire_after is not None:
+            self._nonce_uses += 1
+            if self._nonce_uses > self.retire_after:
+                return self._retire_nonce()
 
         queue = self.routes.get(key)
         if queue is None:

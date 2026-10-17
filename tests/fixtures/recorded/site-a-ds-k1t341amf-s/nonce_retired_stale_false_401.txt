@@ -1,0 +1,25 @@
+HTTP/1.1 401 Unauthorized
+Date: Sun, 18 Oct 2026 09:14:02 GMT
+Server: webs
+Content-Length: 185
+Connection: keep-alive
+X-Frame-Options: SAMEORIGIN
+Cache-Control: no-store
+Pragma: no-cache
+WWW-Authenticate: Digest qop="auth", realm="DS-39DED0D1", nonce="MASKED-NONCE-RET1", stale="false", domain="::"
+Content-Type: application/xml
+
+<userCheck><statusValue>401</statusValue><statusString>Unauthorized</statusString><lockStatus>unlock</lockStatus><unlockTime>0</unlockTime><retryLoginTime>6</retryLoginTime></userCheck>
+
+INVENTED-BUT-LABELLED — NOT A DEVICE CAPTURE. (card t_a3521d8a)
+Shape (b): the nonce WAS retired, but the answer spells `stale="false"` while still
+advertising a fresh nonce. This is the shape a client that trusts the `stale` flag
+would get wrong (RFC 7235: stale=false means "do not assume the nonce aged out"), and
+it is credible on this firmware precisely because the recorded
+`digest_challenge_401.txt` shows Hikvision `webs` spelling stale in lowercase and
+always sending the field. Same header/body style as that fixture.
+Served by: FakeDevice(retire_shape=RETIRE_STALE_FALSE).
+Client outcome (probe, docs/FINDINGS-t_a3521d8a.md F1): survived inside httpx —
+`auth_flow` never parses `stale` at all (gotchas §1.5), so it re-pays this challenge
+exactly like the stale="true" one. Pinning the two shapes separately keeps the claim
+"we do not care how the device spells stale" from being an assumption.

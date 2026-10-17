@@ -19,6 +19,13 @@ serial → `MASKED-SER-1`, mac → `00:11:22:33:44:55`, digest `nonce`/`opaque` 
 | `events_reverse_order.json` | `timeReverseOrder:true` → newest-first |
 | `error_total_notsupport.json` | `AcsEvent/Total` → 400 `subStatusCode:"notSupport"` |
 | `error_naive_start_time.json` | AcsEvent with a **naive** `startTime` → 400 `statusCode:6`, `subStatusCode:"badJsonContent"`, `errorMsg:"startTime"` (owner live probe 2026-10-17, OBSERVED.md "Event-window startTime form: offset REQUIRED" — the shape FakeDevice now answers any naive event bound with) |
+| `nonce_retired_stale_true_401.txt` | **INVENTED, not captured** (t_a3521d8a). Shape (a) of a retired digest nonce: 401 + `WWW-Authenticate … stale="true"` + fresh nonce. httpx re-pays it, so the walk survives inside the library. Emitted by `FakeDevice(retire_shape=RETIRE_STALE_TRUE)`. |
+| `nonce_retired_stale_false_401.txt` | **INVENTED, not captured** (t_a3521d8a). Shape (b): same, but the challenge spells `stale="false"` — the spelling a client that trusts `stale` would get wrong. Also survived inside httpx, which never reads the flag. `FakeDevice(retire_shape=RETIRE_STALE_FALSE)`. |
+| `nonce_retired_envelope_only_401.txt` | **INVENTED, not captured** (t_a3521d8a). Shape (c): 401 + ISAPI envelope, **no `WWW-Authenticate`**. The one shape that reproduces the live "401 at request ~190 with the correct password" (OBSERVED.md "Digest nonce use-cap"): with no challenge, httpx does not re-pay and the dead nonce sticks. `FakeDevice(retire_shape=RETIRE_ENVELOPE_ONLY)`. |
+
+The three `nonce_retired_*` files are **models, not recordings** — the live 401 was never
+captured, which is why all three shapes exist (OBSERVED.md leaves the mechanism OPEN).
+Each file carries its own INVENTED-BUT-LABELLED block; do not cite them as device truth.
 
 Mask map (real names → `User E<n>`) is deliberately **not** in this repo; it lives only
 in the operator's local capture (`~/.hermes/.../device-probe/raw_capture.json`). If the
