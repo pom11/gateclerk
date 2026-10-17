@@ -38,12 +38,16 @@ docs/OBSERVED.md or docs/references/isapi-client-gotchas.md:
   in `_last_challenge` and every later request re-presents it with a climbing `nc`:
   401 forever until the process restarts (gotchas §1.7a). So when — and only when — the
   401 offers no digest challenge and does not say the account is locked, the client
-  drops its digest state (`httpx.DigestAuth` rebuilt, so nonce *and* nc are forgotten)
-  and re-issues the byte-identical request, which re-bootstraps through a normal 401
-  challenge. The budget is hard: ≤1 recovery per request and ≤2 in a row without an
-  intervening 200, then today's terminal + circuit path unchanged. A wrong password
-  never takes it — the device answers bad credentials *with* a challenge, httpx spends
-  its one re-auth on that, and the 401 that reaches us is terminal, exactly as before.
+  drops its digest state (the `httpx.DigestAuth` is rebuilt — `_reset_auth_state` says
+  why that, rather than poking a private field) and re-issues the byte-identical
+  request, which re-bootstraps through a normal 401
+  challenge. The budget is hard, and both limits are per *logical call* (`get`/`search`),
+  not per wire request: at most one recovery inside one call, and at most two in a row
+  across calls with no intervening 200. Retiring the nonce every ~190 requests fits
+  trivially — a 200 always lands in between — while a misbehaving device is not looped.
+  A wrong password never takes the recovery: bad credentials come back WITH a challenge,
+  so httpx spends its one re-auth on that and the 401 that reaches us is terminal,
+  exactly as p1-03 shipped it.
 * **Retry classes follow `statusCode`, not the HTTP status** (gotchas §2.2/§7.4):
   `2` / HTTP 503 → exponential backoff, bounded (`busy_max_attempts`, delays capped
   at `busy_backoff_cap`); `3` → exactly one retry; `4/5/6` → terminal, retrying them
@@ -82,7 +86,7 @@ from gateclerk.exceptions import (
 from gateclerk.isapi_response import envelope_to_error, parse_body, parse_envelope
 
 __all__ = [
-    "DEFAULT_AUTH_RECOVERIES_PER_REQUEST",
+    "DEFAULT_AUTH_RECOVERY_BUDGET",
     "DEFAULT_AUTH_RECOVERY_STREAK",
     "DEFAULT_BUSY_BACKOFF_BASE",
     "DEFAULT_BUSY_BACKOFF_CAP",
@@ -108,16 +112,18 @@ DEFAULT_BUSY_BACKOFF_CAP = 30.0
 #: (card). More than one buys nothing against an embedded box and risks load.
 DEFAULT_TRANSPORT_RETRIES = 1
 
-#: Nonce-retirement recovery budget (t_a3521d8a). Two numbers, both hard.
-#: `auth_recoveries_per_request`: how many times ONE logical call may be re-issued
-#: after a challenge-less 401. One: the recovery costs a challenge plus a replay (2
-#: requests), and a second would be a loop around a device that is not cooperating.
+#: Nonce-retirement recovery budget (t_a3521d8a). Two numbers, both hard, both scoped
+#: to one **logical call** (`get`/`search`, not per wire attempt — see the notes below).
+#: `auth_recovery_budget`: how many challenge-less-401 re-bootstraps one logical call may
+#: spend. One: the recovery costs a challenge plus a replay (2 requests), and a second
+#: would be a loop around a device that is not cooperating.
 #: `auth_recovery_streak`: how many recoveries may fire in a row without an intervening
 #: 200. Two: a box that retires the nonce every ~190 requests needs one, and gets a
 #: fresh allowance each time a 200 lands between retirements; a box that retires it on
 #: every request is misbehaving and must be stopped, not served. Both are constructor
 #: parameters so a stricter policy is one call-site away, like the busy-backoff pair.
-DEFAULT_AUTH_RECOVERIES_PER_REQUEST = 1
+#: The counter of what was actually *spent* is `IsapiClient.auth_recoveries`.
+DEFAULT_AUTH_RECOVERY_BUDGET = 1
 DEFAULT_AUTH_RECOVERY_STREAK = 2
 
 #: Circuit-open fallback when a 401 body carries no `unlockTime` (field reports say
@@ -150,7 +156,7 @@ class IsapiClient:
         transport_retries: int = DEFAULT_TRANSPORT_RETRIES,
         circuit_fallback_seconds: float = DEFAULT_CIRCUIT_FALLBACK_SECONDS,
         circuit_margin_seconds: float = DEFAULT_CIRCUIT_MARGIN_SECONDS,
-        auth_recoveries_per_request: int = DEFAULT_AUTH_RECOVERIES_PER_REQUEST,
+        auth_recovery_budget: int = DEFAULT_AUTH_RECOVERY_BUDGET,
         auth_recovery_streak: int = DEFAULT_AUTH_RECOVERY_STREAK,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.monotonic,
@@ -184,7 +190,7 @@ class IsapiClient:
         self._circuit_margin = circuit_margin_seconds
         self._auth_user = username
         self._auth_secret = password
-        self._auth_recoveries_per_request = auth_recoveries_per_request
+        self._auth_recovery_budget = auth_recovery_budget
         self._auth_recovery_streak = auth_recovery_streak
         self._recovery_streak = 0
         self._sleep = sleep
@@ -272,13 +278,20 @@ class IsapiClient:
 
     @staticmethod
     def _offers_digest_challenge(response: httpx.Response) -> bool:
-        """True when the 401 handed us a `WWW-Authenticate: Digest` to pay.
+        """True when httpx has already paid this 401 for us — so we must not.
 
-        This is the whole discriminator. If a challenge was offered, httpx has ALREADY
-        spent its one re-auth on it (`_auth_flow` re-pays any 401 with a Digest header
-        and never reads `stale`, gotchas §1.5) — a second re-auth from us would be the
-        retry loop DESIGN.md forbids. If none was offered, httpx returned the 401
-        untouched and the dead nonce is still sitting in `_last_challenge`.
+        The question this predicate really answers is "did the library re-auth?", and
+        the answer is exactly the negation of httpx's own exit condition: `auth_flow`
+        walks **every** `www-authenticate` value and pays when any one of them starts
+        with `digest ` (`_auth.py:206-212`; it never reads `stale` — gotchas §1.5). The
+        per-value test below mirrors that scan; if httpx's rule ever changes this is the
+        line that changes with it, and
+        `test_reproduces_httpx_own_challenge_scan_selection` is what notices.
+
+        Drift is silent and expensive in both directions: answer "paid" when httpx did
+        not and a retired nonce kills the walk again (the bug this card exists for);
+        answer "not paid" when httpx did and we re-bootstrap a session httpx already
+        re-paid, burning an auth attempt the device never asked for.
         """
         return any(
             header.lower().startswith("digest ")
@@ -297,7 +310,8 @@ class IsapiClient:
            problem; re-knocking during one is exactly the grind DESIGN.md's circuit
            exists to prevent.
         4. The consecutive-recovery streak still has budget (the loop guard: a box that
-           retires every nonce is misbehaving, and 200-less recoveries must stop).
+           retires every nonce is misbehaving, and recoveries with no 200 in between
+           must stop).
         """
         if response.status_code != 401:
             return False
@@ -310,15 +324,21 @@ class IsapiClient:
     def _reset_auth_state(self) -> None:
         """Forget the digest state so the next request re-bootstraps from scratch.
 
-        Rebuilding `httpx.DigestAuth` (rather than poking `_last_challenge = None`)
-        drops the nonce AND the `nc` counter together — the latter is the point: a
-        retired nonce re-presented with a climbing `nc` is the "worked for an hour,
-        then 401 forever until restart" failure of gotchas §1.7a, and a partial reset
-        would reproduce it. The request we are re-issuing goes out unauthenticated,
-        earns a normal 401 challenge, and httpx pays it — the same two-request
-        handshake a fresh client would, and the reason a search POST is safe here:
-        the body bytes are untouched, so the `searchID`/cursor are unchanged and the
-        device dedupes by cursor (module docstring).
+        Rebuilds the whole `httpx.DigestAuth` instead of clearing one of its fields.
+        The reason is completeness, not any single field: the object carries nonce,
+        realm, opaque, algorithm AND `nc`, and only a fresh instance guarantees none of
+        them survives into the next request. (Checked, not assumed: on the *happy* path
+        clearing `_last_challenge` alone produces byte-identical wire traffic, because
+        the request then goes out unauthenticated and `auth_flow` sets `_nonce_count = 1`
+        itself when it parses the challenge — so no test can tell the two apart, and
+        "nc is what the rebuild buys" would be a false claim. The rebuild is the version
+        that cannot leak a field we did not think of.)
+
+        The re-issued request therefore goes out unauthenticated, earns a normal 401
+        challenge, and httpx pays it — the same two-request handshake a fresh client
+        makes, and the reason a search POST is safe here: the body bytes are untouched,
+        so the `searchID`/cursor are unchanged and the device dedupes by cursor (module
+        docstring, and pinned by the request-count test).
         """
         self._auth = httpx.DigestAuth(self._auth_user, self._auth_secret)
 
@@ -356,7 +376,7 @@ class IsapiClient:
         transport_left = self._transport_retries
         busy_attempt = 0
         retry_3_done = False
-        recovery_left = self._auth_recoveries_per_request
+        recovery_left = self._auth_recovery_budget
         while True:
             if self.circuit_open():
                 raise IsapiAuthError(
