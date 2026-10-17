@@ -66,7 +66,9 @@ def busy_503() -> httpx.Response:
     )
 
 
-def invalid_content(request_url: str = "/ISAPI/AccessControl/AcsEvent?format=json") -> httpx.Response:
+def invalid_content(
+    request_url: str = "/ISAPI/AccessControl/AcsEvent?format=json",
+) -> httpx.Response:
     """The JSON error envelope for `Invalid Content`/badParameters (statusCode 6).
 
     Terminal per the retry-class table (gotchas §7.4): retrying this class is how

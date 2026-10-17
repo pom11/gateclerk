@@ -87,6 +87,9 @@ pythonpath = ["tests"]
 # Live device tests are opt-in twice over: the marker expression excludes them, and
 # tests/live/ hard-skips unless GATECLERK_LIVE=1 (see tests/conftest.py). CI runs the
 # default set and therefore never opens a socket to a device.
+# Coverage gates are NOT in addopts on purpose: they run as explicit CI steps (the
+# 85% overall + 95% tz pair need separate --cov scopes), and a local bare `pytest`
+# stays fast. pytest-cov is a dev dep so those steps need no extra install.
 addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not live"]
 markers = [
     "live: talks to a real Hikvision device -- skipped by default, needs GATECLERK_LIVE=1",

@@ -46,15 +46,59 @@ jobs:
         run: uv run --frozen ruff format --check .
 
       - name: Pytest on the base install (no orjson; offline)
+        # p1-09 "network blocked" outer wall: every proxy var points at a dead port
+        # on localhost. A dependency that tries to escape the socket guard via
+        # HTTP(S)_PROXY still has to OPEN A SOCKET to reach the proxy — which is
+        # exactly what tests/conftest.py's netoff blocks, so the attempt lands on the
+        # same NetworkBlockedError any other connection would. NO_PROXY is emptied so
+        # no host is silently exempted. This is a SECOND wall (the in-process guard is
+        # primary and stays primary: test_offline_guard asserts it bites an httpx
+        # client with these very vars set). It is step-scoped because uv's own
+        # install/sync steps above legitimately download. HTTP-proxy shapes only: a
+        # SOCKS blackhole would fail on httpx's missing socksio dep BEFORE touching a
+        # socket, teaching nothing about the guard.
+        env:
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: ""
         run: uv run --frozen pytest -v
 
       - name: Pytest with the optional [fast] extra (orjson path)
+        env:
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: ""
         run: |
           uv sync --frozen --extra fast
           # --no-sync so this step runs against exactly the env synced above, with no
           # implicit re-resolve between the sync and the test.
           uv run --frozen --no-sync pytest -q
           uv run --frozen --no-sync python -c "import orjson, gateclerk.output; print('orjson path ok')"
+
+      - name: Coverage gate — overall >= 85%
+        # The payroll pipeline is the product: if the offline suite stops covering
+        # it, a green run means nothing. Gate lives here (not in addopts) so local
+        # bare `pytest` stays fast and the number is one visible CI decision.
+        env:
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: ""
+        run: uv run --frozen pytest -q -x --cov=gateclerk --cov-report=term --cov-fail-under=85
+
+      - name: Coverage gate — tz* modules >= 95%
+        # Timestamps are payroll data (pyproject's DTZ lint says as much): the tz
+        # resolver, dialect table and mismatch detector get the tighter gate. Scoped
+        # with --cov=gateclerk.tz* and --cov-report=term so the per-module table is
+        # what a reviewer reads when this step goes red.
+        env:
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: ""
+        run: |
+          uv run --frozen pytest -q -x \
+            tests/test_tz.py tests/test_tz_dialect.py tests/test_tz_mismatch.py tests/test_properties.py \
+            --cov=gateclerk.tz --cov=gateclerk.tz_dialect --cov=gateclerk.tz_mismatch \
+            --cov-report=term --cov-fail-under=95
 
       - name: Console scripts are importable from a fresh env
         run: |

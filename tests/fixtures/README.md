@@ -42,3 +42,37 @@ it can be observed.
 Both are used by `tests/test_model.py` (card p1-07). If a later live probe shows the
 device really does emit one of these shapes, replace the synthetic file with a masked
 recording and say so in `docs/OBSERVED.md`.
+
+## Scenario corpus — `scenarios/` (card p1-09)
+
+Each `scenarios/<name>/` directory is one whole fake box (roster, event pages, clock)
+driven end-to-end through the full CLI by `tests/test_cli_e2e.py` (goldens in
+`tests/golden/`) and audited by `tests/test_cli_e2e_battery.py`. The registry lives in
+`tests/e2e_harness.py::SCENARIOS`; `test_corpus_matches_the_readme_table` pins that
+this table and that registry contain exactly the same names. All contents are
+synthetic and clearly fake (serials 9xxx, `User E<n>`/RO placeholder names, `fakepw`).
+
+| Scenario | What the box simulates |
+|---|---|
+| `happy_day` | attendance mode ON: checkIn/checkOut + face/card passes, offset-bearing time strings with site-a's +02:00-in-+03:00 stamp (the payroll happy path) |
+| `happy_day_chunked` | same day walked `--chunk 12h`: fresh searchID per chunk, cursor restarts at 0, and the noon boundary punch (serial 9013) arrives from BOTH half-day pages — the inclusive-bounds overlap P2's UPSERT makes free |
+| `naive_time` | fw variant that stamps NO offset on any time string (events and System/time alike): same site-tz resolution, and `tz_offset_mismatch` is None (no claim), never False |
+| `dst_day` | Bucharest 2026 DST edges: spring gap 29 Mar 03:30 (nonexistent, kept+flagged) and autumn fold 25 Oct 03:30 occurring TWICE (two employees, same stamp — both take the FIRST occurrence, +03:00) |
+| `max10_box` | device advertises `maxResults @max=10` (some DS-K1T* boxes): six pages of exactly ten, walked at the advertised cap |
+| `clamped_maxresults` | device SILENTLY serves 7 of the 30 asked (vendor text): the cursor must follow the returned numOfMatches — advancing by 30 would skip the last 4 with no error (THE payroll bug) |
+| `ignored_employee_filter` | device ignores `employeeNoString` and serves everyone (OBSERVED.md): the client-side filter must still yield exactly employee 2 |
+| `attendance_absent` | site-a's REAL mode (serves the recorded masked capture): `attendanceStatus` absent on every event → direction=unknown / direction_source=none |
+| `encrypted_person_data` | site variant whose `name` is a base64 blob (DESIGN.md open question): flagged `encrypted_person_data`, kept verbatim, never decoded or dropped |
+| `unicode_names` | RO diacritic names stored NFD by the device (different bytes than NFC for the same person): the MODEL composes to NFC, `raw` keeps the device's NFD bytes |
+| `digest_stale_nonce` | `webs` rotates the session nonce mid-walk: exactly one `stale="true"` re-challenge, zero lost records, new nonce on every later request |
+| `busy_then_retry` | two `deviceBusy` (HTTP 503 / statusCode 2) answers mid-session: transport backs off and the output is byte-identical to the same box served healthy |
+| `invalid_content` | events endpoint answers `Invalid Content`/`badParameters` (statusCode 6) and stays there: terminal class — CLI exits 4 quoting the body, prints no records, never loops (retrying it is the lockout path) |
+
+The error-payload box (`invalid_content`) has no byte golden: its error quotes the
+request body, which carries a fresh uuid4 searchID per run. Its contract is pinned
+structurally instead — see the docstring on `test_events_jsonl_matches_golden`.
+
+Regenerate goldens deliberately: `GATECLERK_UPDATE_GOLDEN=1 uv run pytest
+tests/test_cli_e2e.py`, READ the `git diff tests/golden`, commit only what you meant
+to change. A golden that changed because a record field changed is the review
+artifact; one that changed for no reason is the bug goldens exist to catch.

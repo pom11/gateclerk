@@ -21,3 +21,8 @@ build/
 local-store/
 # git worktrees live here (kanban worker checkouts)
 .worktrees/
+
+# pytest/coverage artefacts
+.coverage
+.coverage.*
+htmlcov/

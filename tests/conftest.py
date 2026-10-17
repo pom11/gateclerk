@@ -191,14 +191,28 @@ def cli_child() -> Callable[..., ChildResult]:
     Deliberately NOT the CliRunner: this exercises the real entry point over the real
     httpx transport (no monkeypatching), which is the only way to test a failure that
     happens *inside* the transport.
+
+    Proxy variables are stripped from the child's environment. These tests assert
+    WHERE the request died (before/after the resolver), and httpx's `trust_env` would
+    otherwise obey any HTTP(S)_PROXY the harness sets — CI's no-egress wall points the
+    proxy at a blackhole (see .github/workflows/ci.yml), which would move the failure
+    site to the proxy hop and break the assertion without any egress. Stripping the
+    proxy does not weaken the wall: the child still refuses to resolve a name or build
+    a socket, whatever the environment says.
     """
 
     def run(*args: str, timeout: float = 120.0) -> ChildResult:
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+        }
         proc = subprocess.run(  # noqa: S603 — argv list, no shell, fixed program text
             [sys.executable, "-c", _CHILD_PROGRAM, *args],
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         marker = "@@GATECLERK_CHILD@@"
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith(marker)]
