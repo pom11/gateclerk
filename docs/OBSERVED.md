@@ -122,6 +122,21 @@ sparse 6-week window; a dense-window A/B (one read-only POST pair on a busy day)
 whether the label shifts the effective window by an hour. Until proven otherwise we send
 site `+03:00` — self-consistent with site-tz-is-truth.
 
+## Digest nonce use-cap → deterministic 401 mid-backfill (owner live run 2026-10-17, VERIFIED symptom / OPEN mechanism)
+
+Long `--chunk 1h` backfill hit **401 Unauthorized with the correct password** at exactly
+the same window on two runs (2026-09-08T21:00, ~190th request of the walk), exit 3.
+The device stayed **unlocked**: `lockStatus=unlock`, `retryLoginTime=4` (the step-9
+wrong-password probe afterwards behaved normally) — so this is NOT a lockout. Reading:
+the device retires a digest nonce after N uses; our client does not survive the
+re-challenge (httpx spends exactly one re-auth; our 401-is-terminal rule + circuit then
+kill the run). **MECHANISM OPEN — we never captured the 401 response itself**: was a
+`WWW-Authenticate` challenge present? `stale="true"` or `"false"`? Or error-envelope-only?
+Three shapes have different fixes. Debug OFFLINE with FakeDevice nonce-expiry seams
+(all three shapes) — do NOT re-probe the device to find out: every wrong-shape 401 can
+count toward lockout accounting. Card t_12286c0d's sibling tracks the fix.
+Any backfill over ~190 requests fails until fixed.
+
 ## Server-side filter truth (probe 2026-10-15, second round) — filter CLIENT-side
 
 `AcsEventCond.employeeNo` (no suffix) is **SILENTLY IGNORED** on this fw:
