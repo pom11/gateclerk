@@ -17,13 +17,18 @@ that is why the assertions iterate `SCENARIOS` instead of listing names.
 
 from __future__ import annotations
 
+import json
+import re
+
 import pytest
 
 from e2e_harness import (
     ALLOWED_PATHS,
     ALLOWED_POST_PATHS,
+    EVENT_PATH,
     GOLDEN_NOW,
     SCENARIOS,
+    TOTAL_NUM_PATH,
     conn_args,
     install,
 )
@@ -82,6 +87,43 @@ def test_registry_and_harness_allowlists_agree() -> None:
     registered = {ep.url_path for ep in endpoints.REGISTRY.values()}
     extra = ALLOWED_PATHS - registered
     assert not extra, f"harness allows paths the product registry does not know: {sorted(extra)}"
+
+
+@pytest.mark.parametrize("name", ALL_SCENARIOS)
+def test_every_event_body_on_the_wire_carries_offset_bearing_bounds(box, name: str) -> None:
+    """p1-05b whole-corpus pin: on EVERY box, every AcsEvent and AcsEventTotalNum
+    body the CLI sent carries startTime AND endTime stamped `+HH:MM` (the site-tz
+    offset). The live run of 2026-10-17 (OBSERVED.md "Event-window startTime form:
+    offset REQUIRED") proved a naive bound gets HTTP 400 `badJsonContent`/
+    `errorMsg=startTime` — a body that fails here would fail every real pull.
+
+    Runs with `--count` so the AcsEventTotalNum probe is audited too (same body
+    shape, same 400). The error box (`invalid_content`) is included: its raw 400 is
+    queued before the strictness check, but the REQUEST body is still recorded —
+    and it must be well-formed regardless of how the box answers.
+    """
+    offset_bound = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}")
+    e2e = box(name)
+    e2e.run_events("--count")
+    checked = 0
+    for served in e2e.device.served:
+        if served.method != "POST" or not served.body:
+            continue
+        if served.path == EVENT_PATH:
+            cond_key = "AcsEventCond"
+        elif served.path == TOTAL_NUM_PATH:
+            cond_key = "AcsEventTotalNumCond"
+        else:
+            continue
+        cond = json.loads(served.body).get(cond_key, {})
+        for bound in ("startTime", "endTime"):
+            assert bound in cond, f"{name}: {cond_key} sent no {bound}"
+            assert offset_bound.fullmatch(cond[bound]), (
+                f"{name}: {cond_key}[{bound}]={cond[bound]!r} carries no +HH:MM "
+                "offset — this firmware 400s it (OBSERVED.md 2026-10-17)"
+            )
+            checked += 1
+    assert checked >= 2, f"{name}: no event/count bodies observed to pin"
 
 
 @pytest.mark.parametrize("name", ALL_SCENARIOS)

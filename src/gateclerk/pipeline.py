@@ -677,7 +677,11 @@ def event_total_count(
     have that 0 means "all minors" rather than "minor zero".
     """
     window = window_for_device(since, until, site_tz=site_tz)
-    start, end = window.search_pair()
+    # Offset-bearing pair: AcsEventTotalNum takes the same body shape as AcsEvent, and
+    # this firmware 400s a naive startTime (OBSERVED.md "Event-window startTime form:
+    # offset REQUIRED", live proof 2026-10-17 — the naive form here fails exactly like
+    # the paged walk did).
+    start, end = window.search_pair(with_offset=True)
     try:
         body = client.search(
             "acs_event_total_num",

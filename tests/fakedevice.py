@@ -31,11 +31,24 @@ Scenarios are installed per test:
 * `busy_503()` / `invalid_content()` (module-level) — the two wire shapes the retry
   tests need: the `deviceBusy` family (vendor statusCode 2, HTTP 503) and the
   `Invalid Content`/`badParameters` envelope (statusCode 6, terminal).
+
+The event handlers are body-strict, not just auth-strict
+----------------------------------------------------------------
+A fake more lenient than the device is a false-green machine (the lesson of the
+worktree-editable-import bug, applied to request shapes). The live run of 2026-10-17
+(docs/OBSERVED.md "Event-window startTime form: offset REQUIRED") proved this
+firmware 400s an AcsEvent/AcsEventTotalNum body whose `startTime`/`endTime` is
+naive: `statusCode=6`, `subStatusCode=badJsonContent`, `errorMsg=startTime` (the
+recorded shape: `error_naive_start_time.json`). So `_handle` rejects a naive bound
+on those two paths with exactly that envelope, *after* auth, like the device
+validates at handler time. A walk that still sends naive now fails loudly instead
+of being served fixture pages.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -83,6 +96,62 @@ def invalid_content(
             "subStatusCode": "badParameters",
         },
     )
+
+
+#: The event POSTs and their cond block — the endpoints the body-strictness below
+#: guards. UserInfo/Search is deliberately NOT here: its body carries no time window.
+_EVENT_COND_KEYS = {
+    "/ISAPI/AccessControl/AcsEvent": "AcsEventCond",
+    "/ISAPI/AccessControl/AcsEventTotalNum": "AcsEventTotalNumCond",
+}
+#: An offset-bearing ISO-8601 bound: `+HH:MM`/`-HH:MM` (the forms OBSERVED.md recorded
+#: accepted) or `Z`. Anything else — above all the naive `2026-10-10T00:00:00` — is the
+#: shape the device answers with `badJsonContent`/`errorMsg=startTime`.
+_HAS_OFFSET = re.compile(r"(?:Z|[+-]\d{2}:\d{2})$")
+
+
+def bad_json_content(field: str) -> httpx.Response:
+    """The RECORDED rejection of a naive event bound (error_naive_start_time.json).
+
+    Envelope verbatim from the owner's 2026-10-17 live probe (OBSERVED.md "Event-window
+    startTime form: offset REQUIRED"): HTTP 400, statusCode 6, badJsonContent, errorMsg
+    naming the offending bound. Only the startTime case is device-observed; naming
+    endTime is the symmetric extrapolation that keeps the fake at least as strict as
+    the device on the pair.
+    """
+    return httpx.Response(
+        400,
+        json={
+            "statusCode": 6,
+            "statusString": "Invalid Content",
+            "subStatusCode": "badJsonContent",
+            "errorMsg": field,
+        },
+    )
+
+
+def naive_event_bound(body: bytes, cond_key: str) -> str | None:
+    """Name the bound of a posted event body that the device would reject, else None.
+
+    A bound that is ABSENT is not this check's business (the engine cannot build one —
+    `build_event_cond` raises first — and test_paging's `_UnboundedQueryRejector`
+    simulates that hazard separately). A bound that is PRESENT must carry an offset.
+    Bodies that do not parse as JSON (transport-level probes) are left to the route.
+    """
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    cond = payload.get(cond_key) if isinstance(payload, dict) else None
+    if not isinstance(cond, dict):
+        return None
+    for name in ("startTime", "endTime"):
+        value = cond.get(name)
+        if value is None:
+            continue
+        if not (isinstance(value, str) and _HAS_OFFSET.search(value)):
+            return name
+    return None
 
 
 def parse_digest_header(value: str) -> dict[str, str]:
@@ -334,6 +403,17 @@ class FakeDevice:
                 b'"subStatusCode":"notSupport","errorCode":1073741825,"errorMsg":"unknow"}',
                 headers={"Content-Type": 'application/json;charset="UTF-8"'},
             )
+        # Body-strictness at HANDLER time (after auth, like the firmware): an event
+        # window bound without a UTC offset is rejected exactly as the device rejected
+        # it on 2026-10-17 — recorded in error_naive_start_time.json, policy in
+        # OBSERVED.md "Event-window startTime form: offset REQUIRED". A walk that
+        # still sends naive fails loudly here instead of being served pages.
+        if request.method == "POST":
+            cond_key = _EVENT_COND_KEYS.get(request.url.path)
+            if cond_key is not None:
+                rejected = naive_event_bound(request.content, cond_key)
+                if rejected is not None:
+                    return bad_json_content(rejected)
         return _clone(queue.pop(0) if len(queue) > 1 else queue[0])
 
 

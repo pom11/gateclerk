@@ -783,7 +783,11 @@ def test_events_count_reads_the_documented_count_endpoint_as_advisory(
     assert len(hits) == 1
     cond = json.loads(hits[0].body)["AcsEventTotalNumCond"]
     assert cond["major"] == 5 and cond["minor"] == 0
-    assert "startTime" in cond and "endTime" in cond
+    # p1-05b: the count probe takes the SAME body shape as AcsEvent, so a naive
+    # startTime here draws the same 400 badJsonContent — the fake would reject it and
+    # the advisory line would print "no readable count" instead of "device says 30".
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", cond["startTime"])
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", cond["endTime"])
     line = stderr_of(events_args("--format", "jsonl", "--count"))
     assert "device says 30" in line and "printed 30" in line
 
