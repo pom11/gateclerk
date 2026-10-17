@@ -24,6 +24,11 @@ gateclerk = "gateclerk.cli:app"
 dev = [
     "pytest>=8.3",
     "ruff>=0.6",
+    # p1-09: the coverage gate (85% overall / 95% gateclerk.time*) runs in CI through
+    # pytest's own addopts, so the plugin is a hard dev dep, not an opt-in.
+    "pytest-cov>=5.0",
+    # p1-09: property tests for paging termination + tz resolver totality.
+    "hypothesis>=6.100",
 ]
 
 [build-system]
