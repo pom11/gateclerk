@@ -26,8 +26,37 @@ device truth: docs/OBSERVED.md.)
   P1-02/04/05/08/09 queued in dependency order. P1-10 live smoke = human-only.
 
 ## Next expected
-- Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
-  suite → hand to owner for P1-10 live smoke against 192.0.2.10.
+- Owner dense-window live re-run for p1-05c (b174150) -> closes the payroll gap.
+- In flight: t_29318514 (tz_dialect tightenings), t_b4c71443 (run-level mismatch
+  warning) -> orchestrator review wave -> P1 done pending owner sign-off.
+
+## 2026-10-18 — p1-05c merged (PR #22 -> b174150); blocked trio adjudicated + re-dispatched
+
+- PR #22 gate: own merged-tree run **1049 passed / 4 skipped / 1 deselected**, ruff
+  clean, CI green at head. A/B-replay audit PASSED on the real numbers:
+  `+03:00`-labeled -> `[]` + NOMATCH (wire label pinned), `+02:00` -> serials **28..47
+  all 20** + OK, seeded at device wall 14:08+ (OBSERVED.md table), against an
+  arithmetically-filtering fake (label->instant->its claimed clock) whose docstring
+  names the presence-only false-green it kills; boundary pin covers the inclusive
+  14:30 edge; one-GET-per-run pinned (had_auth-filtered); unreadable-claim fallback
+  warns, never goes naive; cli.py touch = pure threading. Review posted on PR #22.
+  AWAITING OWNER: dense-window live re-run (13:00-14:30-style pair showing +02:00
+  label returns the events).
+- **Blocked trio rulings** (all three had verified worker blocks from 10-16 awaiting
+  orchestrator input — the review-wave backlog, not live stalls):
+  - t_7a0cb61e (p1-06b) CLOSED as duplicate: tz_dialect shipped via PR #3; the 4 spec
+    divergences = accepted merged design (cards don't re-litigate merged code). Its 2
+    REAL tightenings (sub-minute offsets rounded at tz_dialect.py:179; ±16h bound at
+    :44) re-scoped + dispatched as **t_29318514**.
+  - t_e26227b1 (p1-06c) CLOSED split-3: per-record column shipped (model.py:395,
+    pipeline.py:461, tz_mismatch.py + 13 tests), validator = t_b5308f3f (done), and the
+    ONE piece never built — the run-level warning line (verified: nothing prints it on
+    b174150) — re-scoped + dispatched as **t_b4c71443** (stderr, warn-don't-fail
+    precedent, stdout byte-clean, one line not per-record).
+  - t_c9c62093 (p1-06d) CLOSED superseded: t_7b073d11 (done) is the post-review dedupe
+    (isapi_response sole guard, tz.py re-export, read_system_time stays).
+- Both new cards: backend-engineer, worktree branches, no file overlap -> parallel OK.
+  Board: 0 todo/ready-stranded, 2 running-soon, 0 blocked, done 26.
 
 ## 2026-10-17 night — P1-03b accepted (4af4398); A/B settles window semantics -> NEW payroll bug carded (p1-05c)
 
