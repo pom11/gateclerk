@@ -146,7 +146,12 @@ or upgrades.
 
 P1 in progress. `gateclerk --version` works, and as of card p1-08 the read commands are live:
 `device info`, `device time`, `device capabilities`, `users list` and `gateclerk events
---since ... --until ...` against a real controller. Exit codes: `0` ok, `2` config/input,
+--since ... --until ...` against a real controller. `device time` prints both halves of
+the clock story — the wall-clock skew and the three-valued `tz_offset_mismatch` verdict
+(site-a in summer: skew ~4 s, offset wrong on every record) — so an operator at the
+device cannot read a healthy skew as "the time is fine"; a null verdict means the device
+claimed no offset and says so, never that the offsets agree.
+Exit codes: `0` ok, `2` config/input,
 `3` auth (check the credential before the account locks), `4` device error, `5` the paging
 engine refused to loop on a misbehaving device. There is no local store yet — that is P2 —
 so `--output jsonl` is where the records go.

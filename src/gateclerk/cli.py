@@ -737,13 +737,14 @@ def device_time(
         typer.Option(
             "--json",
             help="Raw System/time passthrough (verbatim body — this fw answers XML) plus "
-            "the parsed reading and the skew. Shorthand for --output json.",
+            "the parsed reading, the tz offset verdict and the skew. "
+            "Shorthand for --output json.",
         ),
     ] = False,
 ) -> None:
     """Read GET /ISAPI/System/time and compare its wall clock with ours.
 
-    Two rules from OBSERVED.md decide what this prints:
+    Three rules from OBSERVED.md decide what this prints:
 
     * the reading is parsed from the **raw body** (`pipeline.device_time_reading`),
       because this firmware answers System/time as XML even with `?format=json`;
@@ -753,6 +754,12 @@ def device_time(
       "NTP skew" forever — a permanent false alarm blaming the clock for a timezone
       mistake. The wall clock is the thing OBSERVED.md verified healthy (~4 s) and the
       thing whose drift actually corrupts punch order.
+    * the skew is NOT the whole answer, so the offset comparison prints beside it
+      (`tz_mismatch.py`'s three-valued rule; DESIGN.md "Open questions" item 7).
+      Site-a in summer has a healthy skew and a wrong claimed offset on every
+      record: an operator who reads only the skew would send that box home as
+      fixed. `None` means the device claimed nothing, and it renders as absence —
+      never as agreement (the model.py convention).
     """
     fmt = OutputFormat.JSON if json_flag else output
     site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
