@@ -32,14 +32,16 @@ the run emitted.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
 import gateclerk.cli as cli_mod
+import gateclerk.pipeline as pipeline_mod
 from e2e_harness import EVENT_PATH, SCENARIOS, Scenario, conn_args, install
-from gateclerk.model import from_jsonl
+from gateclerk.model import EventRecord, from_jsonl
 
 #: Identifies THE mismatch line. A substring of the payload, not the `warning:` prefix:
 #: the naive_time box legitimately prints a *different* warning (p1-05c's window-label
@@ -366,6 +368,190 @@ def test_error_run_that_prints_no_records_prints_no_line(box) -> None:
     assert code == 4
     assert [r for r in e2e.rows(out) if "serial_no" in r] == []
     assert warn_lines(err) == []
+
+
+# --- the emitter never crashes the run it reports on (review round 1, required change) -----
+
+#: A claim outside the ±HH:MM ISO form. `EventRecord.from_dict` keeps such a number
+#: verbatim (it validates the type, not the range) and `offset_hhmm` refuses it — so the
+#: warning is the one place a wild value can turn a report into a crash. Reachable today
+#: only through a record that did not come from `TimeResolver` (a rehydrated or
+#: hand-assembled record; the resolver itself cannot produce it — a `+99:30` stamp fails
+#: `fromisoformat` and lands `unresolved` with no claim at all), which is exactly why the
+#: guard must be behaviour and not an assumption about the input.
+WILD_CLAIM = 5970  # +99:30 — the widest two-digit hour claim `_TIME_RE`'s shape admits
+WILD_USED = -1500  # -25:00 — out of range on the negative side too (both directions)
+
+
+def _flagged(**over: Any) -> EventRecord:
+    """One mismatch-flagged Bucharest record, with `over` on the p1-06 time block.
+
+    Built through `EventRecord.from_dict` — the same door `pipeline` uses — so these pins
+    talk to the emitter with a real record, not a stand-in object.
+    """
+    payload: dict[str, Any] = {
+        "site": "site-a",
+        "device_serial": "SN-1",
+        "serial_no": 1,
+        "event_time_utc": "2026-06-15T05:00:00+00:00",
+        "event_time_local": "2026-06-15T08:00:00+02:00",
+        "tz_offset_min": 180,
+        "tz_offset_min_device": 120,
+        "tz_source": "site-tz",
+        "iana_tz": "Europe/Bucharest",
+        "tz_offset_mismatch": True,
+    }
+    payload.update(over)
+    return EventRecord.from_dict(payload)
+
+
+def test_a_wild_claim_is_labeled_as_raw_minutes_not_raised(capsys) -> None:
+    """The single-pair arm interpolates BOTH offsets through the guard.
+
+    Byte-pinned, including the raw-minutes fallback: a "fix" that clamped the value into
+    range would print a plausible `+23:59` and hide the fact that the record claims +99:30
+    — a cleaner-looking line about a number we never saw.
+    """
+    cli_mod._warn_tz_mismatch([_flagged(tz_offset_min_device=WILD_CLAIM)])
+    assert warn_lines(capsys.readouterr().err) == [
+        "warning: 1 of 1 events have tz_offset_mismatch=true "
+        f"(device claims {WILD_CLAIM:+d} min; site Europe/Bucharest resolves +03:00 at these "
+        "instants) — records are correct, site-tz resolution is authoritative"
+    ]
+
+
+def test_a_wild_site_offset_is_labeled_as_raw_minutes_not_raised(capsys) -> None:
+    """Same guard on the OTHER interpolation — the site offset we used."""
+    cli_mod._warn_tz_mismatch([_flagged(tz_offset_min=WILD_USED)])
+    assert warn_lines(capsys.readouterr().err) == [
+        "warning: 1 of 1 events have tz_offset_mismatch=true "
+        f"(device claims +02:00; site Europe/Bucharest resolves {WILD_USED:+d} min at these "
+        "instants) — records are correct, site-tz resolution is authoritative"
+    ]
+
+
+def test_the_joined_arm_guards_both_offsets_of_every_pair(capsys) -> None:
+    """The multi-pair arm has two more interpolations per pair; both are guarded.
+
+    Pair 1 wild on the claim, pair 2 wild on the site offset, so a partial fix that only
+    guarded one of the two tokens in the joined f-string is caught here as well.
+    """
+    cli_mod._warn_tz_mismatch(
+        [
+            _flagged(tz_offset_min_device=WILD_CLAIM),
+            _flagged(serial_no=2, tz_offset_min_device=120, tz_offset_min=WILD_USED),
+        ]
+    )
+    assert warn_lines(capsys.readouterr().err) == [
+        "warning: 2 of 2 events have tz_offset_mismatch=true "
+        f"(device claims {WILD_CLAIM:+d} min vs site-resolved +03:00; "
+        f"device claims +02:00 vs site-resolved {WILD_USED:+d} min; "
+        "site Europe/Bucharest at these instants) "
+        "— records are correct, site-tz resolution is authoritative"
+    ]
+
+
+def test_a_wild_claim_through_the_cli_still_exits_zero(box, monkeypatch, capsys) -> None:
+    """The card's exit-code rule, applied to the warning itself: rc 0, ONE line.
+
+    Injected by wrapping the assembler `pipeline` looks up as a module global, so the
+    whole real path runs (walk, render, emitter) and only the record's claimed offset is
+    widened to something `offset_hhmm` refuses. Without the guard this run exits 1 — the
+    `_Guard` re-raises anything that is not a `GateclerkError`, so a dead guard costs the
+    operator a crashed backfill instead of a warning.
+    """
+    real = pipeline_mod.event_record_from_device
+
+    def widen_claim(*args: Any, **kwargs: Any) -> EventRecord:
+        return dataclasses.replace(
+            real(*args, **kwargs), tz_offset_min_device=WILD_CLAIM
+        )
+
+    monkeypatch.setattr(pipeline_mod, "event_record_from_device", widen_claim)
+    e2e = box("happy_day")
+    code, out, err = invoke_events(e2e)
+    rows = e2e.rows(out)
+    assert code == 0, "a warning must never change the exit code — warn, don't fail"
+    assert len(rows) == 12 and all(r["tz_offset_mismatch"] is True for r in rows)
+    assert all(r["tz_offset_min_device"] == WILD_CLAIM for r in rows), "the injection landed"
+    lines = warn_lines(err)
+    assert len(lines) == 1, f"12 wild claims are still ONE line, got {len(lines)}: {lines}"
+    assert f"{WILD_CLAIM:+d} min" in lines[0]
+    assert len(from_jsonl(out)) == 12, "stdout stays parseable with the wild claim on"
+
+
+# --- the two arms the first round left unpinned (review round 1, non-blocking) --------------
+
+
+def test_two_site_zones_are_both_named_in_the_one_line(capsys) -> None:
+    """The zone list is joined, not silently reduced to the first record's zone.
+
+    Synthetic on purpose: `events` resolves ONE site zone per run, so two names appear
+    only when records come from two configs. Either way the line must name every zone it
+    saw — asserting one zone and one offset would be wrong about half the records.
+    Records share one (claim, site) pair here, which is what keeps the single-pair arm
+    (the sentence the card pins) in play while the zone list still has two entries.
+    """
+    cli_mod._warn_tz_mismatch(
+        [
+            _flagged(),
+            _flagged(serial_no=2, iana_tz="Europe/London"),
+        ]
+    )
+    assert warn_lines(capsys.readouterr().err) == [
+        "warning: 2 of 2 events have tz_offset_mismatch=true "
+        "(device claims +02:00; site Europe/Bucharest, Europe/London resolves +03:00 at "
+        "these instants) — records are correct, site-tz resolution is authoritative"
+    ]
+
+
+def test_the_joined_arm_names_every_pair_and_every_zone(capsys) -> None:
+    """Two pairs AND two zones: every one of them named, still ONE line.
+
+    The widest shape of the sentence, pinned byte-for-byte so a future "simplification"
+    that drops either list has to be a deliberate diff.
+    """
+    cli_mod._warn_tz_mismatch(
+        [
+            _flagged(),
+            _flagged(serial_no=2, tz_offset_min=60, iana_tz="Europe/London"),
+        ]
+    )
+    assert warn_lines(capsys.readouterr().err) == [
+        "warning: 2 of 2 events have tz_offset_mismatch=true "
+        "(device claims +02:00 vs site-resolved +03:00; device claims +02:00 vs "
+        "site-resolved +01:00; site Europe/Bucharest, Europe/London at these instants) "
+        "— records are correct, site-tz resolution is authoritative"
+    ]
+
+
+def test_a_run_with_no_zone_name_falls_back_to_a_honest_phrase(capsys) -> None:
+    """`iana_tz` None (no site zone configured) must not print `site None resolves`."""
+    cli_mod._warn_tz_mismatch([_flagged(iana_tz=None)])
+    assert warn_lines(capsys.readouterr().err) == [
+        "warning: 1 of 1 events have tz_offset_mismatch=true "
+        "(device claims +02:00; site the configured site zone resolves +03:00 at these "
+        "instants) — records are correct, site-tz resolution is authoritative"
+    ]
+
+
+def test_flag_true_without_offsets_says_so_once_instead_of_printing_blanks(capsys) -> None:
+    """A flag whose own columns are missing is an upstream policy bug — named, not blanked.
+
+    Three flagged records still produce ONE line (the early return), and the sentence
+    points at the columns instead of inventing offsets for them.
+    """
+    cli_mod._warn_tz_mismatch(
+        [
+            _flagged(tz_offset_min_device=None),
+            _flagged(serial_no=2, tz_offset_min_device=None),
+            _flagged(serial_no=3, tz_offset_min=None),
+        ]
+    )
+    assert warn_lines(capsys.readouterr().err) == [
+        "warning: some events have tz_offset_mismatch=true but no offsets to explain it "
+        "— see tz_offset_min_device / tz_offset_min in the records"
+    ]
 
 
 # --- corpus property: the line always agrees with the records it summarizes -----------------
