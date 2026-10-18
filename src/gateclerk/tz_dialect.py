@@ -41,7 +41,8 @@ WINDOWS_TZ: dict[str, tuple[int, int | None, str]] = {
     "utc": (0, None, "UTC"),
 }
 
-_MAX_OFFSET_MIN = 16 * 60  # real zones span -12 h..+14 h; wider means it was never a zone
+_MAX_OFFSET_HOURS = 14  # real zones span -12 h..+14 h (Kiritimati is +14:00)
+_MAX_OFFSET_MIN = _MAX_OFFSET_HOURS * 60
 _DST_SHIFT_MIN = 60  # conventional shift, and the tie-breaker between the two DST readings
 _HMS = r"\d{1,2}(?::\d{1,2}){0,2}"
 _POSIX = re.compile(
@@ -95,6 +96,8 @@ def parse_hik_timezone(raw: str | None) -> HikTz:
     entry = WINDOWS_TZ.get(" ".join(text.split()).casefold())
     if entry:
         std, dst, who = entry
+        if bad := _out_of_range(text, (std, dst)):  # a bound on one branch is not a bound
+            return bad
         tail = f"DST UTC{_h(dst)}" if dst is not None else "no DST"
         return HikTzInfo(
             text, "windows", text, std, dst, f"Windows id, {who}: std UTC{_h(std)}, {tail}"
@@ -108,6 +111,8 @@ def parse_hik_timezone(raw: str | None) -> HikTz:
 def _posix(text: str, match: re.Match[str]) -> HikTz:
     name = match["name"]
     written = match["std"] or match["std_bare"]
+    if bad := _sub_minute(text, match):
+        return bad
     if written is None:  # no numbers: only the UTC aliases have a defensible offset
         if not _UTC_ALIAS.fullmatch(name.strip("<>")):
             return HikTzUnknown(
@@ -123,8 +128,8 @@ def _posix(text: str, match: re.Match[str]) -> HikTz:
         dst = _dst(std, match)
         if dst is False:  # both readings of the DST field are senseless
             return HikTzUnknown(text, f"no plausible DST offset in {text!r}")
-    if any(isinstance(o, int) and abs(o) > _MAX_OFFSET_MIN for o in (std, dst)):
-        return HikTzUnknown(text, f"offset outside ±{_MAX_OFFSET_MIN // 60} h is not a real zone")
+    if bad := _out_of_range(text, (std, dst)):  # the one bound, on every yielding path
+        return bad
 
     desc = f"POSIX dialect, west-positive sign so {name} = std UTC{_h(std)}" + (
         f", DST UTC{_h(dst)} ({dst - std:+d} min)" if dst is not None else ", no DST"
@@ -136,23 +141,64 @@ def _posix(text: str, match: re.Match[str]) -> HikTz:
     return HikTzInfo(text, "posix", name, std, dst, desc)
 
 
+def _sub_minute(text: str, match: re.Match[str]) -> HikTzUnknown | None:
+    """Refuse any offset field carrying non-zero seconds, naming the field.
+
+    A 3-field clock is well-formed only as `H:MM:00`. Real zone rules never have seconds
+    precision, so a device that writes `2:00:30` is misconfigured — and rounding it (the
+    old `_mm` behaviour) invented a minute of shift and reported it as an offset, which
+    on the payroll path is a silent wrong answer. Shape stays in the regex so this
+    refusal can say *which* field is wrong instead of failing to match at all.
+    """
+    for field, label in (
+        ("std", "standard"),
+        ("std_bare", "standard"),
+        ("dst", "DST"),
+        ("dstn", "DST"),
+    ):
+        clock = match[field]
+        if clock is None:
+            continue
+        parts = clock.split(":")
+        if len(parts) == 3 and int(parts[2]) != 0:
+            return HikTzUnknown(
+                text,
+                f"{text!r}: sub-minute precision ({clock!r} in the {label} offset) is not "
+                "a real zone rule; refusing instead of rounding",
+            )
+    return None
+
+
+def _out_of_range(text: str, offsets: tuple[int | None, ...]) -> HikTzUnknown | None:
+    """The one ±14 h bound, applied to every offset the parser would hand back.
+
+    No real zone leaves -12 h..+14 h (Kiritimati holds +14:00); anything wider was never
+    a zone, and accepting it turns a typo into a plausible-looking payroll shift. The
+    bound lives here, not inside `_dst`: a filtered candidate would change *which*
+    refusal the caller sees without changing that it is a refusal.
+    """
+    if any(o is not None and abs(o) > _MAX_OFFSET_MIN for o in offsets):
+        return HikTzUnknown(
+            text, f"offset outside ±{_MAX_OFFSET_HOURS} h is not a real zone ({text!r})"
+        )
+    return None
+
+
 def _dst(std: int, match: re.Match[str]) -> int | bool | None:
     """DST offset as an int, False (senseless), or None (the string has no DST).
 
     The written number is ambiguous — a Hikvision delta added to std, or a classic POSIX
     absolute west-positive value — so both are computed and the plausible shift wins: +1 h
     first (what nearly every zone does), else the smallest sane shift. A bare DST name
-    ("EST5EDT", no number) is classic POSIX for +1 h.
+    ("EST5EDT", no number) is classic POSIX for +1 h. The ±14 h bound is NOT filtered
+    here: an out-of-range candidate must reach _posix's single bound check, so the
+    refusal names the real cause instead of "no plausible DST offset".
     """
     written = match["dst"] or match["dstn"]
     if written is None:
         return std + _DST_SHIFT_MIN if match["dstname"] or match["dst"] is not None else None
     value = -_mm(written) if match["dstsign"] == "-" else _mm(written)
-    shifts = {
-        c - std
-        for c in (std + value, -value)
-        if abs(c) <= _MAX_OFFSET_MIN and 0 < c - std <= 2 * _DST_SHIFT_MIN
-    }
+    shifts = {c - std for c in (std + value, -value) if 0 < c - std <= 2 * _DST_SHIFT_MIN}
     if not shifts:
         return False
     return std + (_DST_SHIFT_MIN if _DST_SHIFT_MIN in shifts else min(shifts))
@@ -174,9 +220,14 @@ def _rules(rules: str) -> str:
 
 
 def _mm(clock: str) -> int:
-    """'2:00:00' | '2' | '5:30' -> magnitude in minutes (seconds rounded to the minute)."""
+    """'2:00:00' | '2' | '5:30' -> magnitude in minutes, exact.
+
+    No rounding: a 3-field clock only reaches here once _sub_minute has refused any
+    non-zero seconds, so the seconds field is always :00. (It used to round to the
+    nearest minute, which turned `2:00:30` into an invented +121.)
+    """
     hh, mm, *rest = (*clock.split(":"), "0", "0")
-    return int(hh) * 60 + int(mm) + (int(rest[0]) + 30) // 60
+    return int(hh) * 60 + int(mm) + int(rest[0]) // 60
 
 
 def _h(minutes: int) -> str:
