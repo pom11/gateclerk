@@ -245,11 +245,15 @@ def test_multi_chunk_walk_prints_one_line_for_the_whole_run(box) -> None:
 def test_counts_are_exact_and_partial_when_only_some_records_mismatch(box) -> None:
     """2 June +02:00 punches (true) + 1 June +03:00 punch (false) -> '2 of 3', one line."""
     e2e = box("happy_day")
-    serve(e2e, _event(1, JUNE_MISMATCH), _event(2, JUNE_MISMATCH, employee="2"),
-          _event(3, JUNE_AGREES, employee="3"))
+    serve(
+        e2e,
+        _event(1, JUNE_MISMATCH),
+        _event(2, JUNE_MISMATCH, employee="2"),
+        _event(3, JUNE_AGREES, employee="3"),
+    )
     code, out, err = invoke_events(e2e)
     assert code == 0
-    assert [r["tz_offset_mismatch"] for r in e2e.rows(out)] == [True, False, True]
+    assert [r["tz_offset_mismatch"] for r in e2e.rows(out)] == [True, True, False]
     lines = warn_lines(err)
     assert len(lines) == 1, f"partial mismatch is still ONE line: {lines}"
     assert lines[0].startswith("warning: 2 of 3 events have tz_offset_mismatch=true ")
@@ -262,8 +266,12 @@ def test_none_records_count_in_the_total_but_never_as_mismatches(box) -> None:
     emitted) but never raise the mismatch count.
     """
     e2e = box("happy_day")
-    serve(e2e, _event(1, JUNE_MISMATCH), _event(2, JUNE_AGREES, employee="2"),
-          _event(3, NAIVE, employee="3"))
+    serve(
+        e2e,
+        _event(1, JUNE_MISMATCH),
+        _event(2, JUNE_AGREES, employee="2"),
+        _event(3, NAIVE, employee="3"),
+    )
     code, out, err = invoke_events(e2e)
     rows = e2e.rows(out)
     assert code == 0
@@ -344,6 +352,7 @@ def test_verbose_does_not_duplicate_or_prefix_the_line(box) -> None:
     e2e = box("happy_day")
     code, out, err = invoke_events(e2e, "--verbose")
     assert code == 0
+    assert len(e2e.rows(out)) == 12, "verbose must not cost the run a single record"
     assert "AcsEventCond" in err, "the verbose request log itself is still on stderr"
     lines = warn_lines(err)
     assert len(lines) == 1, "verbose must not duplicate the summary"

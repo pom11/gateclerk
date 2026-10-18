@@ -29,7 +29,7 @@ because the card names them as groups (`users list`, `device info`).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
@@ -59,6 +59,7 @@ from gateclerk.tz import (
     TimestampInputError,
     UserTimestamp,
     compute_skew,
+    offset_hhmm,
     parse_user_timestamp,
 )
 
@@ -1026,6 +1027,11 @@ def events(
 
     An empty window prints an empty table and exits 0 — "nobody clocked in" is a valid
     answer, and only a filter typo should be able to look like a failure.
+
+    A run where any printed record has `tz_offset_mismatch=true` ends with ONE summary
+    line on stderr (p1-06c: site-a's summer +02:00-on-a-+03:00 wall clock; the records
+    are correct, the site-tz resolution is authoritative). Never per record, never on
+    stdout, never an exit-code change — `--format jsonl > out.jsonl` stays parseable.
     """
     fmt = format
     site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
@@ -1113,6 +1119,10 @@ def events(
                 filtered=bool(employee_no or verify or outcome) or capped,
                 capped=capped,
             )
+        # p1-06c's run-level visibility: the walk is done, the stream is rendered, this
+        # only summarizes what was just printed — display-only, like the `--count` line
+        # above it, and it never changes the exit code.
+        _warn_tz_mismatch(records)
 
 
 #: The card's table columns, in this order. `utc` and `local` are adjacent on purpose:
@@ -1183,6 +1193,88 @@ def _print_count_crosscheck(
         if capped:
             why = " (--max-results capped the output)"
     console.print(f"count: device says {device_count}, printed {shown} ({verb}{why})", markup=False)
+
+
+# --- p1-06c run-level warning --------------------------------------------------------------
+
+
+def _warn_tz_mismatch(records: Sequence[Any]) -> None:
+    """ONE stderr summary line when any printed record has `tz_offset_mismatch=true`.
+
+    The column shipped with p1-06 (`tz_mismatch.py` owns the policy; DESIGN.md "Time
+    handling" item 2: site-tz math is authoritative, the flag is audit-only). What was
+    missing is visibility: on site-a in summer the flag is true on ~100% of records
+    (the device claims +02:00 while Europe/Bucharest resolves +03:00) until the OWNER
+    fixes the device tz — a device write we never make — and an operator watching a
+    backfill saw silence unless they grepped the JSONL.
+
+    The precedent is `--count` (paging.py: "warn, don't fail"): one line, after the
+    run, exit code untouched; `make_console(stderr=True)` keeps `--format jsonl >
+    out.jsonl` parseable with the warning on (the same invariant `--verbose` pins).
+    Rules this line obeys:
+
+    * NEVER per-record — 1104 mismatched events still produce ONE line, and a
+      multi-chunk walk summarizes the WHOLE run (the CLI hands in all output records);
+    * a run with no true flags prints nothing — and a flag of None is "there was no
+      claim to compare" (tz_mismatch.py's three-valued rule), so it counts neither as
+      a mismatch nor as agreement: an all-None run is silence about mismatch;
+    * the pair shown is READ OFF the records' own columns (`tz_offset_min_device` =
+      what the device claimed, `tz_offset_min` = the site offset the UTC math used),
+      never re-derived — a summary that recomputes can disagree with the records it
+      summarizes. Distinct pairs are joined so a DST-boundary run whose mismatches go
+      both ways (claim +02:00/site +03:00 in June; claim +03:00/site +02:00 in late
+      October) names both instead of mislabeling one half;
+    * the line says the records are correct: the resolution is already right, and
+      anything that reads like "1104 records are wrong" would be a worse lie than the
+      silence this replaced.
+    """
+    flagged = [r for r in records if r.tz_offset_mismatch is True]
+    if not flagged:
+        return
+
+    def label(minutes: int) -> str:
+        # A wild claim (`+99:30` on a malformed stamp) is out of the ±HH:MM ISO form
+        # `offset_hhmm` refuses: show it as raw minutes rather than let the WARNING
+        # crash the run it is reporting on (warn, don't fail — both directions).
+        try:
+            return offset_hhmm(minutes)
+        except ValueError:
+            return f"{minutes:+d} min"
+
+    pairs: list[tuple[int, int]] = []
+    for record in flagged:
+        claimed, used = record.tz_offset_min_device, record.tz_offset_min
+        # True without both offsets means the flag and its own columns disagree — a
+        # policy bug upstream. Say so instead of printing a sentence with blanks.
+        if claimed is None or used is None:
+            make_console(stderr=True).print(
+                "warning: some events have tz_offset_mismatch=true but no offsets to "
+                "explain it — see tz_offset_min_device / tz_offset_min in the records",
+                markup=False,
+            )
+            return
+        pair = (claimed, used)
+        if pair not in pairs:
+            pairs.append(pair)
+    zones = sorted({r.iana_tz for r in flagged if r.iana_tz})
+    site = ", ".join(zones) if zones else "the configured site zone"
+    if len(pairs) == 1:
+        claimed, used = pairs[0]
+        detail = (
+            f"device claims {offset_hhmm(claimed)}; "
+            f"site {site} resolves {offset_hhmm(used)} at these instants"
+        )
+    else:
+        joined = "; ".join(
+            f"device claims {offset_hhmm(claimed)} vs site-resolved {offset_hhmm(used)}"
+            for claimed, used in pairs
+        )
+        detail = f"{joined}; site {site} at these instants"
+    make_console(stderr=True).print(
+        f"warning: {len(flagged)} of {len(records)} events have tz_offset_mismatch=true "
+        f"({detail}) — records are correct, site-tz resolution is authoritative",
+        markup=False,
+    )
 
 
 # --- creds (p1-02): diagnostics that never open a socket ------------------------------
