@@ -56,12 +56,14 @@ from gateclerk.paging import DEFAULT_CHUNK, parse_chunk
 from gateclerk.pipeline import DEFAULT_SITE_LABEL, RequestLogger, RunContext
 from gateclerk.tz import (
     SKEW_WARN_SECONDS,
+    DeviceTime,
     TimestampInputError,
     UserTimestamp,
     compute_skew,
     offset_hhmm,
     parse_user_timestamp,
 )
+from gateclerk.tz_mismatch import is_offset_mismatch, site_offset_minutes
 
 __all__ = [
     "AUTH_TERMINAL_EXIT",
@@ -663,6 +665,61 @@ def device_info(
     render(rows, fmt=fmt.value, columns=columns)
 
 
+#: The rendered verdict for "the device asserted no offset at all" (p1-11). Worded as
+#: ABSENCE on purpose: `None` is "no evidence", never "fine" (model.py's convention) — an
+#: operator who read this line as "the offsets agree" would send a naive-clock box home
+#: as healthy. Pinned by exact rendered text in tests/test_cli_commands.py.
+NO_OFFSET_EVIDENCE = "no evidence (device claims nothing)"
+
+
+def _tz_offset_verdict(reading: DeviceTime, site_tz: str) -> tuple[bool | None, int | None, str]:
+    """(mismatch, site offset at the device's wall instant, human sentence) — p1-11.
+
+    DESIGN.md "Phase plan" item 7's other half: an operator standing at the device sees a
+    wall clock ~4 s off (the skew rows below) and must NOT conclude the time is fine —
+    site-a in summer has skew ≈ 0 with a wrong offset on every record. This is that
+    comparison on the `device time` surface; the per-event column and the run-level
+    warning already shipped with p1-06.
+
+    The rule is `tz_mismatch.py`'s, imported and not restated: three-valued, where
+    **None means there was no claim to compare** and is rendered as absence (see
+    `NO_OFFSET_EVIDENCE`), never as agreement. Both sides are computed from the reading
+    the command already fetched — no second request, and the device's own wall digits are
+    what the site zone is resolved at, so the comparison is immune to the device's label.
+
+    The wall clock being unparseable is its own honest answer: with no wall there is
+    nothing for the zone to resolve against (and no claim — both come out of the same
+    `localTime` string), so the verdict and the site offset are both None and the sentence
+    says which fact is missing. `offset_hhmm` cannot refuse a value from here (a
+    `localTime` stamp is ±HH:MM by `_TIME_RE`, a zone offset is within ±23:59), but the
+    label keeps a raw-minutes arm rather than trusting that reading of two other modules.
+    """
+    if reading.naive_local is None:
+        return None, None, "no evidence (no readable device wall clock)"
+    site_min = site_offset_minutes(reading.naive_local, site_tz)
+    claim_min = reading.claimed_offset_minutes
+    verdict = is_offset_mismatch(claim_min, reading.naive_local, site_tz)
+
+    def label(minutes: int) -> str:
+        try:
+            return f"{offset_hhmm(minutes)} ({minutes} min)"
+        except ValueError:  # pragma: no cover - see docstring; never crash the report
+            return f"{minutes} min"
+
+    site = f"site resolves {label(site_min)}"
+    # `verdict is None` and `claim_min is None` are the same fact here (the detector
+    # answers None exactly when the claim asserts nothing); spelling both out keeps the
+    # type checker happy without adding a branch that could drift from the policy.
+    if verdict is None or claim_min is None:
+        return verdict, site_min, f"{NO_OFFSET_EVIDENCE}, {site}"
+    claim = f"device claims {label(claim_min)}"
+    if verdict:
+        # "records unaffected": the resolution path already ignores this claim (DESIGN.md
+        # item 2), so a flag that read like an accusation of bad data would be the lie.
+        return verdict, site_min, f"MISMATCH — {claim}, {site}; records unaffected"
+    return verdict, site_min, f"agrees — {claim}, {site}"
+
+
 @device_app.command("time")
 def device_time(
     host: HostArg = None,
@@ -709,6 +766,7 @@ def device_time(
         with _client_for(target, creds, timeout=timeout, output=fmt, logger=logger) as client:
             reading, raw_text = pipeline.device_time_reading(client)
         skew = compute_skew(reading, site_tz=site_tz, warn_seconds=SKEW_WARN_SECONDS)
+        offset_verdict, site_offset_min, offset_detail = _tz_offset_verdict(reading, site_tz)
         # Everything downstream of the read runs INSIDE the guard: `reading` only exists if
         # the read succeeded, and a `--json` passthrough that rendered after the block would
         # have nothing honest to print on the failure path.
@@ -723,6 +781,12 @@ def device_time(
                     "tz_rule": reading.tz_raw,
                     "parse_note": reading.note,
                     "site_tz": site_tz,
+                    # p1-11 (DESIGN.md item 7): the three-valued comparison, same semantics
+                    # as the event record's `tz_offset_mismatch` — null = no claim, NOT
+                    # agreement. `site_offset_min_at_instant` is the other side of it, so a
+                    # reader never has to re-derive which side disagreed.
+                    "tz_offset_mismatch": offset_verdict,
+                    "site_offset_min_at_instant": site_offset_min,
                     "our_wall": _iso(skew.our_wall),
                     "skew_seconds": skew.skew_seconds,
                     "skew_warn": skew.warn,
@@ -743,6 +807,7 @@ def device_time(
                     "value": reading.tz_raw,
                 },
                 {"field": "site tz", "value": site_tz},
+                {"field": "tz offset vs site (verdict)", "value": offset_detail},
                 {"field": "our wall clock in the site tz", "value": _iso(skew.our_wall)},
                 {
                     "field": f"wall-clock skew (seconds, warn > {SKEW_WARN_SECONDS:.0f}s)",

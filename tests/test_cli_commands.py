@@ -426,14 +426,51 @@ def test_device_time_unreadable_claim_is_no_evidence_not_agreement(device: FakeD
     # The site side still resolves: the verdict is missing because ONE side is silent,
     # and the payload must show which side that was.
     assert row["site_offset_min_at_instant"] == 180
-    assert row["tz_offset_label"] is None and row["site_offset_label"] == "+03:00"
+
+
+def test_device_time_unreadable_wall_clock_is_its_own_no_evidence(device: FakeDevice) -> None:
+    """No wall digits → the site side cannot be resolved either, and nothing says "fine".
+
+    A `System/time` body without `localTime` (OBSERVED.md: a device that omits a field is
+    a fact to report, not an exception) leaves BOTH sides of the comparison empty — the
+    claim and the wall time come out of the same string. The verdict must name which fact
+    is missing instead of printing a bare `-`, and the site offset must stay null rather
+    than resolving against a clock we do not have. Exit code unchanged: the clock is
+    unreadable, the command is not broken.
+    """
+    body = re.sub(
+        r"<localTime>[^<]*</localTime>\n?",
+        "",
+        fixture_text("system_time.xml"),
+    )
+    device.reset(
+        "GET",
+        SYSTEM_TIME_PATH,
+        httpx.Response(200, text=body, headers={"Content-Type": "text/xml"}),
+    )
+    code, table = run(["device", "time", *base_args()])
+    assert code == 0, table
+    assert "no evidence (no readable device wall clock)" in table
+    assert "MISMATCH" not in table and "agrees" not in table
+
+    code, out = run(["device", "time", *base_args("--json")])
+    assert code == 0, out
+    (row,) = rows(out)
+    assert row["tz_offset_mismatch"] is None
+    assert row["site_offset_min_at_instant"] is None, "no wall digits, no resolved site offset"
+    assert row["skew_seconds"] is None and row["skew_reason"], "skew already says why"
 
 
 def test_device_time_verdict_costs_no_extra_device_read(device: FakeDevice) -> None:
-    """The card's rule: the comparison rides the reading already fetched (one cheap GET)."""
+    """The card's rule: the comparison rides the reading already fetched (one cheap GET).
+
+    Counted on AUTHENTICATED requests: every logical request is two served lines, the
+    unauthenticated one the digest challenge answers and the retry that carries the
+    credential (see tests/fakedevice.py's `Served.had_auth`).
+    """
     set_device_clock(device, "2026-06-15T14:30:00+02:00")
     run(["device", "time", *base_args("--json")])
-    clock_reads = [s for s in device.served if s.path == SYSTEM_TIME_PATH]
+    clock_reads = [s for s in device.served if s.path == SYSTEM_TIME_PATH and s.had_auth]
     assert len(clock_reads) == 1, (
         f"the verdict must reuse the System/time reading, got {len(clock_reads)} reads"
     )
