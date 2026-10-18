@@ -316,6 +316,130 @@ def test_device_time_warns_over_the_threshold_without_promising_a_write(
         assert verb not in lowered, f"a read-only tool must not promise {verb!r}"
 
 
+# --- device time: the tz_offset_mismatch verdict (card p1-11, DESIGN.md item 7) -----------
+
+#: The rendered verdict text for "there was no claim to compare" — pinned as an exact
+#: string because the card's whole requirement is that this case is *worded* as absence.
+#: `model.py`'s convention: `None` means "no evidence", never "fine".
+NO_EVIDENCE = "no evidence (device claims nothing)"
+
+
+def set_device_clock(device: FakeDevice, local_time: str) -> None:
+    """Replace the fake's `System/time` answer with one stamped `local_time` verbatim.
+
+    Only `localTime` changes: the recorded `timeZone` dialect line stays, so a test that
+    moves the stamp cannot accidentally "fix" the dialect too. `reset` (not `add`) because
+    the fixture pre-seeds this route — an appended page would be served after the fixture.
+    """
+    body = re.sub(
+        r"<localTime>[^<]*</localTime>",
+        f"<localTime>{local_time}</localTime>",
+        fixture_text("system_time.xml"),
+    )
+    device.reset(
+        "GET",
+        SYSTEM_TIME_PATH,
+        httpx.Response(200, text=body, headers={"Content-Type": "application/xml"}),
+    )
+
+
+def test_device_time_json_flags_the_site_a_summer_shape(device: FakeDevice) -> None:
+    """(a) claim +02:00 while the site zone holds +03:00 → true, both offsets visible.
+
+    This is site-a in summer (OBSERVED.md "The time/offset bug"): the skew is ~0 so the
+    clock looks healthy to the operator standing at the device, while the offset label is
+    wrong on every record they are about to export. The flag is what makes that visible
+    without a laptop, and the offsets have to be *in the payload* for the operator to see
+    which side disagrees.
+    """
+    set_device_clock(device, "2026-06-15T14:30:00+02:00")
+    code, out = run(["device", "time", *base_args("--json")])
+    assert code == 0, out
+    (row,) = rows(out)
+    assert row["tz_offset_mismatch"] is True
+    assert row["device_claimed_offset_min"] == 120, "the device's own label, kept as claimed"
+    assert row["site_offset_min_at_instant"] == 180, "Europe/Bucharest at that wall time"
+    # PR #24's invariant, restated here: the verdict is data on stdout; a diagnostic
+    # (this shape also trips the skew warning — the wall digits are a fixture's) stays
+    # on stderr, so `--json > f` stays parseable.
+    assert "warning" not in out
+
+
+def test_device_time_table_names_claim_and_site_resolved_offset(device: FakeDevice) -> None:
+    """(a, human view) one extra row that says claim vs site-resolved, not just a number.
+
+    Both offsets are in the row's own text, minutes included: the operator at the device
+    must be able to tell WHICH side disagrees without switching to `--json`.
+    """
+    set_device_clock(device, "2026-06-15T14:30:00+02:00")
+    code, out = run(["device", "time", *base_args()])
+    assert code == 0, out
+    assert "tz offset vs site (verdict)" in out
+    assert "MISMATCH" in out
+    assert "device claims +02:00 (120 min)" in out
+    assert "site resolves +03:00 (180 min)" in out
+
+
+def test_device_time_verdict_stops_firing_when_the_device_agrees(device: FakeDevice) -> None:
+    """(b) DESIGN.md item 7's promise: owner fixes the device tz → the flag reads False.
+
+    Same wall digits, correct label: the site-side offset is unchanged (180) and the
+    verdict flips, which is the "the flag stops firing when the owner fixes the device tz"
+    sentence rendered. A flag that stayed true here would be accusing a clock the owner
+    already repaired.
+    """
+    set_device_clock(device, "2026-06-15T14:30:00+03:00")
+    code, out = run(["device", "time", *base_args("--json")])
+    assert code == 0, out
+    (row,) = rows(out)
+    assert row["tz_offset_mismatch"] is False
+    assert row["device_claimed_offset_min"] == 180
+    assert row["site_offset_min_at_instant"] == 180, "the site side never moved"
+    _, table = run(["device", "time", *base_args()])
+    assert "MISMATCH" not in table
+    assert "device claims +03:00 (180 min)" in table
+    assert "site resolves +03:00 (180 min)" in table
+
+
+def test_device_time_unreadable_claim_is_no_evidence_not_agreement(device: FakeDevice) -> None:
+    """(c) THE pin: an unreadable claim is null and must read as ABSENCE, never as agreement.
+
+    A naive `localTime` (this fw variant exists — `tests/fixtures/scenarios/naive_time`)
+    asserts nothing, so there is nothing to compare. Rendering that as `false`/`"agrees"`
+    would be a false reassurance in the operator's hand, which is exactly the failure
+    tz_mismatch.py refuses: None is not False. This test is the mutant catcher — swap the
+    None arm for `False` (or drop the `is None` guard in the renderer) and the two
+    negative assertions below go red while everything else stays green.
+    """
+    set_device_clock(device, "2026-06-15T14:30:00")
+    code, table = run(["device", "time", *base_args()])
+    assert code == 0, table
+    assert NO_EVIDENCE in table, "the missing claim must be named, not left as a blank cell"
+    assert "MISMATCH" not in table, "absence of a claim is not evidence of a mismatch"
+    assert "agrees" not in table, "absence of a claim is not agreement either"
+
+    code, out = run(["device", "time", *base_args("--json")])
+    assert code == 0, out
+    (row,) = rows(out)
+    assert row["tz_offset_mismatch"] is None, "null in JSON — never false for 'no claim'"
+    assert row["device_claimed_offset_min"] is None
+    # The site side still resolves: the verdict is missing because ONE side is silent,
+    # and the payload must show which side that was.
+    assert row["site_offset_min_at_instant"] == 180
+    assert row["tz_offset_label"] is None and row["site_offset_label"] == "+03:00"
+
+
+def test_device_time_verdict_costs_no_extra_device_read(device: FakeDevice) -> None:
+    """The card's rule: the comparison rides the reading already fetched (one cheap GET)."""
+    set_device_clock(device, "2026-06-15T14:30:00+02:00")
+    run(["device", "time", *base_args("--json")])
+    clock_reads = [s for s in device.served if s.path == SYSTEM_TIME_PATH]
+    assert len(clock_reads) == 1, (
+        f"the verdict must reuse the System/time reading, got {len(clock_reads)} reads"
+    )
+    assert {s.method for s in device.served} == {"GET"}, "still read-only on the wire"
+
+
 # --- device capabilities ------------------------------------------------------------------
 
 
