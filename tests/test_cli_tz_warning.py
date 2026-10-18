@@ -463,9 +463,7 @@ def test_a_wild_claim_through_the_cli_still_exits_zero(box, monkeypatch, capsys)
     real = pipeline_mod.event_record_from_device
 
     def widen_claim(*args: Any, **kwargs: Any) -> EventRecord:
-        return dataclasses.replace(
-            real(*args, **kwargs), tz_offset_min_device=WILD_CLAIM
-        )
+        return dataclasses.replace(real(*args, **kwargs), tz_offset_min_device=WILD_CLAIM)
 
     monkeypatch.setattr(pipeline_mod, "event_record_from_device", widen_claim)
     e2e = box("happy_day")

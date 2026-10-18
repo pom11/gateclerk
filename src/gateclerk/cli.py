@@ -1265,8 +1265,7 @@ def _warn_tz_mismatch(records: Sequence[Any]) -> None:
     if len(pairs) == 1:
         claimed, used = pairs[0]
         detail = (
-            f"device claims {label(claimed)}; "
-            f"site {site} resolves {label(used)} at these instants"
+            f"device claims {label(claimed)}; site {site} resolves {label(used)} at these instants"
         )
     else:
         joined = "; ".join(
