@@ -1236,6 +1236,10 @@ def _warn_tz_mismatch(records: Sequence[Any]) -> None:
         # A wild claim (`+99:30` on a malformed stamp) is out of the ±HH:MM ISO form
         # `offset_hhmm` refuses: show it as raw minutes rather than let the WARNING
         # crash the run it is reporting on (warn, don't fail — both directions).
+        # EVERY interpolation below goes through this guard: offset_hhmm raising inside
+        # the `with _Guard(fmt)` block would exit 1 on a run the card requires to exit 0
+        # (pinned e2e by test_a_wild_claim_through_the_cli_still_exits_zero — a nested
+        # function ruff cannot flag, so the pin is what keeps this guard alive).
         try:
             return offset_hhmm(minutes)
         except ValueError:
@@ -1261,12 +1265,12 @@ def _warn_tz_mismatch(records: Sequence[Any]) -> None:
     if len(pairs) == 1:
         claimed, used = pairs[0]
         detail = (
-            f"device claims {offset_hhmm(claimed)}; "
-            f"site {site} resolves {offset_hhmm(used)} at these instants"
+            f"device claims {label(claimed)}; "
+            f"site {site} resolves {label(used)} at these instants"
         )
     else:
         joined = "; ".join(
-            f"device claims {offset_hhmm(claimed)} vs site-resolved {offset_hhmm(used)}"
+            f"device claims {label(claimed)} vs site-resolved {label(used)}"
             for claimed, used in pairs
         )
         detail = f"{joined}; site {site} at these instants"
