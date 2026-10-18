@@ -26,8 +26,26 @@ device truth: docs/OBSERVED.md.)
   P1-02/04/05/08/09 queued in dependency order. P1-10 live smoke = human-only.
 
 ## Next expected
-- Owner dense-window live re-run for p1-05c on main 7aa0148 -> closes the payroll gap,
-  then P1 sign-off. No orchestrator work in flight.
+- P1 CLOSED (below). P2-00 design-spec card dispatched. Owner decisions queued:
+  device tz/NTP fix (DESIGN item 7), 3-site rollout order, BC/P3 scope (stays closed).
+
+## 2026-10-18 night — P1 CLOSED: dense-window live re-run passed on faa1f52
+
+- Owner ran `events --since 2026-05-21T13:00 --until 2026-05-21T14:30 --chunk 1h -v
+  --output json` (read-only): **rc 0, 20 records**. Chunk 13:00-14:00 -> NOMATCH/0;
+  chunk 14:00-14:30 -> 200, 20 records, termination=OK, max_serial=47.
+  ORCHESTRATOR JUDGMENT: the empty 13-14 chunk is EXACTLY what p1-05c expects —
+  recorded dense cluster = device wall 14:08:22..14:20:04, serials 27..47 (fixture +
+  my A/B); nothing exists in 13:00-14:00. Counterfactual: the same window under the
+  retired +03:00 label returned 0 (my A/B: NO MATCH/0) -> **20 vs 0 = the payroll fix
+  proven live**. Live jsonl parsed clean (20/20 rows, serials 27..47,
+  tz_offset_mismatch true 20/20): independently proves PR #24's stdout byte-clean
+  property on a real run + the one stderr warning line fired exactly once.
+- Board: ALL cards done (P1-01..P1-10 + every fix/re-scope). Watcher stopped on owner
+  instruction after one full review wave. Main 1120 tests / ruff clean.
+- P1 close-out truths (OBSERVED.md): naive startTime -> 400; digest nonce use-cap ~190
+  reqs (recovery offline-proven, live arm not exercised); window labels are ARITHMETIC.
+  Owner-side optional: device tz fix stops the mismatch warning without touching math.
 
 ## 2026-10-18 evening — P1 review wave closed: PR #23 (tz_dialect tighten) + #24 (run warning) merged
 
