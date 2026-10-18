@@ -428,6 +428,45 @@ def test_device_time_unreadable_claim_is_no_evidence_not_agreement(device: FakeD
     assert row["site_offset_min_at_instant"] == 180
 
 
+@pytest.mark.parametrize(
+    ("local_time", "expected_site_min"),
+    [
+        # Bucharest winter: the zone holds +02:00, so a +02:00 claim AGREES there.
+        pytest.param("2026-01-15T12:00:00+02:00", 120, id="winter-wall-claims-plus-02"),
+        # Bucharest summer: +03:00, so the same +03:00 claim agrees there instead.
+        pytest.param("2026-06-15T12:00:00+03:00", 180, id="summer-wall-claims-plus-03"),
+    ],
+)
+def test_device_time_resolves_the_site_zone_at_the_device_wall_not_ours(
+    device: FakeDevice, local_time: str, expected_site_min: int
+) -> None:
+    """The comparison anchors on the device's stamped wall time, never on our clock.
+
+    Mutation catcher (probe m4): resolving the site zone at OUR wall passes every other
+    test here, because the two clocks sit seconds apart in the fixtures — yet it is a
+    second, different rule, and the wrong one. The offset a zone holds is a property of
+    the wall time the device stamped (tz_mismatch.py's rule), which is what makes the
+    verdict immune to the device's own label and what keeps a device whose clock has
+    drifted by months from being judged against a DST moment it never claimed.
+
+    The two cases are the two sides of the Bucharest DST pair, and the winter one does
+    the work: today (mid-October) our own clock still resolves +03:00, so a site zone
+    anchored on OUR instant returns 180 for a January stamp where the device's own digits
+    say 120.
+    """
+    set_device_clock(device, local_time)
+    code, out = run(["device", "time", *base_args("--json")])
+    assert code == 0, out
+    (row,) = rows(out)
+    assert row["site_offset_min_at_instant"] == expected_site_min, (
+        "the site offset is resolved at the DEVICE's wall digits, not at our instant"
+    )
+    assert row["tz_offset_mismatch"] is False, (
+        "a claim that matches the zone AT THE STAMPED INSTANT agrees, whatever our "
+        "calendar says today"
+    )
+
+
 def test_device_time_unreadable_wall_clock_is_its_own_no_evidence(device: FakeDevice) -> None:
     """No wall digits → the site side cannot be resolved either, and nothing says "fine".
 
