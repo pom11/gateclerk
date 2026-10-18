@@ -26,9 +26,27 @@ device truth: docs/OBSERVED.md.)
   P1-02/04/05/08/09 queued in dependency order. P1-10 live smoke = human-only.
 
 ## Next expected
-- Owner dense-window live re-run for p1-05c (b174150) -> closes the payroll gap.
-- In flight: t_29318514 (tz_dialect tightenings), t_b4c71443 (run-level mismatch
-  warning) -> orchestrator review wave -> P1 done pending owner sign-off.
+- Owner dense-window live re-run for p1-05c on main 7aa0148 -> closes the payroll gap,
+  then P1 sign-off. No orchestrator work in flight.
+
+## 2026-10-18 evening — P1 review wave closed: PR #23 (tz_dialect tighten) + #24 (run warning) merged
+
+- PR #23 -> `f8a06e9` (t_29318514): gate 1086 passed / ruff clean / CI green. My probes
+  (cleared bytecode cache): ±14:00 -> HikTzInfo(std=840), ±14:01 + CST-15:00:00 ->
+  HikTzUnknown "±14 h", CST-2:00:30 -> HikTzUnknown "sub-minute", refusals are values
+  never exceptions; TYPE-pin via refused() isinstance. Mutations (sub-minute neutered,
+  bound 13h/16h): 13 reds each. ci.yml touch legit (new file into tz coverage gate).
+- PR #24 -> `7aa0148` (t_b4c71443): gate 1120 passed / 5 skipped (5th = the file's own
+  delegated error-box skip, accepted) / ruff clean. stdout-byte-clean audit: emitter-seam
+  byte-identity + from_jsonl parse + MY mutation (print -> stdout) = 26 reds. One line
+  per run (multi-chunk), all-None silence (three-valued rule), rc 0, --verbose no dup.
+- Combined main: **1120 passed / 5 skipped / 1 deselected**, ruff clean, tree clean,
+  worktrees pruned. P1 board state: all cards done; OPEN for owner = the p1-05c
+  dense-window live re-run on main (expect +02:00-labeled windows returning events).
+- Review-hygiene lesson (my own false alarm): rapid mutate/restore of a module inside a
+  review worktree left STALE .pyc -> 13 spurious reds on a clean tree. Purge
+  __pycache__ before trusting any post-mutation pytest reading; direct-interpreter probe
+  is the tiebreaker.
 
 ## 2026-10-18 — p1-05c merged (PR #22 -> b174150); blocked trio adjudicated + re-dispatched
 
