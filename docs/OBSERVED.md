@@ -122,20 +122,57 @@ sparse 6-week window; a dense-window A/B (one read-only POST pair on a busy day)
 whether the label shifts the effective window by an hour. Until proven otherwise we send
 site `+03:00` — self-consistent with site-tz-is-truth.
 
-## Digest nonce use-cap → deterministic 401 mid-backfill (owner live run 2026-10-17, VERIFIED symptom / OPEN mechanism)
+## Digest nonce use-cap → deterministic 401 mid-backfill (owner live 2026-10-17; fix MERGED, live recovery path NOT exercised)
 
 Long `--chunk 1h` backfill hit **401 Unauthorized with the correct password** at exactly
 the same window on two runs (2026-09-08T21:00, ~190th request of the walk), exit 3.
-The device stayed **unlocked**: `lockStatus=unlock`, `retryLoginTime=4` (the step-9
-wrong-password probe afterwards behaved normally) — so this is NOT a lockout. Reading:
-the device retires a digest nonce after N uses; our client does not survive the
-re-challenge (httpx spends exactly one re-auth; our 401-is-terminal rule + circuit then
-kill the run). **MECHANISM OPEN — we never captured the 401 response itself**: was a
-`WWW-Authenticate` challenge present? `stale="true"` or `"false"`? Or error-envelope-only?
-Three shapes have different fixes. Debug OFFLINE with FakeDevice nonce-expiry seams
-(all three shapes) — do NOT re-probe the device to find out: every wrong-shape 401 can
-count toward lockout accounting. Card t_12286c0d's sibling tracks the fix.
-Any backfill over ~190 requests fails until fixed.
+The device stayed **unlocked**: `lockStatus=unlock`, `retryLoginTime=4` — NOT a lockout.
+
+**Mechanism DETERMINED offline (t_a3521d8a, docs/FINDINGS-t_a3521d8a.md F1): shape (c)**
+— 401 carrying the ISAPI error envelope and NO `WWW-Authenticate`. httpx re-pays any 401
+that offers a challenge (stale flag irrelevant), so shapes (a)/(b) were always survivable;
+the challenge-less 401 fell to our 401-terminal rule and killed the walk. Fix = bounded
+challenge-less re-bootstrap (`DEFAULT_AUTH_RECOVERY_BUDGET=1` per logical call, streak ≤2
+without an intervening 200; `IsapiClient.auth_recoveries` counts spend), merged as
+PR #21 → `4af4398` after the owner's live acceptance.
+
+**Acceptance (owner, main 4af4398, read-only):** rc 0, **1104 chunks / 1108×HTTP 200 /
+zero non-200 / 10 events (identical to pre-fix) / 177 s**, sailed through the old
+2026-09-08T21:00 wall. HONEST CAVEAT: **no 401 occurred at all this run** — the device
+did not retire the nonce (or httpx absorbed it below the `-v` log), so the recovery arm
+is **proven offline only** (FakeDevice retire-after-N in all three shapes; 1031 green).
+The live trigger remains empirical: the ~190-request cap is observed, not modeled.
+Reproduction discipline stands: NEVER hammer the device for digest debugging — wrong-shape
+401s can count toward lockout accounting.
+
+## Window offsets are ARITHMETIC for the device — bounds must be site-wall stamped with the DEVICE's claimed offset (A/B 2026-10-17, VERIFIED, payroll-critical)
+
+The OPEN question from "startTime form: offset REQUIRED" (does the device interpret the
+offset or merely require presence?) is **settled: it does offset arithmetic.**
+Decisive A/B (orchestrator, 2 read-only POSTs, dense day 2026-05-21, window
+`13:00–14:30` per run; device wall = events at 14:08–14:20):
+
+```
+startTime 13:00:00+03:00, endTime 14:30:00+03:00  -> "NO MATCH", totalMatches 0
+startTime 13:00:00+02:00, endTime 14:30:00+02:00  -> "OK", totalMatches 20 (serials 27..47)
+```
+
+Digits-only comparison is refuted: the `+03:00` run carries the SAME digits inside the
+same window and returns zero. The device converts label→instant→its own clock, so
+during DST a `+03:00`-labeled window arrives **one hour early in device terms**. Sparse
+windows hide this (Sep 1–Oct 17 "same 10 events" under both labels; the 1104-chunk
+acceptance is sparse too — the shift is invisible there); dense windows at boundaries
+lose/misplace events — payroll-critical, same class as the p1-05 clamp bug.
+
+**Consequence:** we currently send site-wall stamped `+03:00` (p1-05b) — WRONG shape for
+this device in summer. Correct = **site-wall digits labeled with the device's claimed
+offset** (`+02:00`, which this fw reports year-round — its DST rule never engages).
+This is DESIGN.md's original "derive the window in site-tz wall time, stamp the
+device's claimed offset" — retired by the naive-400 discovery, now reinstated by
+arithmetic proof, with the offset REQUIRED (never naive — p1-05b's FakeDevice rejection
+stays). Fix carded: t_56d8b09d (DeviceWindow pair + pipeline wiring + FakeDevice must
+FILTER arithmetically, not just require presence — the current lenience is what let
+this through). Do not trust presence-checking mocks for window semantics.
 
 ## Server-side filter truth (probe 2026-10-15, second round) — filter CLIENT-side
 

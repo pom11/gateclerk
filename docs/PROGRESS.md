@@ -29,6 +29,27 @@ device truth: docs/OBSERVED.md.)
 - Review queue: PRs for p1-06 (+b/c/d), then p1-02/03/04/05 land → p1-08 CLI → p1-09
   suite → hand to owner for P1-10 live smoke against 192.0.2.10.
 
+## 2026-10-17 night — P1-03b accepted (4af4398); A/B settles window semantics -> NEW payroll bug carded (p1-05c)
+
+- PR #21 (nonce recovery) merged by owner after live acceptance: 1104 chunks / 1108
+  200s / zero non-200 / same 10 events / 177s through the old wall. Retro-review on
+  t_a3521d8a: budget/streak design sound, wrong-password invariant double-pinned,
+  locked-account case separate; gates on main 1031 passed. Honest caveat recorded in
+  OBSERVED: **recovery arm proven offline only** (no 401 materialized live this run).
+- **A/B done by orchestrator (2 read-only curl POSTs, dense day 2026-05-21): the
+  device does offset ARITHMETIC.** `+03:00`-labeled 13:00-14:30 -> 0; `+02:00` -> 20.
+  Our current p1-05b shape (site-wall digits + site offset) is WRONG in DST: windows
+  land an hour early, boundary punches lost silently. Sparse runs hide it — the
+  acceptance passing does NOT clear it. Correct = site-wall digits labeled with the
+  DEVICE's claimed offset (the original DESIGN.md rule, reinstated). Recorded in
+  OBSERVED ("Window offsets are ARITHMETIC"); fix carded **t_56d8b09d (P1-05c)** incl.
+  A/B-replica pin + FakeDevice filtering arithmetically. Raw A/B responses contained
+  employee names -> deleted locally, never committed.
+- P1-10: acceptance for the digest bug passed; card closed by owner per their plan —
+  but see p1-05c, which the acceptance cannot cover (sparse window). P1-05c re-run
+  acceptance ask: one dense-day chunk pair (13:00-14:30 style) showing the +02:00
+  label returns the events.
+
 ## 2026-10-17 late — p1-05b merged by owner with live proof (e75e3a3); digest nonce bug carded
 
 - PR #20 merged by OWNER after a live run on the branch (steps 5,6,7 pass: startTime
