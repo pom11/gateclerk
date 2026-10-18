@@ -57,6 +57,12 @@ device truth: docs/OBSERVED.md.)
     (isapi_response sole guard, tz.py re-export, read_system_time stays).
 - Both new cards: backend-engineer, worktree branches, no file overlap -> parallel OK.
   Board: 0 todo/ready-stranded, 2 running-soon, 0 blocked, done 26.
+- INCIDENT (owner-caught): both cards died spawn_failed x3 -> gave_up — I created them
+  with bare `--workspace worktree` while the board had no default_workdir. Owner set
+  default_workdir=~/dev/gateclerk + unblocked; both now RUNNING with worktrees.
+  Standing rule: always pass `--workspace worktree:<abs-path>` on this board. Watcher
+  patched (blocked cards alarm, never report "idle") + restarted tracked (was a blind
+  spot: it printed "board idle" over a spawn_failed pair).
 
 ## 2026-10-17 night — P1-03b accepted (4af4398); A/B settles window semantics -> NEW payroll bug carded (p1-05c)
 
