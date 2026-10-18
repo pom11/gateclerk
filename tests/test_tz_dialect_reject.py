@@ -162,3 +162,36 @@ def test_refusals_never_raise_and_always_keep_the_raw(raw: str) -> None:
     result = parse_hik_timezone(raw)
     assert isinstance(result, HikTzUnknown)
     assert result.raw == raw and result.reason.strip()
+
+
+# --- neighbours of the tightened paths, covered so the CI tz coverage gate counts this
+#     file as the whole dialect surface (the gate enumerates test files explicitly) -------
+
+
+@pytest.mark.parametrize("raw", ["UTC", "GMT", "Z", "Etc/UTC", "z"])
+def test_utc_aliases_offset_zero_without_written_numbers(raw: str) -> None:
+    """The no-numbers branch: only the UTC aliases get a defensible offset (0)."""
+    info = parse_hik_timezone(raw)
+    assert isinstance(info, HikTzInfo), f"{raw!r} must parse: {info!r}"
+    assert (info.std_offset_min, info.dst_offset_min) == (0, None)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ["M13.9.9/99:99:99", "M0.1.1", "not-a-rule", "M3.4.1"],
+    ids=["month-13", "month-0", "gibberish", "no-time-ok"],
+)
+def test_rule_tail_is_audit_text_never_a_crash(tail: str) -> None:
+    """The offsets are resolved before the rule text is read; a bad tail must not raise.
+
+    `M13...` used to IndexError on `_MONTHS[12]` — the one reachable traceback in a module
+    whose whole contract is HikTzUnknown-not-a-traceback. Pinned here while touching the
+    file (t_29318514 review find).
+    """
+    info = parse_hik_timezone(f"CST-2:00:00,{tail}")
+    assert isinstance(info, HikTzInfo), f"offsets are known, rule text is not: {info!r}"
+    assert (info.std_offset_min, info.dst_offset_min) == (120, None)
+    if tail != "M3.4.1":  # a well-formed rule still reads as plain words
+        assert "rule form not understood" in info.rule_desc
+    else:
+        assert "fourth Monday of Mar" in info.rule_desc

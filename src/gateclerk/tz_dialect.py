@@ -205,16 +205,27 @@ def _dst(std: int, match: re.Match[str]) -> int | bool | None:
 
 
 def _rules(rules: str) -> str:
-    """',M3.4.1/00:00:00,M10.5.0/23:00:00' -> 'DST starts ..., ends ...' in plain words."""
+    """',M3.4.1/00:00:00,M10.5.0/23:00:00' -> 'DST starts ..., ends ...' in plain words.
+
+    The offsets are already resolved by the time this runs, and the parser is total — so
+    an M-rule whose *text* is out of range (month 13, weekday 9) is described verbatim,
+    never raised. It was `int(rule['month']) - 1` into `_MONTHS` unguarded before, which
+    IndexError'd on a device writing 'M13...': the one reachable crash in a module whose
+    contract is HikTzUnknown-not-a-traceback (t_29318514 review find, pinned by test).
+    """
     parts = []
     for kind, part in zip(("starts", "ends"), (p for p in rules.split(",") if p), strict=False):
         rule = _M_RULE.fullmatch(part.strip())
         if rule is None:
             parts.append(f"{kind} {part!r} (rule form not understood)")
             continue
+        month, week, dow = int(rule["month"]), int(rule["week"]), int(rule["dow"])
+        if not 1 <= month <= len(_MONTHS):
+            parts.append(f"{kind} {part!r} (rule form not understood)")
+            continue
         parts.append(
-            f"{kind} the {_OCC[min(int(rule['week']), 5) - 1]} {_DOW[int(rule['dow']) % 7]} of "
-            f"{_MONTHS[int(rule['month']) - 1]} at {rule['at'] or '02:00:00'}"
+            f"{kind} the {_OCC[min(week, 5) - 1]} {_DOW[dow % 7]} of "
+            f"{_MONTHS[month - 1]} at {rule['at'] or '02:00:00'}"
         )
     return "DST " + ", ".join(parts)
 
