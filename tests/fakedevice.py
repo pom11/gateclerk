@@ -50,6 +50,23 @@ recorded shape: `error_naive_start_time.json`). So `_handle` rejects a naive bou
 on those two paths with exactly that envelope, *after* auth, like the device
 validates at handler time. A walk that still sends naive now fails loudly instead
 of being served fixture pages.
+
+The event store FILTERS by ARITHMETIC (p1-05c — the anti-false-green core)
+---------------------------------------------------------------------------
+`add_events(...)` installs stored events and puts the fake in *filtering mode* for
+the two event POSTs: instead of replaying a canned page queue, it computes which
+stored events fall in the requested window the way the DEVICE does —
+docs/OBSERVED.md "Window offsets are ARITHMETIC for the device" (A/B 2026-10-17:
+the SAME window digits answered `NO MATCH`/0 labeled `+03:00` and OK/20 labeled
+`+02:00`, dense day 2026-05-21). The fake parses the bound's label, converts the
+bound to an instant, re-anchors it on ITS OWN claimed clock (`claimed_offset_min`,
+site-a: +02:00 year-round) and compares against the events' wall digits.
+
+That is load-bearing, not flavour: the pre-p1-05c fake only required an offset's
+*presence*, so it served identical pages under both labels and the window bug the
+owner measured live could not be reproduced offline at all. A presence-only fake
+is exactly the lenience this card removes. The naive-400 above stays armed in
+filtering mode too — presence still gates the request before arithmetic runs.
 """
 
 from __future__ import annotations
@@ -58,8 +75,15 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 import httpx
+
+#: What site-a's clock claims year-round (OBSERVED.md "time/offset bug": `+02:00`
+#: even in +03:00 summer, its DST rule never engages). `FakeDevice.claimed_offset_min`
+#: defaults to this so a store-mode fake behaves like the box the A/B measured;
+#: tests flip it to model a correct device (site offset), a winter day, or a UTC box.
+SITE_A_CLAIM_MIN = 120
 
 # The masked fixture's challenge values verbatim (already masked — see
 # tests/fixtures/README). Nothing device-real lives in this file.
@@ -203,6 +227,66 @@ def naive_event_bound(body: bytes, cond_key: str) -> str | None:
     return None
 
 
+# --- p1-05c store arithmetic (see the module docstring) ---------------------------------
+
+#: A complete offset-bearing bound: `2026-05-21T13:00:00+03:00`, `...Z`. The naive
+#: form cannot reach the store — `_handle` 400s it first — and a bound that fails
+#: THIS shape afterwards is a broken test, not a device shape.
+_BOUND_RE = re.compile(
+    r"^(?P<digits>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<label>[Zz]|[+-]\d{2}:\d{2})$"
+)
+
+
+def _label_minutes(label: str) -> int:
+    if label in ("Z", "z"):
+        return 0
+    sign = 1 if label[0] == "+" else -1
+    hours, minutes = label[1:].split(":")
+    return sign * (int(hours) * 60 + int(minutes))
+
+
+def _split_bound(value: str, field: str) -> tuple[datetime, int]:
+    match = _BOUND_RE.match(value) if isinstance(value, str) else None
+    if match is None:
+        raise AssertionError(
+            f"store-mode fake got bound {value!r} in {field}: the naive check already "
+            "400s offset-less values, so reaching here means the fake flow broke"
+        )
+    return datetime.fromisoformat(match.group("digits")), _label_minutes(match.group("label"))
+
+
+def _bound_to_device_wall(value: str, claimed_offset_min: int, field: str) -> datetime:
+    """One posted bound -> the device-wall time the fake filters against.
+
+    This is the whole p1-05c mechanism, and the ONLY place the fake interprets a
+    label (OBSERVED.md "Window offsets are ARITHMETIC"): digits D labeled L name the
+    instant D-L, and the device reads that instant back on its OWN claimed clock, so
+    the effective wall bound is D + claimed - L. `13:00` labeled `+03:00` on a
+    `+02:00` box is device wall `12:00` — one hour early, the A/B.
+    """
+    digits, label_min = _split_bound(value, field)
+    return digits + timedelta(minutes=claimed_offset_min - label_min)
+
+
+def _store_wall(event: dict) -> datetime | None:
+    """The event's wall DIGITS — what the device compares its own clock against.
+
+    The event's own label is deliberately not consulted: it is the same claimed
+    stamp on every record (OBSERVED.md), and the device filters its log by its own
+    wall clock, not by re-reading each row's offset.
+    """
+    raw = event.get("time")
+    if not isinstance(raw, str):
+        return None
+    match = _BOUND_RE.match(raw)
+    return None if match is None else datetime.fromisoformat(match.group("digits"))
+
+
+def _store_serial(event: dict) -> int:
+    serial = event.get("serialNo")
+    return serial if isinstance(serial, int) and not isinstance(serial, bool) else -1
+
+
 def parse_digest_header(value: str) -> dict[str, str]:
     """Authorization: Digest k="v", ... -> dict (quoted and bare values both)."""
     if not value.lower().startswith("digest "):
@@ -308,6 +392,16 @@ class FakeDevice:
         #: raw responses served BEFORE the auth check (to simulate server-side 401s:
         #: stale-nonce re-challenges, lockout bodies, whatever the scenario needs)
         self.raw: dict[str, list] = {}
+        #: --- the p1-05c event store (filtering mode) --------------------------------
+        #: The offset this fake's clock CLAIMS, exactly like the `<localTime>` stamp
+        #: of a real `System/time` answer. Default = site-a's year-round +02:00
+        #: (OBSERVED.md). `add_events` arms filtering mode, which uses it for the
+        #: window arithmetic — this is the knob the winter / correct-device / UTC-box
+        #: tests turn.
+        self.claimed_offset_min = SITE_A_CLAIM_MIN
+        #: None = classic queue-replay mode (every pre-p1-05c test rides this).
+        #: A list once `add_events` runs: the fake then FILTERS it per request.
+        self._event_store: list[dict] | None = None
         self.served: list[Served] = []
         self.challenges = 0
         self.transport = httpx.MockTransport(self._handle)
@@ -426,6 +520,75 @@ class FakeDevice:
             httpx.Response(200, text=body, headers={"Content-Type": "application/xml"}),
         )
 
+    # -- the p1-05c event store (filtering mode) ---------------------------------------
+
+    def add_events(self, *events: dict) -> None:
+        """Store device events and arm window-ARITHMETIC filtering on the event POSTs.
+
+        Each event is the dict a real AcsEvent page would carry (`serialNo`,
+        `time`, `major`, ...). `time` is the device's own stamp — ITS wall digits
+        plus ITS claimed offset, e.g. `2026-05-21T14:08:17+02:00` for site-a. Once
+        armed, the fake answers `AcsEvent`/`AcsEventTotalNum` POSTs by filtering
+        this store the way the device filters (see the module docstring) instead of
+        replaying a queued page — so a wrongly-labeled window genuinely returns
+        `NO MATCH`/0 here, as it did live on 2026-10-17.
+        """
+        if self._event_store is None:
+            self._event_store = []
+        self._event_store.extend(dict(e) for e in events)
+
+    def _event_store_response(self, request: httpx.Request) -> httpx.Response:
+        """Filter the store with the DEVICE's arithmetic and answer like the device.
+
+        Device-side interpretation of one bound (OBSERVED.md "Window offsets are
+        ARITHMETIC"): the label makes the digits an instant; the instant is written
+        back onto the device's OWN clock; the event's stored wall digits are compared
+        to that shifted window, inclusively. So a `+03:00`-labeled 13:00 bound is,
+        on a +02:00-claiming box, device wall 12:00 — one hour early. `major`/`minor`
+        are NOT simulated server-side: OBSERVED.md's policy is that we never trust a
+        server filter we have not probed and the pipeline re-filters client-side
+        anyway, so the store answers the window and nothing else.
+        """
+        cond_key = _EVENT_COND_KEYS[request.url.path]
+        payload = json.loads(request.content)
+        cond = payload.get(cond_key, {}) if isinstance(payload, dict) else {}
+        search_id = cond.get("searchID", "")
+        # The naive-400 already passed in `_handle` (presence gates arithmetic, both
+        # modes). A bound missing HERE is a broken test, not a device shape — the
+        # engine refuses to build a boundless body — so raise, don't serve.
+        start = _bound_to_device_wall(cond["startTime"], self.claimed_offset_min, "startTime")
+        end = _bound_to_device_wall(cond["endTime"], self.claimed_offset_min, "endTime")
+        assert self._event_store is not None  # caller checks; keeps the type honest
+        # Matched rows keep their wall digits (the filter proved them parseable); the
+        # device returns a window oldest-first, so sort by wall then serial.
+        matched_walls = [
+            (w, e)
+            for e in self._event_store
+            if (w := _store_wall(e)) is not None and start <= w <= end
+        ]
+        matched_walls.sort(key=lambda we: (we[0], _store_serial(we[1])))
+        matched = [e for _, e in matched_walls]
+        if request.url.path.startswith("/ISAPI/AccessControl/AcsEventTotalNum"):
+            return httpx.Response(200, json={"AcsEventTotalNum": {"totalNum": len(matched)}})
+        if not matched:
+            # The RECORDED empty-window shape: status "NO MATCH" (with the space) and
+            # NO InfoList key at all (OBSERVED.md) — not `[]`.
+            envelope = {
+                "searchID": search_id,
+                "responseStatusStrg": "NO MATCH",
+                "numOfMatches": 0,
+                "totalMatches": 0,
+            }
+        else:
+            envelope = {
+                "searchID": search_id,
+                "responseStatusStrg": "OK",
+                "numOfMatches": len(matched),
+                "totalMatches": len(matched),
+                "InfoList": matched,
+            }
+        return httpx.Response(200, json={"AcsEvent": envelope})
+
     # -- the server --------------------------------------------------------------------
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
@@ -507,7 +670,11 @@ class FakeDevice:
                 return self._retire_nonce()
 
         queue = self.routes.get(key)
-        if queue is None:
+        cond_key = _EVENT_COND_KEYS.get(request.url.path) if request.method == "POST" else None
+        # With a store installed (filtering mode) the two event POSTs are SERVED —
+        # the store is their route — so they must not fall to the 404 below.
+        store_answers = self._event_store is not None and cond_key is not None
+        if queue is None and not store_answers:
             return httpx.Response(
                 404,
                 content=b'{"statusCode":4,"statusString":"Invalid Operation",'
@@ -518,13 +685,17 @@ class FakeDevice:
         # window bound without a UTC offset is rejected exactly as the device rejected
         # it on 2026-10-17 — recorded in error_naive_start_time.json, policy in
         # OBSERVED.md "Event-window startTime form: offset REQUIRED". A walk that
-        # still sends naive fails loudly here instead of being served pages.
-        if request.method == "POST":
-            cond_key = _EVENT_COND_KEYS.get(request.url.path)
-            if cond_key is not None:
-                rejected = naive_event_bound(request.content, cond_key)
-                if rejected is not None:
-                    return bad_json_content(rejected)
+        # still sends naive fails loudly here instead of being served pages. This
+        # check runs in BOTH modes: presence gates the request BEFORE any arithmetic
+        # does (p1-05c keeps the p1-05b arm alive in filtering mode too).
+        if cond_key is not None:
+            rejected = naive_event_bound(request.content, cond_key)
+            if rejected is not None:
+                return bad_json_content(rejected)
+            if self._event_store is not None:
+                # Filtering mode (p1-05c): answer from the store the way the device
+                # answers — window arithmetic, not a replayed queue.
+                return self._event_store_response(request)
         return _clone(queue.pop(0) if len(queue) > 1 else queue[0])
 
 

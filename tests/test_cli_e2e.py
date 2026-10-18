@@ -386,16 +386,20 @@ def test_every_scenario_fixture_is_valid_json_and_wellformed() -> None:
                 _read_json(roster)  # parses, or this fails with the file name
 
 
-def test_scenario_event_window_reaches_the_device_with_the_site_offset(box) -> None:
-    """--since/--until land in the POST body as site-tz wall time WITH the site offset.
+def test_scenario_event_window_reaches_the_device_with_the_device_claimed_offset(box) -> None:
+    """--since/--until land in the POST body as site-tz wall time labeled with the
+    DEVICE's claimed offset (p1-05c), still offset-bearing (p1-05b).
 
-    p1-05b (live P0, OBSERVED.md "Event-window startTime form: offset REQUIRED",
-    proof 2026-10-17): a naive `"startTime":"2026-06-15T00:00:00"` gets HTTP 400
-    `badJsonContent`/`errorMsg=startTime` from this firmware, so the wire pair must
-    be `+03:00`-stamped (June in Bucharest). FakeDevice enforces this too — a naive
-    walk now gets the 400 from the fake exactly as from the device.
+    Two live proofs from 2026-10-17 define this line. "offset REQUIRED": a naive
+    `"startTime":"2026-06-15T00:00:00"` gets HTTP 400 `badJsonContent`/
+    `errorMsg=startTime`, so the pair must carry an offset — FakeDevice enforces it,
+    a naive walk gets the 400 here exactly as from the device. "Window offsets are
+    ARITHMETIC": the same digits answered `NO MATCH`/0 labeled `+03:00` and OK/20
+    labeled `+02:00`, so the label must be the one the device's own `System/time`
+    reports — this scenario's box claims `+02:00` year-round (the site-a stamp), and
+    June's site-wall digits therefore go out `+02:00`-labeled, not `+03:00`.
     """
     e2e = box("happy_day")
     code, _ = e2e.run_events()
     assert code == 0
-    assert e2e.window_strings() == [("2026-06-15T00:00:00+03:00", "2026-06-16T00:00:00+03:00")]
+    assert e2e.window_strings() == [("2026-06-15T00:00:00+02:00", "2026-06-16T00:00:00+02:00")]
