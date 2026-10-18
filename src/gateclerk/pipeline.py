@@ -60,6 +60,7 @@ from gateclerk.tz import (
     DeviceTime,
     TimeResolver,
     UserTimestamp,
+    offset_hhmm,
     read_system_time,
     resolve_event_time,
     window_for_device,
@@ -71,8 +72,10 @@ __all__ = [
     "LoggedClient",
     "RequestLogger",
     "RunContext",
+    "WindowLabels",
     "compile_run_context",
     "device_time_reading",
+    "device_window_labels",
     "event_record_from_device",
     "event_total_count",
     "fetch_events",
@@ -110,6 +113,28 @@ _VERIFY_TOKENS = frozenset({"card", "face", "fp", "password"})
 
 
 @dataclass(frozen=True, slots=True)
+class WindowLabels:
+    """What the event windows get stamped with this run (p1-05c).
+
+    `claimed_offset_min` is the offset the device *labels its own clock* with — read
+    from `GET /ISAPI/System/time` (`read_system_time`'s `claimed_offset_minutes`),
+    which on site-a is `+02:00` year-round while the site zone is `+03:00` in summer
+    (OBSERVED.md "time/offset bug"). The A/B of 2026-10-17 (OBSERVED.md "Window
+    offsets are ARITHMETIC") proved the device re-anchors window bounds on THAT
+    clock, so the correct wire shape is site-wall digits carrying this label.
+
+    None means "the claim was unreadable" — and then `note` says why, and the walk
+    proceeds site-labeled with a visible warning (the p1-05b shape). A claim is
+    never invented: guessing an offset would shift payroll windows silently, which
+    is the exact bug class this card exists to close.
+    """
+
+    claimed_offset_min: int | None
+    #: Why the claim could not be read (surfaced on the warning line), when it could not.
+    note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RunContext:
     """Per-run facts every command needs, resolved once, before the first request.
 
@@ -134,6 +159,12 @@ class RunContext:
     max_records: int | None = None
     #: The verbose logger, when `--verbose` was given.
     logger: RequestLogger | None = None
+    #: The device's claimed UTC offset in minutes (p1-05c), from `device_window_labels`
+    #: read ONCE per run. None = unreadable -> event windows fall back to the site
+    #: label and `fetch_events` warns; never a silently invented offset.
+    claimed_offset_min: int | None = None
+    #: Why the claim was unreadable, when it was (folded into the warning line).
+    claimed_offset_note: str | None = None
     #: Injectable clock for `captured_at`, so a golden test is not a timestamp race.
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -157,6 +188,12 @@ class RunContext:
         """Same context, logging (frozen dataclass, so: a copy)."""
         return replace(self, logger=logger)
 
+    def with_device_claim(
+        self, claimed_offset_min: int | None, note: str | None = None
+    ) -> RunContext:
+        """Same context with the run's window-label decision (p1-05c; frozen, so: a copy)."""
+        return replace(self, claimed_offset_min=claimed_offset_min, claimed_offset_note=note)
+
 
 def compile_run_context(
     *,
@@ -167,6 +204,8 @@ def compile_run_context(
     page_size: int | None = None,
     max_records: int | None = None,
     logger: RequestLogger | None = None,
+    claimed_offset_min: int | None = None,
+    claimed_offset_note: str | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> RunContext:
     """Assemble a `RunContext` from already-resolved values.
@@ -175,6 +214,9 @@ def compile_run_context(
     does no config precedence of its own on purpose: p1-02's `site_from_args` owns
     precedence, and a second precedence ladder in a second module is how the two drift.
     `caps` supplies the paging limits once the CLI has read them (p1-04's discovery).
+    `claimed_offset_min`/`claimed_offset_note` carry the p1-05c window-label decision
+    from `device_window_labels` (read once, before the walk); `None` means "unreadable"
+    and selects the warned site-labeled fallback, never an invented offset.
     """
     delay = DEFAULT_INTER_PAGE_DELAY if page_delay_ms is None else page_delay_ms / 1000.0
     return RunContext(
@@ -185,6 +227,8 @@ def compile_run_context(
         page_size=page_size,
         max_records=max_records,
         logger=logger,
+        claimed_offset_min=claimed_offset_min,
+        claimed_offset_note=claimed_offset_note,
         now=now,
     )
 
@@ -316,6 +360,39 @@ def device_time_reading(client: Any) -> tuple[DeviceTime, str]:
     """
     raw = client.get_response("system_time").content
     return read_system_time(raw), raw.decode("utf-8", "replace")
+
+
+def device_window_labels(client: Any) -> WindowLabels:
+    """The window-label decision for one run: the device's claimed offset, read ONCE.
+
+    p1-05c (OBSERVED.md "Window offsets are ARITHMETIC"): the device interprets each
+    window bound by converting the label to an instant and re-anchoring it on ITS
+    clock, so event windows must be site-wall digits labeled with the offset the
+    device itself reports. That offset lives in the `localTime` stamp of
+    `GET /ISAPI/System/time` — a cheap, read-only GET already in the p1-08 read
+    patterns, and read here exactly once per run: per-chunk reads would multiply
+    requests against a box that already caps digest nonces near 190 uses
+    (OBSERVED.md "Digest nonce use-cap") for an answer that does not change
+    mid-walk.
+
+    A transport failure is a *fallback*, not a failure: the walk can still run
+    site-labeled (p1-05b behavior), and `fetch_events` says so loudly. The one
+    exception is an auth error, which is re-raised: an unauthenticated run must
+    never spend its one cheap read deciding to degrade payroll windows quietly —
+    exit 3 exists for a human to check the credential.
+    """
+    try:
+        reading, _raw = device_time_reading(client)
+    except IsapiAuthError:
+        raise
+    except IsapiError as exc:
+        return WindowLabels(None, note=f"System/time unreadable: {exc}")
+    if reading.claimed_offset_minutes is None:
+        return WindowLabels(
+            None,
+            note=reading.note or "System/time localTime carried no UTC offset",
+        )
+    return WindowLabels(reading.claimed_offset_minutes)
 
 
 # --- record assembly -------------------------------------------------------------------
@@ -452,14 +529,30 @@ def fetch_events(
     `--max-results` caps OUTPUT, applied after the client-side filters: `--max-results 10
     --verify face` means ten matching records (what a human means by it), not ten records
     that then filtered down to four.
+
+    Window labels (p1-05c, OBSERVED.md "Window offsets are ARITHMETIC"): every chunk
+    goes out as site-wall digits labeled with `context.claimed_offset_min` — the
+    device's own claimed offset, read once per run by `device_window_labels`. When no
+    claim was readable the chunks keep the site label (the p1-05b shape) and a warning
+    line goes to stderr: during DST that shape arrives one hour early in device terms
+    and silently loses boundary punches, so the run must SAY it is at risk rather
+    than print a plausible short table. The offset is never invented, and never naive
+    (the firmware 400s that).
     """
     limits = context.limits or PagingLimits()
     major = 0 if include_noise else 5
+    label = (
+        f"device-claimed {offset_hhmm(context.claimed_offset_min)}"
+        if context.claimed_offset_min is not None
+        else "site (fallback)"
+    )
     if context.logger is not None:
         context.logger.note(
             f"events window {since.value.isoformat()} .. {until.value.isoformat()} "
-            f"chunk={chunk} major={major} site={context.site} tz={context.site_tz}"
+            f"chunk={chunk} major={major} site={context.site} tz={context.site_tz} "
+            f"window_label={label}"
         )
+    _warn_site_labeled(context, since)
     yielded = 0
     for chunk_result in iter_event_windows(
         _search_reader(client),
@@ -467,6 +560,7 @@ def fetch_events(
         until=until,
         chunk=chunk,
         site_tz=context.site_tz,
+        device_offset_min=context.claimed_offset_min,
         limits=limits,
         page_size=context.page_size,
         inter_page_delay=context.inter_page_delay,
@@ -646,6 +740,33 @@ def _refuse_snapshot_requests(payload: Mapping[str, Any]) -> None:
             )
 
 
+def _warn_site_labeled(context: RunContext, since: UserTimestamp) -> None:
+    """The p1-05c fallback warning: a site-labeled window is a KNOWN-RISKY shape.
+
+    Emitted per run (not per chunk) on stderr, outside `--verbose`: an operator
+    watching `gateclerk events` in summer must see "boundaries may shift" without
+    digging for it, because the failure mode is a plausible short table — NO MATCH
+    looks exactly like a quiet day (OBSERVED.md's A/B). The site label shown is the
+    one the wire actually carries: `since.value` is tz-aware in the site zone, so
+    its trailing offset IS the pair's label, no re-derivation to drift.
+    """
+    if context.claimed_offset_min is not None:
+        return
+    site_label = since.value.isoformat()[-6:]
+    reason = f" ({context.claimed_offset_note})" if context.claimed_offset_note else ""
+    message = (
+        f"warning: window labeled {site_label}; device arithmetic may shift boundaries "
+        f"— device time unreadable{reason}. Events near a window edge may be silently "
+        "missing (OBSERVED.md: the device re-anchors labels on its own clock)."
+    )
+    if context.logger is not None:
+        context.logger.note(message)
+    else:
+        from gateclerk.output import make_console  # local: keeps the module import cheap
+
+        make_console(stderr=True).print(message, markup=False)
+
+
 def event_total_count(
     client: Any,
     *,
@@ -654,6 +775,7 @@ def event_total_count(
     site_tz: str,
     major: int = PUNCH_MAJOR,
     minor: int = 0,
+    device_offset_min: int | None = None,
 ) -> int | None:
     """`POST /ISAPI/AccessControl/AcsEventTotalNum` for the same window: the device's own
     count, for the `--count` display line. None when it will not give us a readable one.
@@ -677,11 +799,13 @@ def event_total_count(
     have that 0 means "all minors" rather than "minor zero".
     """
     window = window_for_device(since, until, site_tz=site_tz)
-    # Offset-bearing pair: AcsEventTotalNum takes the same body shape as AcsEvent, and
-    # this firmware 400s a naive startTime (OBSERVED.md "Event-window startTime form:
-    # offset REQUIRED", live proof 2026-10-17 — the naive form here fails exactly like
-    # the paged walk did).
-    start, end = window.search_pair(with_offset=True)
+    # Offset-bearing pair, labeled EXACTLY like the walk (p1-05c): the count probe
+    # takes the same body shape as AcsEvent, so it must carry the same label too —
+    # a walk relabeled +02:00 and a count probe still +03:00 would compare two
+    # different windows and print a nonsense cross-check (one shape, no split-brain).
+    # The naive form stays impossible (OBSERVED.md "Event-window startTime form:
+    # offset REQUIRED", live proof 2026-10-17).
+    start, end = window.search_pair(with_offset=True, device_offset_min=device_offset_min)
     try:
         body = client.search(
             "acs_event_total_num",

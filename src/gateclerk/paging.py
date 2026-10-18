@@ -40,13 +40,17 @@ full ~10k history is the slow page-heavy path DESIGN.md rules out. So the event
 side of this module *refuses* to build an unbounded body — `build_event_cond()`
 takes a `gateclerk.tz.DeviceWindow` and `iter_event_windows()` chunks the range
 (default `1d`) and pages inside each chunk. The window strings come from
-`gateclerk.tz.window_for_device` — the site-tz wall clock, and on the wire it is sent
-**with the site offset stamped** (`with_offset=True` is the default): the live run of
-2026-10-17 (OBSERVED.md "Event-window startTime form: offset REQUIRED") proved the
-device 400s a naive `startTime` (`badJsonContent`, `errorMsg=startTime`), retiring
-p1-05's naive-pair default and the "unless a live run proves otherwise" clause that
-shipped it. The naive pair remains available on the struct (`with_offset=False`) for
-callers that want it; nothing on the event wire may use it.
+`gateclerk.tz.window_for_device` — the site-tz wall clock — and on the wire they
+**always carry an offset** (the naive pair 400s, OBSERVED.md "Event-window
+startTime form: offset REQUIRED", live proof 2026-10-17). The p1-05c A/B
+(OBSERVED.md "Window offsets are ARITHMETIC for the device") settled *which*
+offset: the **device's claimed one** (`device_offset_min=...` relabels the
+site-wall digits), because the device converts each label to an instant and back
+onto its own clock — a site-labeled window arrives shifted by the label delta and
+silently loses boundary events. The site-labeled pair (`with_offset=True`) remains
+the fallback when the device's claim is unreadable; the naive pair
+(`with_offset=False`) stays available on the struct, but nothing on the event wire
+may use it.
 
 `beginSerialNo`/`endSerialNo` are exposed for checkpointed pulls and `timeReverseOrder`
 for newest-first reads; oldest-first (`timeReverseOrder=False`) is the backfill
@@ -525,6 +529,7 @@ def build_event_cond(
     window: DeviceWindow,
     *,
     with_offset: bool = True,
+    device_offset_min: int | None = None,
     major: int = 0,
     minor: int = 0,
     employee_no: str | None = None,
@@ -538,14 +543,22 @@ def build_event_cond(
     `startTime`/`endTime` are ALWAYS present (card: some fw answers an unbounded
     query with `Invalid Content`; DESIGN.md rules out full-history walks) — the
     values come from `gateclerk.tz.window_for_device`, i.e. the site-tz wall clock.
-    **`with_offset=True` is the default and the only form allowed on the wire**:
-    the live run of 2026-10-17 (OBSERVED.md "Event-window startTime form: offset
-    REQUIRED") shows this firmware 400s a naive `startTime` — `statusCode=6`,
-    `subStatusCode=badJsonContent`, `errorMsg=startTime` — while the same window
-    stamped with the site offset (`+03:00`) returns 200. The naive pair
-    (`with_offset=False`) stays on the struct for callers that need the raw wall
-    strings; using it in an event search body is the bug this default exists to
-    prevent.
+    **The pair must carry an offset**: the live run of 2026-10-17 (OBSERVED.md
+    "Event-window startTime form: offset REQUIRED") shows this firmware 400s a
+    naive `startTime` — `statusCode=6`, `subStatusCode=badJsonContent`,
+    `errorMsg=startTime`.
+
+    *Which* offset is the p1-05c rule (OBSERVED.md "Window offsets are ARITHMETIC
+    for the device", A/B same day): pass the device's claimed offset as
+    `device_offset_min` (e.g. `120` for site-a's year-round `+02:00`) and the wire
+    pair becomes the site-wall digits relabeled with it — the shape the device's
+    label arithmetic turns into the window we actually asked for. With `None` we
+    keep the p1-05b site-labeled pair (`with_offset=True`): the honest fallback for
+    a device whose claim we could not read, which the caller must WARN about rather
+    than silently accept (pipeline.py surfaces the line). The naive pair
+    (`with_offset=False`, only consulted when no claim is given) stays on the struct
+    for callers that need the raw wall strings; using it in an event search body is
+    the bug this default exists to prevent.
 
     `employee_no` maps to `employeeNoString`, never `employeeNo` (OBSERVED.md
     "Server-side filter truth": the suffixless form is SILENTLY IGNORED on this fw
@@ -556,7 +569,7 @@ def build_event_cond(
         # Defensive: DeviceWindow always carries both today; a future caller
         # handing us a half-window must not produce an unbounded query.
         raise EventBoundsError("event search needs a complete startTime/endTime window")
-    start, end = window.search_pair(with_offset=with_offset)
+    start, end = window.search_pair(with_offset=with_offset, device_offset_min=device_offset_min)
     cond: dict[str, Any] = {
         "startTime": start,
         "endTime": end,
@@ -722,6 +735,7 @@ def iter_event_windows(
     chunk: str | timedelta = DEFAULT_CHUNK,
     site_tz: str | tzinfo | None = DEFAULT_SITE_TZ,
     with_offset: bool = True,
+    device_offset_min: int | None = None,
     limits: PagingLimits | None = None,
     page_size: int | None = None,
     max_pages: int = DEFAULT_MAX_PAGES,
@@ -737,9 +751,15 @@ def iter_event_windows(
 ) -> Iterator[ChunkResult]:
     """Chunk [since, until] to `chunk` (default 1d) and page **inside each chunk**.
 
-    Bodies carry `startTime`/`endTime` with the site offset stamped
-    (`with_offset=True`, the only wire form — OBSERVED.md "Event-window startTime
-    form: offset REQUIRED", live proof 2026-10-17).
+    Bodies carry `startTime`/`endTime` with an offset label on every chunk (the
+    device 400s a naive bound — OBSERVED.md "Event-window startTime form: offset
+    REQUIRED", live proof 2026-10-17). The p1-05c rule decides *which* label
+    (OBSERVED.md "Window offsets are ARITHMETIC for the device"): pass the
+    device's claimed offset as `device_offset_min` and every chunk's window is the
+    site-wall digits relabeled with it — the only shape the device's label
+    arithmetic resolves to the window we asked for. With `None` the chunks keep the
+    site-labeled pair (p1-05b behavior), which the caller must surface as a warning
+    (pipeline.py's fallback line) — the shift is silent, boundary events are not.
 
     Every chunk is a new logical search: fresh `searchID`, its own cursor walk, its
     own `SearchSummary`. Chunks run chronologically (oldest-first backfill;
@@ -762,6 +782,7 @@ def iter_event_windows(
         cond = build_event_cond(
             window,
             with_offset=with_offset,
+            device_offset_min=device_offset_min,
             major=major,
             minor=minor,
             employee_no=employee_no,

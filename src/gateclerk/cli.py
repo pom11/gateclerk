@@ -543,8 +543,14 @@ def _context(
     caps: Any = None,
     max_records: int | None,
     logger: RequestLogger | None,
+    device_claim: pipeline.WindowLabels | None = None,
 ) -> RunContext:
-    """Assemble the run context, translating a bad flag value into exit 2."""
+    """Assemble the run context, translating a bad flag value into exit 2.
+
+    `device_claim` is the p1-05c window-label decision (the device's claimed offset,
+    read ONCE per run by `pipeline.device_window_labels`); None keeps the warned
+    site-labeled fallback.
+    """
     label = site_label if site_label is not None else (site_config.name or DEFAULT_SITE_LABEL)
     try:
         return pipeline.compile_run_context(
@@ -554,6 +560,8 @@ def _context(
             page_delay_ms=site_config.page_delay_ms,
             max_records=max_records,
             logger=logger,
+            claimed_offset_min=None if device_claim is None else device_claim.claimed_offset_min,
+            claimed_offset_note=None if device_claim is None else device_claim.note,
             now=_now,
         )
     except (ValueError, TimestampInputError) as exc:
@@ -1043,6 +1051,10 @@ def events(
                     "half the idempotency key, so records cannot be assembled without it",
                 )
             caps = pipeline.read_capabilities(client)
+            # p1-05c (OBSERVED.md "Window offsets are ARITHMETIC"): the device does
+            # arithmetic on window labels, so the walk's bounds must carry the DEVICE's
+            # claimed offset — read once here, before the walk, never per chunk.
+            device_claim = pipeline.device_window_labels(client)
             context = _context(
                 site_config=site_config,
                 site_label=site_label,
@@ -1050,6 +1062,7 @@ def events(
                 caps=caps,
                 max_records=max_results,
                 logger=logger,
+                device_claim=device_claim,
             )
             records = list(
                 pipeline.fetch_events(
@@ -1070,8 +1083,16 @@ def events(
             # The advisory count is read AFTER the walk on purpose: the device counts its log
             # ring as it is now, and the walk is what we just saw. Reading it first would make
             # an event that landed mid-walk look like a lost record.
+            # p1-05c: it carries the SAME label as the walk (device_claim) — a count probe
+            # labeled differently counts a different window than the one we just walked.
             device_count = (
-                pipeline.event_total_count(client, since=start, until=end, site_tz=site_tz)
+                pipeline.event_total_count(
+                    client,
+                    since=start,
+                    until=end,
+                    site_tz=site_tz,
+                    device_offset_min=device_claim.claimed_offset_min,
+                )
                 if count
                 else None
             )

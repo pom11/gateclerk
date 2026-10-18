@@ -26,10 +26,14 @@ and pins that the flag is computed *after* UTC and never fed back into resolutio
 Two consequences that are easy to get wrong, both pinned by tests:
 
 * **Query windows are built from the site wall clock** (`window_for_device`) and sent
-  on the wire **with the site offset stamped** — the live run of 2026-10-17 (OBSERVED.md
+  on the wire **with an offset label** — the live run of 2026-10-17 (OBSERVED.md
   "Event-window startTime form: offset REQUIRED") proved this firmware 400s a naive
-  `startTime` (`badJsonContent`, `errorMsg=startTime`). Sending UTC would shift every
-  window by the device's offset error; sending naive strings is rejected outright.
+  `startTime` (`badJsonContent`, `errorMsg=startTime`). *Which* label is the p1-05c
+  finding (OBSERVED.md "Window offsets are ARITHMETIC for the device", A/B same day):
+  the device re-anchors the digits on its own clock, so the window must be labeled
+  with the **device's claimed offset** (`search_pair(device_offset_min=...)`); the
+  site-labeled pair is only the fallback when the device's claim is unreadable, and
+  it shifts boundaries by the label delta in the meantime.
 * **Skew compares wall clocks in the site zone** (`compute_skew`), not self-labelled
   instants — comparing instants would report the offset bug as a 3600 s "skew".
 
@@ -70,6 +74,7 @@ __all__ = [
     "TzSource",
     "UserTimestamp",
     "compute_skew",
+    "offset_hhmm",
     "parse_isapi_xml",
     "parse_user_timestamp",
     "read_system_time",
@@ -585,13 +590,16 @@ def parse_user_timestamp(
 class DeviceWindow:
     """A `--since/--until` pair in every form the pipeline needs.
 
-    The wire form for `startTime`/`endTime` is the **`_site_iso` pair** — site-tz wall
-    time stamped with the site offset. The live run of 2026-10-17 (OBSERVED.md
-    "Event-window startTime form: offset REQUIRED") proved this firmware rejects the
-    naive pair outright: 400 `statusCode=6`, `subStatusCode=badJsonContent`,
-    `errorMsg=startTime`. The p1-05 note "prefer the naive pair unless a live run
-    proves otherwise" is retired by that proof; event callers must pass
-    `with_offset=True` (the default from p1-05b onward).
+    The wire form for `startTime`/`endTime` is an **offset-bearing pair** — the live
+    run of 2026-10-17 (OBSERVED.md "Event-window startTime form: offset REQUIRED")
+    proved this firmware rejects the naive pair outright: 400 `statusCode=6`,
+    `subStatusCode=badJsonContent`, `errorMsg=startTime`. Which offset the pair
+    carries is the p1-05c question (OBSERVED.md "Window offsets are ARITHMETIC for
+    the device", same day): the device does *arithmetic* on the label, so
+    `search_pair(device_offset_min=...)` — site-wall digits relabeled with the
+    device's claimed offset — is the shape a known device must be sent, and
+    `with_offset=True` (the site-labeled pair) is the fallback only when the
+    device's claim is unreadable.
 
     The naive `since_device_local`/`until_device_local` pair stays on the struct: it
     is the raw wall reading the device's *clock* displays, which the audit path and
@@ -606,20 +614,67 @@ class DeviceWindow:
     until_site_iso: str
     site_tz: str | None = None
 
-    def search_pair(self, *, with_offset: bool = False) -> tuple[str, str]:
+    def search_pair(
+        self, *, with_offset: bool = False, device_offset_min: int | None = None
+    ) -> tuple[str, str]:
         """The `(startTime, endTime)` strings for a query body.
 
-        `with_offset=True` — the only form this firmware accepts on the event
-        endpoints (OBSERVED.md, live proof 2026-10-17). The naive default exists so
-        the struct's raw wall pair stays reachable for audit and test use; the
-        production callers (`paging.build_event_cond`, `pipeline.event_total_count`)
-        all ask for the offset explicitly.
+        `device_offset_min` (minutes east of UTC, the device's *claimed* offset from
+        `System/time`) is the shape the A/B proved correct: the site-wall digits of
+        the `_site_iso` pair kept verbatim, trailing label replaced (e.g.
+        `2026-05-21T13:00:00+03:00` -> `...+02:00` for site-a's year-round +02:00
+        claim). The device re-anchors those digits on its own clock, so a
+        site-labeled window arrives shifted by the label delta — silently one hour
+        early all summer (OBSERVED.md, payroll-critical).
+
+        `with_offset=True` with no `device_offset_min` gives the site-labeled pair
+        (the p1-05b fallback for a device whose claim we cannot read); the naive
+        default exists so the struct's raw wall pair stays reachable for audit and
+        test use. Nothing on the event wire may use the naive pair — this firmware
+        400s it.
         """
+        if device_offset_min is not None:
+            label = offset_hhmm(device_offset_min)
+            return (
+                _relabel(self.since_site_iso, label),
+                _relabel(self.until_site_iso, label),
+            )
         return (
             (self.since_site_iso, self.until_site_iso)
             if with_offset
             else (self.since_device_local, self.until_device_local)
         )
+
+
+def offset_hhmm(minutes: int) -> str:
+    """Offset minutes -> the `±HH:MM` label the device parses (`120` -> `+02:00`).
+
+    Refuses a value outside ±23:59: an ISO parser that accepts a nonsense label
+    would shift the window by an unbounded amount with no error — worse than the
+    naive 400, which at least stops the walk.
+    """
+    if not -1439 <= minutes <= 1439:
+        raise ValueError(f"cannot label an offset of {minutes} minutes: ±23:59 is the ISO form")
+    sign = "+" if minutes >= 0 else "-"
+    hours, mins = divmod(abs(minutes), 60)
+    return f"{sign}{hours:02d}:{mins:02d}"
+
+
+def _relabel(iso: str, label: str) -> str:
+    """Swap the trailing offset of an offset-bearing ISO string for `label`.
+
+    Digits left of the label are untouched — that is the whole rule (site-wall
+    digits, device-labeled). The digits produced by `window_for_device` always
+    carry an offset; anything else here is a programming error, raised loudly.
+    """
+    for sep in ("+", "-"):
+        # rfind, not split: the date's own dashes must not be mistaken for a sign.
+        if (cut := iso.rfind(sep)) > 10:
+            return iso[:cut] + label
+    raise ValueError(
+        f"{iso!r} carries no offset to relabel; the claimed-label pair "
+        "needs the offset-bearing site pair (window_for_device output)"
+    )
 
 
 def window_for_device(
