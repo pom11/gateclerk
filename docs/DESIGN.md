@@ -428,7 +428,7 @@ bounded retries, capability discovery), `gateclerk device info`, `gateclerk devi
 Exit: reads a full day of punches off `192.0.2.10`, correct UTC, idempotent re-run
 adds zero rows, `docs/OBSERVED.md` records the real event-code table.
 
-**P2 — site agent + local store (SKETCH ONLY — not scheduled, not carded).** Listed
+**P2 — site agent + local store (SKETCH ONLY — not scheduled, not carded).** Per-seam options + recommendations for owner sign-off: [P2-SITE-AGENT.md](P2-SITE-AGENT.md). Listed
 so P1's seams stay honest; becomes cards only after P1 is demonstrated working on
 site-a: sqlite store keyed `(device_serial, serial_no)`, checkpoint + overlap,
 systemd/launchd unit, outbound pusher with retry + dead-letter, config for N devices
