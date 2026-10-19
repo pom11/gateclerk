@@ -685,36 +685,50 @@ def test_migration_list_not_starting_at_one_is_refused(tmp_path, monkeypatch) ->
 def test_a_store_from_the_future_is_refused(tmp_path) -> None:
     """Downgrade wall: a db already at a version this code does not ship must NOT be
     opened (an old binary writing a new schema is how P2-04's rows would meet P2-02's
-    columns). Simulated the way an upgrade actually looks: P2-04's v3 present, this
-    binary ships v2."""
+    columns). Simulated the way an upgrade actually looks: a version ahead of the shipped
+    list present, this binary behind it.
+
+    The version is `len(MIGRATIONS) + 1`, not a literal 3: P2-04 has shipped v3 (queue) and
+    v4 (dead-letter) for real, so a v3 row is now a schema this code knows and would not be
+    refused. The wall is about the version the code does NOT have.
+    """
     path = tmp_path / "agent.sqlite3"
     agent_db.connect(path).close()
+    future = len(agent_db.MIGRATIONS) + 1
     conn = sqlite3.connect(path)
     conn.execute(
-        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (3, 'p2_04', 'x')"
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, 'p2_next', 'x')",
+        (future,),
     )
     conn.commit()
     conn.close()
 
-    # The shipped list has 2 entries; a v3 db must be refused, not "applied backwards".
-    with pytest.raises(agent_db.MigrationTooNewError, match="version 3"):
+    with pytest.raises(agent_db.MigrationTooNewError, match=f"version {future}"):
         agent_db.connect(path)
     # And the refusal left the future schema untouched (no half-repair attempted).
     conn = sqlite3.connect(path)
-    at_v3 = conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 3").fetchone()[0]
-    assert at_v3 == 1
+    at_future = conn.execute(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", (future,)
+    ).fetchone()[0]
+    assert at_future == 1
     conn.close()
 
 
 def test_a_failing_migration_rolls_back_whole_entry(tmp_path, monkeypatch) -> None:
-    """Migration atomicity: a v3 entry whose SECOND statement fails must leave
+    """Migration atomicity: a new entry whose SECOND statement fails must leave
     neither of its tables nor its bookkeeping row — a crash mid-migration resumes at
-    v3, not half-inside it."""
+    that entry, not half-inside it.
+
+    The version is `len(MIGRATIONS) + 1`, not a literal 3: P2-04 appended v3 (queue) and
+    v4 (dead-letter) to the list this seam exists for, so "the next entry" is whatever the
+    shipped history does not have yet. Pinning a literal here would break this card's own
+    test on every append — which is the opposite of the extensibility it pins.
+    """
     path = tmp_path / "agent.sqlite3"
     agent_db.connect(path).close()
 
     boom = agent_db.Migration(
-        version=3,
+        version=len(agent_db.MIGRATIONS) + 1,
         name="half_a_table",
         sql="CREATE TABLE will_not_survive (x); CREATE TABLE bad (x, x);",  # dup column fails
     )
@@ -725,8 +739,12 @@ def test_a_failing_migration_rolls_back_whole_entry(tmp_path, monkeypatch) -> No
     conn = sqlite3.connect(path)
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "will_not_survive" not in names, "the first statement survived a rolled-back entry"
-    rows_v3 = conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 3").fetchone()[0]
-    assert rows_v3 == 0
+    # Bookkeeping for THE ENTRY UNDER TEST (not a literal 3, which P2-04 has shipped for
+    # real now): the rolled-back entry must have left no row of its own.
+    rows_new = conn.execute(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", (boom.version,)
+    ).fetchone()[0]
+    assert rows_new == 0
     conn.close()
 
 
