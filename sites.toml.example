@@ -11,6 +11,19 @@ host = "192.0.2.10"
 port = 80                            # ISAPI is HTTP:80; 8000 is Hikvision's SDK port, not TLS
 iana_tz = "Europe/Bucharest"         # the ONLY source of truth for UTC (OBSERVED.md: the
                                      # device's own offset is wrong in summer)
+device_tz = "Europe/Bucharest"       # p1-12: the zone this device's wall digits actually
+                                     # live in. site-a stamps +02:00 year-round while the
+                                     # wall digits ARE site-local (OBSERVED.md
+                                     # "time/offset bug"); the owner decision of
+                                     # 2026-10-18 keeps the clock and declares the
+                                     # mapping here: the mapped zone is what the run
+                                     # resolves against (authoritative over the claimed
+                                     # offset) and the run-level tz warning is silenced
+                                     # for this device — the wrongness is known and
+                                     # accepted. The record provenance fields
+                                     # (tz_offset_mismatch and both offsets) still
+                                     # populate exactly as before. Omit the key for a
+                                     # device whose clock is not known-bad.
 isapi_user = "admin"                 # overridable by --user / GATECLERK_*_USER; the keychain
                                      # item's `user=` comment is the last hint before default
 keychain_service = "gateclerk-hikvision"  # keychain ACCOUNT is always the host

@@ -77,9 +77,22 @@ name = "site-a"
 host = "192.0.2.10"
 port = 80
 iana_tz = "Europe/Bucharest"
+device_tz = "Europe/Bucharest"
 isapi_user = "admin"
 keychain_service = "gateclerk-hikvision"
 ```
+
+`device_tz` (optional) is the p1-12 owner decision for clocks that will never be fixed:
+it declares the zone the device's wall digits actually live in — site-a stamps `+02:00`
+year-round while the digits ARE Bucharest (OBSERVED.md "time/offset bug"). When set, the
+mapped zone is what `gateclerk events` resolves punches in (authoritative over the
+device's claimed offset) and the run-level tz-mismatch warning stays silent for that
+device, because the wrongness is declared and accepted; record provenance
+(`tz_offset_mismatch` and both offset fields) still populates exactly as before, and
+`gateclerk device time` labels its verdict `mapped via sites.toml`. An explicitly typed
+`--tz` overrides the mapping — and then the warning fires again, because the mapping is
+no longer what made the run's zone. Omit the key for a device whose clock is not
+known-bad; absent it, behaviour is byte-for-byte the previous one.
 
 `--site site-a --config sites.toml` resolves host/port/user/service in one step. The tool
 never picks a site for you: `--host` or `--site` is required, even when the file holds

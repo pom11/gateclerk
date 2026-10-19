@@ -511,19 +511,69 @@ def _resolve_window(
     return start, end
 
 
-def _resolved_site_tz(*, tz: str | None, site: cfg.SiteConfig, fmt: OutputFormat) -> str:
-    """--tz beats sites.toml's `iana_tz`, which beats the compiled-in default.
+def _resolved_site_tz(
+    *,
+    tz: str | None,
+    site: cfg.SiteConfig,
+    fmt: OutputFormat,
+    ctx: Any = None,
+) -> tuple[str, bool]:
+    """The zone the run resolves punches in, as `(zone, mapping_in_play)`.
 
-    Validated by constructing the context (which resolves the zone before any socket), so
-    a typo'd zone is exit 2 with the zone name in the message, not 400 pages of
-    `unresolved` records.
+    Base precedence: `--tz` beats sites.toml's `iana_tz`, which beats the compiled-in
+    default. Validated by constructing the context (which resolves the zone before any
+    socket), so a typo'd zone is exit 2 with the zone name in the message, not 400 pages
+    of `unresolved` records.
+
+    p1-12 (owner decision 2026-10-18): a site block that declares `device_tz` says "this
+    device's wall digits live in this zone, whatever the clock claims" — site-a stamps
+    +02:00 year-round while the digits ARE Bucharest (OBSERVED.md "time/offset bug").
+    The mapped zone is then authoritative over the claimed offset, and the second return
+    value tells the caller the wrongness is declared: the run-level warning is silenced
+    while the record provenance (`tz_offset_mismatch` + both offsets) fills unchanged.
+    Without the key the zone is what it always was and `False` comes back — the
+    unmapped-device path stays byte-for-byte today's.
+
+    An explicit `--tz` still beats a declared `device_tz`: the operator who typed the
+    zone wants that zone, and silently ignoring the most specific instrument on the
+    command line is the failure mode this repo names elsewhere ("a flag we silently
+    ignore is a bug, not a default"). Telling "typed" from "the declared default landed
+    in the value" is impossible from the value alone — `tz: TzOpt = DEFAULT_TZ` makes an
+    absent flag arrive as `'Europe/Bucharest'`, indistinguishable from an operator who
+    insisted on Bucharest — so `ctx` (the Click context the command passes) answers it
+    via the parameter source. Without a `ctx` there is no evidence anyone typed
+    `--tz`, the mapping stands: callers get the config's intent, never a guess.
     """
-    chosen = tz if tz is not None else (site.iana_tz or DEFAULT_TZ)
+    typed_tz = ctx is not None and _tz_flag_given(ctx)
+    if site.device_tz is not None and not typed_tz:
+        chosen = site.device_tz
+        mapped = True
+    else:
+        chosen = tz if tz is not None else (site.iana_tz or DEFAULT_TZ)
+        mapped = False
     try:
         RunContext(site="validate", site_tz=chosen)
     except TimestampInputError as exc:
         raise _config_exit(fmt, str(exc)) from exc
-    return chosen
+    return chosen, mapped
+
+
+def _tz_flag_given(ctx: Any) -> bool:
+    """True when `--tz` was actually typed, not when its declared default landed.
+
+    Click's own bookkeeping (the parameter source), because no CLI here may re-derive
+    that fact from the value: the value cannot distinguish "not given" from "given, and
+    given the same string the default happens to hold" — and a mapping silently beating
+    an explicitly typed zone, or silently losing to an untouched default, are both
+    payroll bugs this seam exists to keep apart. Fails CLOSED (treat as typed) when the
+    context cannot answer: an operator-visible alarm is cheaper than a silently mapped
+    run nobody approved.
+    """
+    try:
+        source = ctx.get_parameter_source("tz")
+    except Exception:  # pragma: no cover - a Click context always answers; belt, not branch
+        return True
+    return source is not None and source.name != "DEFAULT"
 
 
 def _now() -> datetime:
@@ -672,7 +722,9 @@ def device_info(
 NO_OFFSET_EVIDENCE = "no evidence (device claims nothing)"
 
 
-def _tz_offset_verdict(reading: DeviceTime, site_tz: str) -> tuple[bool | None, int | None, str]:
+def _tz_offset_verdict(
+    reading: DeviceTime, site_tz: str, *, mapped_via: str | None = None
+) -> tuple[bool | None, int | None, str]:
     """(mismatch, site offset at the device's wall instant, human sentence) — p1-11.
 
     DESIGN.md "Phase plan" item 7's other half: an operator standing at the device sees a
@@ -687,6 +739,12 @@ def _tz_offset_verdict(reading: DeviceTime, site_tz: str) -> tuple[bool | None, 
     the command already fetched — no second request, and the device's own wall digits are
     what the site zone is resolved at, so the comparison is immune to the device's label.
 
+    `mapped_via` (p1-12) is the site's declared `device_tz` when the mapping is in play:
+    the zone the comparison resolves against is then the *mapped* one, and the sentence
+    says so — an operator reading "MISMATCH" beside a silenced run alarm must be able to
+    see WHY the run stayed quiet (the wrongness is declared in sites.toml) instead of
+    concluding the two surfaces disagree with each other.
+
     The wall clock being unparseable is its own honest answer: with no wall there is
     nothing for the zone to resolve against (and no claim — both come out of the same
     `localTime` string), so the verdict and the site offset are both None and the sentence
@@ -694,6 +752,9 @@ def _tz_offset_verdict(reading: DeviceTime, site_tz: str) -> tuple[bool | None, 
     `localTime` stamp is ±HH:MM by `_TIME_RE`, a zone offset is within ±23:59), but the
     label keeps a raw-minutes arm rather than trusting that reading of two other modules.
     """
+    # p1-12: why the run-level alarm is silent for this device, appended to every
+    # verdict sentence when a sites.toml mapping is what made the comparison.
+    mapping_note = f" (mapped via sites.toml: {mapped_via})" if mapped_via is not None else ""
     if reading.naive_local is None:
         return None, None, "no evidence (no readable device wall clock)"
     site_min = site_offset_minutes(reading.naive_local, site_tz)
@@ -711,17 +772,18 @@ def _tz_offset_verdict(reading: DeviceTime, site_tz: str) -> tuple[bool | None, 
     # answers None exactly when the claim asserts nothing); spelling both out keeps the
     # type checker happy without adding a branch that could drift from the policy.
     if verdict is None or claim_min is None:
-        return verdict, site_min, f"{NO_OFFSET_EVIDENCE}, {site}"
+        return verdict, site_min, f"{NO_OFFSET_EVIDENCE}, {site}{mapping_note}"
     claim = f"device claims {label(claim_min)}"
     if verdict:
         # "records unaffected": the resolution path already ignores this claim (DESIGN.md
         # item 2), so a flag that read like an accusation of bad data would be the lie.
-        return verdict, site_min, f"MISMATCH — {claim}, {site}; records unaffected"
-    return verdict, site_min, f"agrees — {claim}, {site}"
+        return verdict, site_min, f"MISMATCH — {claim}, {site}{mapping_note}; records unaffected"
+    return verdict, site_min, f"agrees — {claim}, {site}{mapping_note}"
 
 
 @device_app.command("time")
 def device_time(
+    ctx: typer.Context,
     host: HostArg = None,
     site: SiteOpt = None,
     config: ConfigOpt = None,
@@ -765,7 +827,7 @@ def device_time(
     site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
     target = site_config.target()
     creds = _resolve_creds(target, user=user, password=password, output=fmt)
-    site_tz = _resolved_site_tz(tz=tz, site=site_config, fmt=fmt)
+    site_tz, tz_mapped = _resolved_site_tz(tz=tz, site=site_config, fmt=fmt, ctx=ctx)
     logger = _logger_for(verbose, creds)
     machine = fmt is OutputFormat.JSON or fmt is OutputFormat.JSONL
     rows: list[dict[str, Any]] = []
@@ -773,7 +835,9 @@ def device_time(
         with _client_for(target, creds, timeout=timeout, output=fmt, logger=logger) as client:
             reading, raw_text = pipeline.device_time_reading(client)
         skew = compute_skew(reading, site_tz=site_tz, warn_seconds=SKEW_WARN_SECONDS)
-        offset_verdict, site_offset_min, offset_detail = _tz_offset_verdict(reading, site_tz)
+        offset_verdict, site_offset_min, offset_detail = _tz_offset_verdict(
+            reading, site_tz, mapped_via=site_config.device_tz if tz_mapped else None
+        )
         # Everything downstream of the read runs INSIDE the guard: `reading` only exists if
         # the read succeeded, and a `--json` passthrough that rendered after the block would
         # have nothing honest to print on the failure path.
@@ -788,6 +852,11 @@ def device_time(
                     "tz_rule": reading.tz_raw,
                     "parse_note": reading.note,
                     "site_tz": site_tz,
+                    # p1-12: the mapping the effective zone came from, when sites.toml's
+                    # `device_tz` chose it — `null` means the zone is the plain
+                    # --tz/iana_tz/default answer. Machine-surface twin of the
+                    # "mapped via sites.toml" wording in the table verdict row.
+                    "tz_mapped_via": site_config.device_tz if tz_mapped else None,
                     # p1-11 (DESIGN.md item 7): the three-valued comparison, same semantics
                     # as the event record's `tz_offset_mismatch` — null = no claim, NOT
                     # agreement. `site_offset_min_at_instant` is the other side of it, so a
@@ -980,6 +1049,7 @@ def users_list(
 
 @app.command("events")
 def events(
+    ctx: typer.Context,
     since: Annotated[
         str | None,
         typer.Option(
@@ -1110,7 +1180,7 @@ def events(
     target = site_config.target()
     _validate_choice(fmt, verify, flag="--verify", allowed=VERIFY_CHOICES)
     _validate_choice(fmt, outcome, flag="--outcome", allowed=OUTCOME_CHOICES)
-    site_tz = _resolved_site_tz(tz=tz, site=site_config, fmt=fmt)
+    site_tz, tz_mapped = _resolved_site_tz(tz=tz, site=site_config, fmt=fmt, ctx=ctx)
     try:
         parse_chunk(chunk)
     except TimestampInputError as exc:
@@ -1194,7 +1264,7 @@ def events(
         # p1-06c's run-level visibility: the walk is done, the stream is rendered, this
         # only summarizes what was just printed — display-only, like the `--count` line
         # above it, and it never changes the exit code.
-        _warn_tz_mismatch(records)
+        _warn_tz_mismatch(records, mapping_declared=tz_mapped)
 
 
 #: The card's table columns, in this order. `utc` and `local` are adjacent on purpose:
@@ -1270,7 +1340,7 @@ def _print_count_crosscheck(
 # --- p1-06c run-level warning --------------------------------------------------------------
 
 
-def _warn_tz_mismatch(records: Sequence[Any]) -> None:
+def _warn_tz_mismatch(records: Sequence[Any], *, mapping_declared: bool = False) -> None:
     """ONE stderr summary line when any printed record has `tz_offset_mismatch=true`.
 
     The column shipped with p1-06 (`tz_mismatch.py` owns the policy; DESIGN.md "Time
@@ -1279,6 +1349,20 @@ def _warn_tz_mismatch(records: Sequence[Any]) -> None:
     (the device claims +02:00 while Europe/Bucharest resolves +03:00) until the OWNER
     fixes the device tz — a device write we never make — and an operator watching a
     backfill saw silence unless they grepped the JSONL.
+
+    p1-12 (owner decision 2026-10-18): the clocks are NOT going to be fixed physically;
+    a site declares the wrongness once, in sites.toml (`device_tz`), and `events` hands
+    in `mapping_declared=True` when that mapping is what resolved the run's zone. Then
+    this prints NOTHING: the mismatch is known and accepted, and re-announcing it on
+    every backfill is noise that trains operators to ignore warnings — the exact
+    failure the line above exists to prevent, arriving from the other direction.
+    The suppression is at THIS line only: every record still carries
+    `tz_offset_mismatch` and both offset fields exactly as an unmapped run would
+    (provenance is a fact about the data, the warning is a policy about attention).
+    The mapping flag is keyed on "the mapping made this run's zone" — not on record
+    counts or flag values — so an unmapped device warns exactly as before, including
+    an explicit `--tz` overriding a declared mapping (the mapping then is NOT what
+    resolved the zone, so the alarm the mapping silenced comes back).
 
     The precedent is `--count` (paging.py: "warn, don't fail"): one line, after the
     run, exit code untouched; `make_console(stderr=True)` keeps `--format jsonl >
@@ -1300,6 +1384,11 @@ def _warn_tz_mismatch(records: Sequence[Any]) -> None:
       anything that reads like "1104 records are wrong" would be a worse lie than the
       silence this replaced.
     """
+    if mapping_declared:
+        # Known-wrong, declared in sites.toml — the whole point of the mapping is that
+        # this run stays quiet. Deliberately BEFORE any record inspection: the
+        # suppression must not depend on what the records happen to say.
+        return
     flagged = [r for r in records if r.tz_offset_mismatch is True]
     if not flagged:
         return
