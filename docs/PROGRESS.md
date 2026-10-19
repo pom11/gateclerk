@@ -49,6 +49,20 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-19 later — P2 roots merged: #28 (fdd2f32) + #29 (ed02860); DAG auto-dispatching
+
+- P2-01 (config validator) merged fdd2f32: 1206 passed; mutants 6/2/9 red (required-zone,
+  http:// push target, unknown-key refusal). P2-02 (store) merged ed02860: 1254 passed;
+  completed-only checkpoint guard pin + UPSERT idempotence verified incl. free-overlap
+  WHERE-guard; mutants: guard-removal -> exact refusal pin red, DO-NOTHING -> 14 red,
+  WHERE-drop -> 3 red. v3+ migration seam reserved for P2-04. Zero trailers, sockets
+  blocked, no real hosts.
+- Dispatcher auto-released P2-03 + P2-04 (running) the moment both roots completed —
+  todo-flip correction doing its job. Then 05/06 (parents done) -> 07 -> canary.
+- Note: one of my own mutations hit a docstring comment not the SQL (false green);
+  retried anchored in the statement -> 14 red. Anchor mutants in code, grep-verify
+  the anchor location, then trust the color.
+
 ## 2026-10-19 — PRs #26 + #25 merged; owner tz decision carded (P1-12 t_e37dfd68, running)
 
 - PR #26 (P1-11 device-time verdict) -> `99d0c65`: 1128 passed / ruff clean; the None
