@@ -94,6 +94,19 @@ device, because the wrongness is declared and accepted; record provenance
 no longer what made the run's zone. Omit the key for a device whose clock is not
 known-bad; absent it, behaviour is byte-for-byte the previous one.
 
+P2 (site agent) keys are already part of the schema — every one is read by the agent,
+optional for the CLI, and documented in `sites.toml.example`: `cadence_s`/`overlap_s`
+(5-min poll + 5-min gap-healing window), `db_path` (defaults to `./gateclerk-<site>.sqlite3`),
+`db_warn_bytes` (2 GiB store watermark), `push_target` (`stub://` or `https://` ref,
+never a default endpoint) and `push_dead_letter_after_s` (24 h). One rule changes with
+the agent surface: **`iana_tz` becomes REQUIRED** — the P2 agent refuses a block without
+an explicit zone (site tz is payroll truth, never defaulted; docs/P2-SITE-AGENT.md §2d).
+The P1 CLI keeps working on a zoneless block byte-for-byte but prints one `warning:`
+line naming the site, because its fallback is a compiled-in site-a value. Credential
+*references* follow the name `gateclerk-<site>-<host>` (the systemd `LoadCredential=`
+name; macOS keeps the keychain scheme unchanged) — password values remain refused in
+every config surface, unknown-key style.
+
 `--site site-a --config sites.toml` resolves host/port/user/service in one step. The tool
 never picks a site for you: `--host` or `--site` is required, even when the file holds
 exactly one block — a leftover `sites.toml` in the current directory must not silently
