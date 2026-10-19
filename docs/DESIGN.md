@@ -82,7 +82,7 @@ heal gaps.
 | `/ISAPI/AccessControl/AcsEvent/Total` | — | **not supported on site-a fw (400 notSupport)** — implemented nowhere |
 
 Everything returns `401 + WWW-Authenticate: Digest qop="auth"` unauthenticated,
-confirmed on `192.0.2.10` (realm `DS-39DED0D1`, `Server: webs`). So: HTTP digest,
+confirmed on the site-a device (realm `DS-MASKED`, `Server: webs`). So: HTTP digest,
 `qop=auth`. Digest auth is per-request-challenge stateful (nonce/nc), so the client must
 reuse one authenticated session across paged requests, not rebuild auth per request.
 
@@ -353,12 +353,15 @@ NTP anyway; only the tz rule is wrong).
 
 ## Credential plumbing
 
-Config (`sites.toml`, committed — hosts are not secret, passwords never appear):
+Config (`sites.toml` is LOCAL-ONLY — gitignored; the tracked example carries
+placeholder hosts only. Real device hosts identify the operator's LAN, so they stay
+out of tracked files regardless of repo visibility; passwords never appear in either):
 
 ```toml
 [[site]]
 name = "site-a"
-host = "192.0.2.10"
+host = "192.0.2.10"                        # TEST-NET placeholder; the real host lives in the
+                                           # gitignored local sites.toml (see sites.toml.example)
 port = 80
 iana_tz = "Europe/Bucharest"
 isapi_user = "admin"                      # overridable; keychain comment also carries user=
@@ -425,15 +428,13 @@ nonce, serial or employee name (fixtures mask them — see tests/fixtures/README
 bounded retries, capability discovery), `gateclerk device info`, `gateclerk device time`,
 `gateclerk users list`, `gateclerk events --since/--until` (paged + checkpointed), `json`/
 `table` output, offline unit tests on fixtures, one opt-in live smoke suite.
-Exit: reads a full day of punches off `192.0.2.10`, correct UTC, idempotent re-run
+Exit: reads a full day of punches off the site-a device, correct UTC, idempotent re-run
 adds zero rows, `docs/OBSERVED.md` records the real event-code table.
 
-**P2 — site agent + local store (SKETCH ONLY — not scheduled, not carded).** Per-seam options + recommendations for owner sign-off: [P2-SITE-AGENT.md](P2-SITE-AGENT.md). Listed
-so P1's seams stay honest; becomes cards only after P1 is demonstrated working on
-site-a: sqlite store keyed `(device_serial, serial_no)`, checkpoint + overlap,
+**P2 — site agent + local store (SIGNED OFF 2026-10-19 — scheduled, carded).** Per-seam decisions (a)–(f) all decided as recommended: [P2-SITE-AGENT.md](P2-SITE-AGENT.md) §6 is binding for P2 cards. sqlite store keyed `(device_serial, serial_no)`, checkpoint + overlap,
 systemd/launchd unit, outbound pusher with retry + dead-letter, config for N devices
 per site (3 sites = 1 codebase + 3 configs, not 3 forks), `/healthz`, metrics, alerts
-on clock skew and auth failure. Optional `alertStream` later.
+on clock skew and auth failure. `alertStream` DEFERRED (spec §2f). Rollout: site-a canary ≥7 days clean, then B and C one at a time behind read-only §5 probe cards.
 
 **P3 — Business Central side (OUT OF SCOPE, owner-decided).** No design and no cards
 until the owner has seen P1 working end-to-end on the real device. The only artifact

@@ -1,9 +1,13 @@
 # P2 — site agent: decision spec (docs only)
 
-STATUS: this document exists so the owner can **decide** the P2 seams. P2 remains
-**not scheduled and not carded** (owner scope-lock, DESIGN.md "Phase plan": P2 =
-SKETCH ONLY) until the owner signs off on all open questions (a)–(f) below.
-Nothing here is code, scaffolding, or a device-touching plan. Where this file and
+STATUS: **SIGNED OFF — decided 2026-10-19 (owner, via review).** All seams (a)–(f)
+are decided AS RECOMMENDED (see §6 checklist); P2 is now scheduled and carded on the
+gateclerk board, and the recommendations below are BINDING for P2 cards. Rollout order
+(owner, same review): site-a (the proven box) first as canary, ≥7 days clean (no checkpoint
+stall, no terminal 401, tz_offset_mismatch warning-count 0, site_labeled_windows 0),
+then sites B and C ONE AT A TIME, each gated on a read-only §5 probe card that first
+needs the operator's host + keychain item. Push target stays ABSTRACT: cards build
+against a local stub ingest + JSONL — never invent a real endpoint. Where this file and
 docs/OBSERVED.md disagree about device behaviour, OBSERVED.md wins (it was read off
 the box). Every device-behaviour claim below cites OBSERVED.md or DESIGN.md — no
 invented device facts.
@@ -253,9 +257,9 @@ no new concepts):
 
 | Seam | Question | Recommendation | Decided? |
 |---|---|---|---|
-| (a) | cadence + overlap | 5 min / 5 min; long-lived client per device | ☐ |
-| (b) | retention + dead-letter | keep-everything + watermark; dead-letter = sqlite table w/ full JSONL payload | ☐ |
-| (c) | pusher backoff + auth alerting | park-on-bad-creds w/ acked slow re-probe; lockout = critical + on-site; recoveries = info | ☐ |
-| (d) | site config deltas | explicit `iana_tz` required; refs-only creds; `gateclerk-<site>-<host>` naming | ☐ |
-| (e) | /healthz + metrics | carry over all listed P1 observables, minimal vocabulary | ☐ |
-| (f) | alertStream | DEFER (reasons 1–4) | ☐ |
+| (a) | cadence + overlap | 5 min / 5 min; long-lived client per device | Decided 2026-10-19 (owner, via review) ✓ |
+| (b) | retention + dead-letter | keep-everything + watermark; dead-letter = sqlite table w/ full JSONL payload | Decided 2026-10-19 (owner, via review) ✓ |
+| (c) | pusher backoff + auth alerting | park-on-bad-creds w/ acked slow re-probe; lockout = critical + on-site; recoveries = info | Decided 2026-10-19 (owner, via review) ✓ |
+| (d) | site config deltas | explicit `iana_tz` required; refs-only creds; `gateclerk-<site>-<host>` naming | Decided 2026-10-19 (owner, via review) ✓ |
+| (e) | /healthz + metrics | carry over all listed P1 observables, minimal vocabulary | Decided 2026-10-19 (owner, via review) ✓ |
+| (f) | alertStream | DEFER (reasons 1–4) | Decided 2026-10-19 (owner, via review) ✓ |
