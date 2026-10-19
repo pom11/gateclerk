@@ -291,18 +291,18 @@ def _check_endpoint(endpoint: str, *, what: str) -> None:
         )
 
 
-def _error_class(outcome: int | BaseException) -> str:
+def _error_class(outcome: BaseException) -> str:
     """§2b's "error class": the exception's class name, or `HttpStatus<code>`.
 
-    The status is folded INTO the name deliberately: `HttpStatusRejected` tells an owner
+    The status is folded INTO the name deliberately: the bare class name tells an owner
     nothing about whether to wait for the ingest or fix our payload, and §2b asks for one
-    column, not a column plus a detail column.
+    column, not a column plus a detail column. Every failure reaches here as an exception
+    (a non-2xx status is wrapped in `HttpStatusRejectedError` by `_call_transport`), so a
+    bare status can never arrive as an int.
     """
     if isinstance(outcome, HttpStatusRejectedError):
         return f"{HTTP_ERROR_CLASS}{outcome.status}"
-    if isinstance(outcome, BaseException):
-        return type(outcome).__name__
-    return f"{HTTP_ERROR_CLASS}{outcome}"
+    return type(outcome).__name__
 
 
 def _draw(rng: Callable[[], float]) -> float:
@@ -451,7 +451,10 @@ def drain(
             continue
 
         attempts = row["attempts"] + 1
-        first_failed_at = _note_failure(conn, row, attempts, outcome, now, stamp)
+        # The outage clock is decided BEFORE the write: it is the row's existing stamp, or
+        # this instant when this is the first failure. Deciding it here (rather than after
+        # a write) is what lets the failure and its reschedule land in ONE transaction.
+        first_failed_at = row["first_failed_at"] or stamp
         elapsed = (now - _parse(first_failed_at)).total_seconds()
         if elapsed >= dead_letter_after_s:
             _move_to_dead_letter(
@@ -467,17 +470,20 @@ def drain(
             )
             dead_lettered.append(row["event_id"])
         else:
-            delay = _backoff_delay_s(attempts, rng, base_s=base_s, cap_s=cap_s)
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    "UPDATE push_queue SET next_attempt_at = ? WHERE id = ?",
-                    (_stamp(now + timedelta(seconds=round(delay, 3))), row["id"]),
-                )
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
-            conn.execute("COMMIT")
+            # One draw, one transaction: the attempt count and the new due time are the
+            # same fact. Written separately, a SIGTERM between them would leave attempts
+            # bumped with `next_attempt_at` still <= now — every restart of the agent
+            # would re-hit the endpoint immediately, which is §1 seam 9 broken by a crash
+            # rather than by intent (and the UPSERT would make it free to repeat).
+            delay_s = _backoff_delay_s(attempts, rng, base_s=base_s, cap_s=cap_s)
+            _note_failure(
+                conn,
+                row,
+                attempts=attempts,
+                outcome=outcome,
+                stamp=stamp,
+                next_attempt_at=_stamp(now + timedelta(seconds=round(delay_s, 3))),
+            )
             retried.append(row["event_id"])
 
     if log is not None:
@@ -523,15 +529,21 @@ def _call_transport(transport: Transport, endpoint: str, payload: str) -> int | 
 def _note_failure(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
+    *,
     attempts: int,
-    outcome: int | BaseException,
-    now: datetime,
+    outcome: Exception,
     stamp: str,
-) -> str:
-    """Record a failed attempt; return the (possibly newly set) first-failure stamp.
+    next_attempt_at: str,
+) -> None:
+    """Record a failed attempt AND reschedule it, in ONE transaction.
 
-    `first_failed_at` is written by the FIRST failure and never moved afterwards: it is
-    the start of the continuous-failure span §2c measures the 24 h bound against. The
+    One transaction because the two halves are one fact: a kill between them would leave
+    `attempts` bumped while `next_attempt_at` is still <= now, so the next drain (or the
+    next agent start) would re-hit the endpoint that just failed — the "never hammer" rule
+    broken by a crash instead of by intent.
+
+    `first_failed_at` is written by the FIRST failure and never moved afterwards: it is the
+    start of the continuous-failure span §2c measures the 24 h bound against. The
     `COALESCE` keeps that true even if a racing writer got here first.
     """
     error_class = _error_class(outcome)
@@ -543,16 +555,16 @@ def _note_failure(
                SET attempts = ?,
                    first_failed_at = COALESCE(first_failed_at, ?),
                    last_attempt_at = ?,
-                   last_error_class = ?
+                   last_error_class = ?,
+                   next_attempt_at = ?
              WHERE id = ?
             """,
-            (attempts, stamp, stamp, error_class, row["id"]),
+            (attempts, stamp, stamp, error_class, next_attempt_at, row["id"]),
         )
     except BaseException:
         conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT")
-    return row["first_failed_at"] or stamp
 
 
 def _mark_sent(conn: sqlite3.Connection, *, queue_id: int, event_id: int, endpoint: str) -> None:

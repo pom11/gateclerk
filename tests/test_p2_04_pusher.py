@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -801,6 +801,32 @@ def test_depths_are_the_metric_lines_spec_2e_names(db, stored) -> None:
     assert agent_push.queue_depth(db) == 0 and agent_push.dead_letter_depth(db) == 1
 
 
+def test_the_read_seams_expose_state_without_payloads(db, stored) -> None:
+    """P2-07's CLI and P2-05's health surface read the tables through these helpers
+    rather than hand-writing SQL. Two halves pinned: the queue view must NOT carry payload
+    bytes (a CLI table that prints payloads is how payroll fields land on a terminal), and
+    the dead-letter view MUST (a replay reads them back, and §2b is the whole point)."""
+    record, rowid = stored
+    agent_push.enqueue_events(db, [rowid], endpoint=ENDPOINT, now=T0)
+    pending = agent_push.pending_rows(db)
+    assert [p.event_id for p in pending] == [rowid]
+    assert pending[0].endpoint == ENDPOINT and pending[0].attempts == 0
+    assert pending[0].first_failed_at is None and pending[0].last_error_class is None
+    assert not any(one_line(record)[:24] in repr(p) for p in pending)
+
+    agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(503), now=T0, rng=Rng(1.0))
+    agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(503), now=at(BOUND), rng=Rng(1.0))
+    rows = agent_push.dead_letter_rows(db)
+    assert len(rows) == 1
+    assert rows[0].payload == one_line(record)
+    assert rows[0].error_class == "HttpStatus503"
+    assert rows[0].attempts == 2
+    assert rows[0].first_attempt_at == iso(T0) and rows[0].last_attempt_at == iso(at(BOUND))
+    # endpoint filtering: a triage for site-a must not show site-b's rows.
+    assert agent_push.dead_letter_rows(db, endpoint="stub://elsewhere") == ()
+    assert agent_push.pending_rows(db, endpoint="stub://elsewhere") == ()
+
+
 # -----------------------------------------------------------------------------------------
 # (5) the stub ingest: stub:// appends JSONL to a local path
 # -----------------------------------------------------------------------------------------
@@ -928,6 +954,179 @@ def test_a_naive_clock_is_refused_by_the_drain(db, stored) -> None:
             rng=Rng(),
         )
     assert transport.calls == [], "the refusal must happen before anything is sent"
+
+
+# -----------------------------------------------------------------------------------------
+# transaction discipline: a failed write rolls back, it does not leave BEGIN open
+# -----------------------------------------------------------------------------------------
+
+
+class BreaksOn:
+    """A connection stand-in that raises on one statement, delegating everything else.
+
+    The point is what happens AFTER the raise: each writer owns its transaction
+    (`isolation_level=None`), so a raise that skips COMMIT would leave `BEGIN IMMEDIATE`
+    open on the agent's one connection and poison every later write of the same poll loop
+    (agent_store's own suite learned this the hard way). The proxy makes the raise land
+    inside the writer rather than in front of it.
+    """
+
+    def __init__(self, inner: sqlite3.Connection, marker: str) -> None:
+        self.inner = inner
+        self.marker = marker
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.inner.in_transaction
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        if self.marker in sql:
+            raise RuntimeError(f"simulated write failure on: {sql.strip().splitlines()[0]}")
+        return self.inner.execute(sql, params)
+
+    def as_conn(self) -> sqlite3.Connection:
+        """The proxy handed to a function typed for a real Connection (duck-typed here:
+        the writers use `execute` and nothing else on the connection)."""
+        return cast(sqlite3.Connection, self)
+
+
+def _assert_rolled_back(conn: sqlite3.Connection) -> None:
+    assert conn.in_transaction is False, "the writer left BEGIN IMMEDIATE open on the db"
+
+
+def test_a_failed_success_delete_rolls_back_and_the_row_is_repushed(db, stored) -> None:
+    """A push the ingest ACCEPTED but whose queue DELETE failed must leave the row queued
+    (it will be re-pushed, and §2b's UPSERT is exactly what makes that safe) — never
+    deleted-and-unsent, which is the loss direction with no dead-letter to account for."""
+    _, rowid = stored
+    agent_push.enqueue_events(db, [rowid], endpoint=ENDPOINT, now=T0)
+    broken = BreaksOn(db, "DELETE FROM push_queue WHERE id")
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        agent_push.drain(
+            broken.as_conn(), endpoint=ENDPOINT, transport=Flaky(200), now=T0, rng=Rng()
+        )
+    _assert_rolled_back(db)
+    assert len(queue_rows(db)) == 1, "an accepted push whose DELETE failed lost the row"
+    result = agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(200), now=at(1), rng=Rng())
+    assert len(result.sent) == 1 and queue_rows(db) == []
+
+
+def test_a_failed_replay_insert_rolls_back_and_keeps_the_dead_letter(db, stored) -> None:
+    """Replaying must not consume the dead-letter row: if the re-queue write fails, the
+    payload stays where it is and the owner can replay again."""
+    _, rowid = stored
+    agent_push.enqueue_events(db, [rowid], endpoint=ENDPOINT, now=T0)
+    agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(500), now=T0, rng=Rng(1.0))
+    agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(500), now=at(BOUND), rng=Rng(1.0))
+    target = dead_rows(db)[0]["id"]
+    broken = BreaksOn(db, "INSERT INTO push_queue")
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        agent_push.replay_dead_letter(broken.as_conn(), target, now=at(BOUND + 1))
+    _assert_rolled_back(db)
+    assert len(dead_rows(db)) == 1 and queue_rows(db) == []
+    assert agent_push.replay_dead_letter(db, target, now=at(BOUND + 1)) is not None
+
+
+def test_enqueue_refuses_a_target_that_is_not_an_accepted_scheme(db, stored) -> None:
+    """§3's gate on the MAIN path (not just the stub): the queue must never hold a row
+    aimed at an endpoint nobody authorised — an `http://` ingest would ship a punch in
+    plaintext, and a scheme-less value is a typo that would silently never be sent."""
+    _, rowid = stored
+    for bad in ("http://ingest.example.invalid/push", "ftp://x", "ingest.example.invalid/push"):
+        with pytest.raises(agent_push.PushTargetError, match="scheme"):
+            agent_push.enqueue_events(db, [rowid], endpoint=bad, now=T0)
+    assert queue_rows(db) == [], "a refused target must not leave a queued row"
+
+
+def test_a_failure_and_its_reschedule_are_one_sql_statement(db, stored) -> None:
+    """The crash-consistency claim in `_note_failure` is that the attempt count and the
+    new due time are written by ONE statement (a kill between two statements would leave
+    the row counted-but-due-now, i.e. an immediate re-hit on every restart).
+
+    Traced out of sqlite itself rather than inferred from behaviour: a mutation that split
+    the UPDATE into two statements keeps every behavioural test here green (each half does
+    what it did before), so only the statement count can pin the claim. The trace callback
+    reports the expanded SQL (params inlined), which is fine — the SET column names are
+    what is being pinned, not the placeholders."""
+    _, rowid = stored
+    agent_push.enqueue_events(db, [rowid], endpoint=ENDPOINT, now=T0)
+    seen: list[str] = []
+    db.set_trace_callback(lambda sql: seen.append(sql))
+    try:
+        agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(500), now=T0, rng=Rng(1.0))
+    finally:
+        db.set_trace_callback(None)
+    updates = [s for s in seen if "UPDATE push_queue" in s]
+    assert len(updates) == 1, f"a failed row should cost one UPDATE, saw {len(updates)}: {updates}"
+    assert "attempts =" in updates[0] and "next_attempt_at =" in updates[0], (
+        "attempts and next_attempt_at must be written by the SAME statement — two "
+        "statements leave a crash window where the row is due again immediately"
+    )
+
+
+def test_a_failed_retry_update_rolls_back_and_leaves_the_row_usable(db, stored) -> None:
+    """The backoff UPDATE is the writer the agent hits most often, so its rollback is
+    the one worth pinning: the raise must not leave BEGIN open, and the row must still be
+    there with its attempt count for the next tick (a half-applied backoff would either
+    wedge the connection or re-hit the endpoint immediately)."""
+    _, rowid = stored
+    agent_push.enqueue_events(db, [rowid], endpoint=ENDPOINT, now=T0)
+    broken = BreaksOn(db, "SET attempts")
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        agent_push.drain(
+            broken.as_conn(), endpoint=ENDPOINT, transport=Flaky(500), now=T0, rng=Rng(1.0)
+        )
+    _assert_rolled_back(db)
+    assert len(queue_rows(db)) == 1, "a failed backoff update lost the queued row"
+    # ...and the same connection still works: the next drain pushes it normally.
+    result = agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(200), now=at(3600), rng=Rng())
+    assert len(result.sent) == 1 and queue_rows(db) == []
+
+
+def test_a_failed_dead_letter_write_rolls_back_whole_move(db, stored) -> None:
+    """The dead-letter INSERT + queue DELETE are ONE transaction: a failure between them
+    must leave the row queued (retrying) rather than deleted-and-undelivered, which is
+    exactly how a punch would vanish with no dead-letter row to account for it."""
+    _, rowid = stored
+    agent_push.enqueue_events(db, [rowid], endpoint=ENDPOINT, now=T0)
+    agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(500), now=T0, rng=Rng(1.0))
+    broken = BreaksOn(db, "INSERT INTO dead_letter")
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        agent_push.drain(
+            broken.as_conn(),
+            endpoint=ENDPOINT,
+            transport=Flaky(500),
+            now=at(BOUND),
+            rng=Rng(1.0),
+        )
+    _assert_rolled_back(db)
+    assert agent_push.dead_letter_depth(db) == 0, "a rolled-back move left a dead-letter row"
+    assert len(queue_rows(db)) == 1, "dequeued without being sent OR dead-lettered"
+
+
+def test_a_failed_enqueue_rolls_back_the_whole_batch(db, stored) -> None:
+    """A batch that hits a bad rowid mid-loop must leave nothing queued: a half-queued
+    batch is a send buffer that lies about what will go out."""
+    _, rowid = stored
+    with pytest.raises(agent_push.QueueError):
+        agent_push.enqueue_events(db, [rowid, 4242], endpoint=ENDPOINT, now=T0)
+    _assert_rolled_back(db)
+    assert queue_rows(db) == []
+
+
+def test_a_failed_owner_delete_rolls_back_and_keeps_the_row(db, stored) -> None:
+    """The owner command deleting a row it cannot delete must leave the payload intact —
+    a dead-letter row is the only copy of a punch that never reached the ingest."""
+    _, rowid = stored
+    agent_push.enqueue_events(db, [rowid], endpoint=ENDPOINT, now=T0)
+    agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(500), now=T0, rng=Rng(1.0))
+    agent_push.drain(db, endpoint=ENDPOINT, transport=Flaky(500), now=at(BOUND), rng=Rng(1.0))
+    target = dead_rows(db)[0]["id"]
+    broken = BreaksOn(db, "DELETE FROM dead_letter")
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        agent_push.delete_dead_letter(broken.as_conn(), target)
+    _assert_rolled_back(db)
+    assert [r["id"] for r in dead_rows(db)] == [target], "the payload was destroyed anyway"
 
 
 def test_push_is_a_named_surface_so_p2_07_can_wrap_it() -> None:
