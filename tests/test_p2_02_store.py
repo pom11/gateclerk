@@ -30,7 +30,7 @@ The five DoD cases the card dictates, 1:1 to test names below:
 
 Plus the card's own extras: pragmas (WAL + synchronous=NORMAL, crash-safe under a
 systemd kill), the migration list extensible + forward-only (P2-04 appends its
-queue/dead-letter entries — pinned by actually appending a fake v2 and reopening), and
+queue/dead-letter entries — pinned by actually appending a fake v3 and reopening), and
 the NULL-serial refusal this card's design note records.
 
 Offline by construction: tmp sqlite files only (conftest.netoff would still kill a
@@ -607,7 +607,7 @@ def test_a_new_migration_appends_and_applies_on_next_open(tmp_path, monkeypatch)
     """P2-04's contract: it appends queue/dead-letter entries to MIGRATIONS; the next
     connect applies ONLY the new one onto the existing schema. A frozen (or rebuilt)
     migration list would break P2-04 silently — this pins the seam by appending a fake
-    v2 exactly the way P2-04 will."""
+    v3 exactly the way P2-04 will."""
     path = tmp_path / "agent.sqlite3"
     conn = agent_db.connect(path)
     conn.execute(
@@ -616,19 +616,19 @@ def test_a_new_migration_appends_and_applies_on_next_open(tmp_path, monkeypatch)
     )
     conn.close()
 
-    fake_v2 = agent_db.Migration(
-        version=len(agent_db.MIGRATIONS) + 1,
+    fake_next = agent_db.Migration(
+        version=len(agent_db.MIGRATIONS) + 1,  # 3 today: P2-04 appends exactly here
         name="fake_queue_for_test",
         sql="CREATE TABLE fake_queue (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
     )
-    monkeypatch.setattr(agent_db, "MIGRATIONS", (*agent_db.MIGRATIONS, fake_v2))
+    monkeypatch.setattr(agent_db, "MIGRATIONS", (*agent_db.MIGRATIONS, fake_next))
 
     conn2 = agent_db.connect(path)
     try:
         applied = [
             r[0] for r in conn2.execute("SELECT version FROM schema_migrations ORDER BY version")
         ]
-        assert applied[-1] == fake_v2.version
+        assert applied[-1] == fake_next.version
         assert applied[:-1] == [m.version for m in agent_db.MIGRATIONS[:-1]]
         # additive: the old data survived the new migration
         assert (
