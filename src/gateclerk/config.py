@@ -108,6 +108,14 @@ class SiteConfig:
     timeout_s: float = DEFAULT_TIMEOUT_S
     page_delay_ms: int = DEFAULT_PAGE_DELAY_MS
     iana_tz: str | None = None
+    #: p1-12 (owner decision 2026-10-18): the zone the device's wall digits actually
+    #: live in, declared per device. On site-a the clock stamps +02:00 year-round while
+    #: the digits ARE site-local Europe/Bucharest (OBSERVED.md "time/offset bug"), and
+    #: the owner will not touch the device clock — so the mapping is declared here and
+    #: the run resolves against it. When set it is authoritative over the claimed
+    #: offset AND silences the run-level tz warning (the wrongness is known and
+    #: accepted); when absent, today's behaviour byte-for-byte.
+    device_tz: str | None = None
     isapi_user: str = DEFAULT_ISAPI_USER
     keychain_service: str = DEFAULT_KEYCHAIN_SERVICE
 
@@ -122,6 +130,7 @@ class SiteConfig:
             "timeout_s",
             "page_delay_ms",
             "iana_tz",
+            "device_tz",
             "isapi_user",
             "keychain_service",
         }
@@ -157,6 +166,13 @@ class SiteConfig:
             problem = _tz_problem(self.iana_tz)
             if problem:
                 problems.append(problem)
+        if self.device_tz is not None:
+            # Same strictness as `iana_tz` (p1-12): a typo'd mapping must not quietly fall
+            # back to the device's wrong claim — the whole point of the key is that the
+            # mapping is what the run resolves against.
+            problem = _tz_problem(self.device_tz, key="device_tz")
+            if problem:
+                problems.append(problem)
         if not self.keychain_service.strip():
             problems.append("keychain_service must not be empty")
         if problems:
@@ -181,6 +197,7 @@ class SiteConfig:
             timeout_s=_number(table.get("timeout_s", DEFAULT_TIMEOUT_S), "timeout_s"),
             page_delay_ms=_int(table.get("page_delay_ms", DEFAULT_PAGE_DELAY_MS), "page_delay_ms"),
             iana_tz=_text(table["iana_tz"], "iana_tz") if "iana_tz" in table else None,
+            device_tz=_text(table["device_tz"], "device_tz") if "device_tz" in table else None,
             isapi_user=_text(table.get("isapi_user", DEFAULT_ISAPI_USER), "isapi_user"),
             keychain_service=_text(
                 table.get("keychain_service", DEFAULT_KEYCHAIN_SERVICE), "keychain_service"
@@ -206,14 +223,18 @@ def _number(value: object, key: str) -> float:
     return float(value)
 
 
-def _tz_problem(iana_tz: str) -> str | None:
-    """`None` when zoneinfo resolves the name, else a message. We never assume UTC."""
+def _tz_problem(iana_tz: str, *, key: str = "iana_tz") -> str | None:
+    """`None` when zoneinfo resolves the name, else a message. We never assume UTC.
+
+    `key` names the config key the value came from, so the error points at the line the
+    operator typed: `iana_tz` (unchanged wording) or `device_tz` (p1-12).
+    """
     try:
         from zoneinfo import ZoneInfo
 
         ZoneInfo(iana_tz)
     except Exception as exc:  # ZoneInfoNotFoundError arrives as a KeyError subclass
-        return f"iana_tz {iana_tz!r} is not a resolvable IANA zone ({type(exc).__name__})"
+        return f"{key} {iana_tz!r} is not a resolvable IANA zone ({type(exc).__name__})"
     return None
 
 
