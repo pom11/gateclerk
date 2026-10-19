@@ -27,13 +27,15 @@ VERIFIED against the real `security` CLI (macOS, throwaway keychain, 2026-10-15)
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import tomllib
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -43,16 +45,23 @@ from gateclerk.exceptions import ConfigError, CredentialUnavailable, redact_b64
 from gateclerk.secrets import Secret, redact
 
 __all__ = [
+    "DEFAULT_CADENCE_S",
+    "DEFAULT_DB_PATH_TEMPLATE",
+    "DEFAULT_DB_WARN_BYTES",
     "DEFAULT_IANA_TZ",
     "DEFAULT_ISAPI_USER",
     "DEFAULT_KEYCHAIN_SERVICE",
+    "DEFAULT_OVERLAP_S",
     "DEFAULT_PAGE_DELAY_MS",
     "DEFAULT_PORT",
+    "DEFAULT_PUSH_DEAD_LETTER_AFTER_S",
     "DEFAULT_SITES_FILE",
     "DEFAULT_TIMEOUT_S",
     "ENV_PREFIX",
     "KEYCHAIN_EXIT_NOT_FOUND",
+    "PUSH_TARGET_SCHEMES",
     "SECURITY_BIN",
+    "ConfigSurface",
     "CredentialProvider",
     "CredentialSource",
     "Credentials",
@@ -61,8 +70,10 @@ __all__ = [
     "KeychainReader",
     "SiteConfig",
     "credential_provider",
+    "credential_ref",
     "describe_target",
     "env_var_names",
+    "explicit_iana_tz_required",
     "find_site",
     "host_env_prefix",
     "load_sites",
@@ -83,11 +94,72 @@ DEFAULT_ISAPI_USER = "admin"
 DEFAULT_IANA_TZ = "Europe/Bucharest"
 DEFAULT_SITES_FILE = "sites.toml"
 
+# P2 agent defaults are docs/P2-SITE-AGENT.md decisions, signed off 2026-10-19 — the
+# card text cites the seam for each number. They live HERE (and every P2 key of the
+# schema is defined NOW) so later P2 cards only read them:
+#   cadence/overlap 5 min/5 min (§2a: minutes, not days — the ~190-request nonce use-cap
+#     makes retirement routine at any minutes-scale cadence, and the overlap is the
+#     crash/clock-step gap-healer);
+#   db_warn_bytes 2 GiB watermark (§2b: keep-everything + watermark alert);
+#   push_dead_letter_after_s 24 h of continuous push failure (§2c);
+#   db path derives `./gateclerk-<site>.sqlite3` per site (§2b; `*.sqlite3` is already
+#     gitignored — deliberately no DEFAULT_PUSH_TARGET: spec §3/§2d forbid ever
+#     defaulting an endpoint, absence means "pusher off", the P2-04 decision point).
+DEFAULT_CADENCE_S = 300
+DEFAULT_OVERLAP_S = 300
+DEFAULT_DB_WARN_BYTES = 2 * 1024**3
+DEFAULT_PUSH_DEAD_LETTER_AFTER_S = 86400
+DEFAULT_DB_PATH_TEMPLATE = "./gateclerk-{site}.sqlite3"
+
+#: The only `push_target` schemes the validator accepts (§3: the push leg is ordinary
+#: HTTPS to our own endpoint; `stub://` is the owner-authorized local stub ingest).
+#: Everything else — `ftp://`, plaintext `http://`, `file://`, scheme-less — is refused.
+PUSH_TARGET_SCHEMES = ("stub://", "https://")
+
 ENV_PREFIX = "GATECLERK"
 SECURITY_BIN = "/usr/bin/security"
 
 #: What `security` exits when the item simply is not in the keychain (VERIFIED, above).
 KEYCHAIN_EXIT_NOT_FOUND = 44
+
+
+class ConfigSurface(StrEnum):
+    """WHICH process is reading the config — the strictness is a property of the CALLER,
+    never of the file (a shared `sites.toml` must not be able to disqualify its own CLI
+    use by carrying a key).
+
+    CLI   — the P1 operator surface: today's behaviour, `iana_tz` optional (the CLI
+            falls back to `DEFAULT_IANA_TZ` via `--tz` precedence in cli.py).
+    AGENT — the P2 site agent (docs/P2-SITE-AGENT.md §2d): a block without an explicit
+            `iana_tz` is REFUSED, because site tz is payroll truth and the compiled-in
+            default is a *site-a* value that must never decide another site's payroll.
+    """
+
+    CLI = "cli"
+    AGENT = "agent"
+
+
+#: Process-wide strictness for an agent entry point that cannot thread `surface=`
+#: through every config read (systemd unit-per-site main(): flip it on once at startup).
+#: A ContextVar, not a module global: nesting is token-reset and exception-safe.
+_STRICT_IANA_TZ: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "gateclerk_strict_iana_tz", default=False
+)
+
+
+@contextlib.contextmanager
+def explicit_iana_tz_required() -> Iterator[None]:
+    """Within this block, EVERY config read behaves as the agent surface (spec §2d).
+
+    Deliberately additive: the `surface=` argument stays the explicit seam (tests and
+    call sites that know what they are); this covers an agent process' inherited paths
+    (shared helpers, `site_from_args` reuse) without editing each of them.
+    """
+    token = _STRICT_IANA_TZ.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_IANA_TZ.reset(token)
 
 
 class CredentialSource(StrEnum):
@@ -100,7 +172,14 @@ class CredentialSource(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SiteConfig:
-    """One `[[site]]` block of `sites.toml` — the non-secret half of a connection."""
+    """One `[[site]]` block of `sites.toml` — the non-secret half of a connection.
+
+    P2-01 defines EVERY key of the P2 schema here (this module owns the file for the
+    whole phase), so later P2 cards only read fields: the agent keys below are validated
+    at parse time AND construct time exactly like P1's, and `surface` says which process
+    is asking — the agent refuses a block whose `iana_tz` is missing, the CLI does not
+    (docs/P2-SITE-AGENT.md §2d; see `ConfigSurface`).
+    """
 
     name: str
     host: str
@@ -118,10 +197,29 @@ class SiteConfig:
     device_tz: str | None = None
     isapi_user: str = DEFAULT_ISAPI_USER
     keychain_service: str = DEFAULT_KEYCHAIN_SERVICE
+    # --- P2 agent keys (docs/P2-SITE-AGENT.md §2a-§2d) ---------------------------------
+    #: Seconds between polls (§2a: 5 min against the ~190-request nonce use-cap).
+    cadence_s: int = DEFAULT_CADENCE_S
+    #: Seconds of already-seen window re-read on every poll (§2a: the gap-healer).
+    overlap_s: int = DEFAULT_OVERLAP_S
+    #: Local sqlite path; `None` means "derive `./gateclerk-<site>.sqlite3`" (§2b) — see
+    #: `db_path_resolved`. The `*.sqlite3` gitignore pattern already covers the default.
+    db_path: str | None = None
+    #: Disk watermark in bytes past which the agent warns (§2b: keep-everything + alert).
+    db_warn_bytes: int = DEFAULT_DB_WARN_BYTES
+    #: Ingest endpoint REF for the outbound push (§3: abstract, never defaulted). `None`
+    #: means the pusher is off. Accepted schemes: `PUSH_TARGET_SCHEMES`.
+    push_target: str | None = None
+    #: Continuous-push-failure seconds before a batch is dead-lettered (§2c: 24 h).
+    push_dead_letter_after_s: int = DEFAULT_PUSH_DEAD_LETTER_AFTER_S
+    #: Which process is reading (see `ConfigSurface`). NOT a TOML key: strictness
+    #: belongs to the caller, so a shared sites.toml can never disqualify its own CLI.
+    surface: ConfigSurface = ConfigSurface.CLI
 
     #: Keys a `[[site]]` block may carry. Anything else is refused loudly: a silently
     #: ignored `timeout_s = 5` would mean we poll a door controller for 30 s and believe
-    #: we configured 5.
+    #: we configured 5. Credential VALUES have no key here by design (DESIGN.md
+    #: "Credential plumbing", spec §2d): a `password =` line lands in the refusal below.
     _KNOWN_KEYS = frozenset(
         {
             "name",
@@ -133,11 +231,33 @@ class SiteConfig:
             "device_tz",
             "isapi_user",
             "keychain_service",
+            "cadence_s",
+            "overlap_s",
+            "db_path",
+            "db_warn_bytes",
+            "push_target",
+            "push_dead_letter_after_s",
         }
     )
 
     def __post_init__(self) -> None:
+        # `surface` is normalised BEFORE validating: the field is typed
+        # `ConfigSurface` for readers, but an agent entry point may legitimately pass
+        # the plain string "agent" (StrEnum accepts it). An unknown spelling is a
+        # ConfigError, never a silent downgrade to CLI — that hole would be §2d again.
+        object.__setattr__(self, "surface", _coerce_surface(self.surface))
         self.validate()
+
+    @property
+    def db_path_resolved(self) -> str:
+        """The sqlite path to actually open: the operator's, else the site-derived one.
+
+        Derivation lives here (not in each caller) so P2-02's store, P2-04's dead-letter
+        and P2-05's watermark alert cannot disagree about where site-a's data is.
+        """
+        if self.db_path is not None:
+            return self.db_path
+        return DEFAULT_DB_PATH_TEMPLATE.format(site=self.name)
 
     def target(self) -> DeviceTarget:
         """The device half of the config, as the credential resolver wants it."""
@@ -150,7 +270,11 @@ class SiteConfig:
         )
 
     def validate(self) -> None:
-        """Fail loudly and before any network call. p1-08 maps this to exit 2."""
+        """Fail loudly and before any network call. p1-08 maps this to exit 2.
+
+        Every problem names the key the operator typed (and the message carries the
+        site name), the style set by the unknown-key refusal and p1-12's `device_tz`.
+        """
         problems: list[str] = []
         if not self.name.strip():
             problems.append("name must not be empty")
@@ -175,12 +299,52 @@ class SiteConfig:
                 problems.append(problem)
         if not self.keychain_service.strip():
             problems.append("keychain_service must not be empty")
+        # --- P2 agent keys ------------------------------------------------------------
+        # cadence/overlap > 0: 0 would busy-poll a device whose digest nonce dies at
+        # ~190 uses, and a negative overlap moves the window's lower bound FORWARD —
+        # a silent gap in the exact crash-heal case the overlap exists for.
+        if self.cadence_s <= 0:
+            problems.append(f"cadence_s {self.cadence_s} must be > 0")
+        if self.overlap_s < 0:
+            problems.append(f"overlap_s {self.overlap_s} must be >= 0")
+        if self.db_warn_bytes <= 0:
+            problems.append(f"db_warn_bytes {self.db_warn_bytes} must be > 0")
+        if self.push_dead_letter_after_s <= 0:
+            problems.append(f"push_dead_letter_after_s {self.push_dead_letter_after_s} must be > 0")
+        if self.db_path is not None and not self.db_path.strip():
+            problems.append("db_path must not be empty (omit the key for the site default)")
+        if self.push_target is not None:
+            problem = _push_target_problem(self.push_target)
+            if problem:
+                problems.append(problem)
+        # §2d: on the agent surface the zone is REQUIRED, never defaulted. The
+        # compiled-in DEFAULT_IANA_TZ is a site-a value and must never decide another
+        # site's payroll, so it is simply absent from this branch — an agent that wants
+        # a zone must have one declared in the file.
+        if self._strict_iana_tz() and self.iana_tz is None:
+            problems.append(
+                "iana_tz is required (the site timezone is payroll truth and is never "
+                'defaulted — add iana_tz = "Europe/Bucharest" or the site\'s real zone)'
+            )
         if problems:
             raise ConfigError(f"site {self.name!r} is misconfigured: {('; '.join(problems))}")
 
+    def _strict_iana_tz(self) -> bool:
+        """Whether the REQUIRED-zone rule applies to THIS read: the agent surface, or
+        the process-wide `explicit_iana_tz_required()` block an agent process sets."""
+        return self.surface is ConfigSurface.AGENT or _STRICT_IANA_TZ.get()
+
     @classmethod
-    def from_table(cls, table: Mapping[str, Any]) -> SiteConfig:
-        """Build from one parsed TOML table, rejecting unknown keys and wrong types."""
+    def from_table(
+        cls, table: Mapping[str, Any], *, surface: str | ConfigSurface = "cli"
+    ) -> SiteConfig:
+        """Build from one parsed TOML table, rejecting unknown keys and wrong types.
+
+        `surface` is passed in by the reader (never read from the table — see
+        `ConfigSurface`); a block that lacks `iana_tz` is refused here on the agent
+        surface, which is the parse-time half of the "construct-time + parse-time both"
+        requirement.
+        """
         unknown = sorted(set(table) - cls._KNOWN_KEYS)
         if unknown:
             raise ConfigError(
@@ -202,6 +366,18 @@ class SiteConfig:
             keychain_service=_text(
                 table.get("keychain_service", DEFAULT_KEYCHAIN_SERVICE), "keychain_service"
             ),
+            cadence_s=_int(table.get("cadence_s", DEFAULT_CADENCE_S), "cadence_s"),
+            overlap_s=_int(table.get("overlap_s", DEFAULT_OVERLAP_S), "overlap_s"),
+            db_path=_text(table["db_path"], "db_path") if "db_path" in table else None,
+            db_warn_bytes=_int(table.get("db_warn_bytes", DEFAULT_DB_WARN_BYTES), "db_warn_bytes"),
+            push_target=(
+                _text(table["push_target"], "push_target") if "push_target" in table else None
+            ),
+            push_dead_letter_after_s=_int(
+                table.get("push_dead_letter_after_s", DEFAULT_PUSH_DEAD_LETTER_AFTER_S),
+                "push_dead_letter_after_s",
+            ),
+            surface=_coerce_surface(surface),
         )
 
 
@@ -236,6 +412,51 @@ def _tz_problem(iana_tz: str, *, key: str = "iana_tz") -> str | None:
     except Exception as exc:  # ZoneInfoNotFoundError arrives as a KeyError subclass
         return f"{key} {iana_tz!r} is not a resolvable IANA zone ({type(exc).__name__})"
     return None
+
+
+def _coerce_surface(value: str | ConfigSurface) -> ConfigSurface:
+    """Validate a surface argument. An unknown spelling is refused, NOT downgraded: a
+    typo'd `surface="agenta"` silently becoming CLI would be the §2d hole through the
+    back door.
+    """
+    try:
+        return ConfigSurface(value)
+    except ValueError:
+        known = ", ".join(s.value for s in ConfigSurface)
+        raise ConfigError(f"surface {value!r} is unknown (accepted: {known})") from None
+
+
+def _push_target_problem(target: str, *, key: str = "push_target") -> str | None:
+    """`None` when the ref carries an accepted scheme, else a refusal naming it.
+
+    §3: the target is an ABSTRACT ingest ref — an endpoint may never be invented or
+    defaulted, so the only shapes that pass are the owner-authorized local stub and
+    real HTTPS. Matched case-sensitively on purpose: `HTTPS://` in a config is a
+    mistake worth a loud error, not a silently accepted one.
+    """
+    if target.startswith(PUSH_TARGET_SCHEMES):
+        return None
+    allowed = " or ".join(PUSH_TARGET_SCHEMES)
+    return (
+        f"{key} {target!r} has an unacceptable scheme: a push target must start with "
+        f"{allowed} (never a default endpoint — docs/P2-SITE-AGENT.md §3)"
+    )
+
+
+def credential_ref(site: str, host: str) -> str:
+    """The credential REFERENCE name for one device: `gateclerk-<site>-<host>` (§2d).
+
+    A helper rather than a prose convention, so P2-04/05 (and the systemd unit naming
+    `LoadCredential=` follows) cannot drift from each other by hand-crafting strings.
+    Refs only, always: this produces a NAME to look a secret up under — macOS keeps the
+    existing keychain scheme (`-s gateclerk-hikvision -a <host>` is unchanged), agent
+    hosts resolve the name via systemd credentials or the `GATECLERK_<HOST>_PASSWORD`
+    env rung. No password value ever passes through here.
+    """
+    for label, value in (("site", site), ("host", host)):
+        if not value or not value.strip():
+            raise ConfigError(f"credential_ref: {label} must not be empty")
+    return f"gateclerk-{site.strip()}-{host.strip()}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,8 +805,25 @@ def credential_provider(
 # --- sites.toml ----------------------------------------------------------------------
 
 
-def load_sites(path: Path | str = DEFAULT_SITES_FILE) -> dict[str, SiteConfig]:
-    """Parse `sites.toml` into `{name: SiteConfig}`. Raises on a bad file or bad block."""
+def _warn_stderr(message: str) -> None:
+    """The default warning emitter: stderr via the shared console, the `--verbose`/
+    jsonl-pipe invariant (stdout stays parseable) that p1-05c/p1-06c established.
+    """
+    from gateclerk.output import make_console  # local import: config must stay cheap
+
+    make_console(stderr=True).print(message, markup=False)
+
+
+def load_sites(
+    path: Path | str = DEFAULT_SITES_FILE,
+    *,
+    surface: str | ConfigSurface = "cli",
+) -> dict[str, SiteConfig]:
+    """Parse `sites.toml` into `{name: SiteConfig}`. Raises on a bad file or bad block.
+
+    `surface` says which process is reading (see `ConfigSurface`): the agent surface
+    refuses a block without an explicit `iana_tz` (docs/P2-SITE-AGENT.md §2d).
+    """
     file = Path(path)
     try:
         raw = file.read_bytes()
@@ -596,15 +834,21 @@ def load_sites(path: Path | str = DEFAULT_SITES_FILE) -> dict[str, SiteConfig]:
         ) from None
     except OSError as exc:
         raise ConfigError(f"cannot read sites file {file}: {exc.strerror or exc}") from exc
-    return parse_sites(raw, origin=str(file))
+    return parse_sites(raw, origin=str(file), surface=surface)
 
 
-def parse_sites(raw: bytes, *, origin: str = "<bytes>") -> dict[str, SiteConfig]:
+def parse_sites(
+    raw: bytes,
+    *,
+    origin: str = "<bytes>",
+    surface: str | ConfigSurface = "cli",
+) -> dict[str, SiteConfig]:
     """Parse the TOML bytes of a sites file.
 
     No redaction on the way in: this is *our own* config text and mangling base64-shaped
     runs would corrupt it. A sites file has no business carrying a password, and if one
-    appears the value simply becomes a config string — the credential path never reads it.
+    appears the value simply becomes a config string — the credential path never reads
+    it (and any such key is refused outright as unknown, DoD: refs-only).
     """
     try:
         data = tomllib.loads(raw.decode("utf-8"))
@@ -619,7 +863,7 @@ def parse_sites(raw: bytes, *, origin: str = "<bytes>") -> dict[str, SiteConfig]
     for block in blocks:
         if not isinstance(block, Mapping):
             raise ConfigError(f"{origin}: a [[site]] entry is not a table")
-        site = SiteConfig.from_table(block)
+        site = SiteConfig.from_table(block, surface=surface)
         if site.name in sites:
             raise ConfigError(f"{origin}: duplicate site name {site.name!r}")
         sites[site.name] = site
@@ -641,6 +885,8 @@ def site_from_args(
     host: str | None = None,
     port: int = DEFAULT_PORT,
     config_path: Path | str | None = None,
+    surface: str | ConfigSurface = "cli",
+    warn: Callable[[str], None] | None = None,
 ) -> SiteConfig:
     """`--site NAME` reads that block from sites.toml; `--host` builds a one-off.
 
@@ -648,13 +894,30 @@ def site_from_args(
     one block. A connector for door hardware must never guess which door to talk to: the
     file can be a leftover from another directory, and P1's config carries a real site
     address. Exactly one of the two flags is required.
+
+    P2-01 scoping decision (card: "validator enabled for the agent surface AND warns on
+    CLI `--site` reads"): a CLI-surface read of a block with no `iana_tz` still works —
+    P1's `--tz` precedence keeps `DEFAULT_IANA_TZ` as the fallback and no existing
+    command starts failing — but it is exactly the defaulted-payroll-truth situation
+    §2d refuses, so one `warning:` line naming site+key goes to stderr (`warn` injects a
+    collector for tests). The agent surface never warns: it raises (see `ConfigSurface`).
     """
     if site is not None and host is not None:
         raise ConfigError("--site and --host are mutually exclusive — pick one device")
     if site is not None:
-        return find_site(load_sites(config_path or DEFAULT_SITES_FILE), site)
+        found = find_site(load_sites(config_path or DEFAULT_SITES_FILE, surface=surface), site)
+        if found.iana_tz is None:
+            message = (
+                f"warning: site {found.name!r} has no iana_tz in sites.toml; UTC math "
+                "falls back to the compiled-in default (a site-a value). Site timezone "
+                "is payroll truth — declare iana_tz explicitly (docs/P2-SITE-AGENT.md §2d)."
+            )
+            (warn or _warn_stderr)(message)
+        return found
     if host is not None:
-        return SiteConfig(name=site or host, host=host, port=port)
+        # A `--host` one-off has no block, so there is no missing key to warn about —
+        # and P1 built these with no zone for months; byte-for-byte behaviour.
+        return SiteConfig(name=site or host, host=host, port=port, surface=_coerce_surface(surface))
     raise ConfigError(
         "no device given: pass --host HOST or --site NAME (sites.toml is only read for "
         "--site; this tool never guesses which device to poll)."

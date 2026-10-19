@@ -4,13 +4,22 @@
 # for them in: --password flag > GATECLERK_* env > macOS Keychain (see README "Credentials").
 # Keep this example's host in the TEST-NET range: a committed config must never name a
 # real device, and this repo's test suite refuses non-TEST-NET addresses under tests/.
+#
+# Credential refs only, never values (docs/P2-SITE-AGENT.md §2d): the reference name
+# for one device is `gateclerk-<site>-<host>` (e.g. `gateclerk-site-a-192.0.2.10`) — the
+# systemd `LoadCredential=` name an agent unit carries. macOS keeps the keychain scheme
+# unchanged (service `gateclerk-hikvision`, account = the host); the resolver picks the
+# source by rung (flag > env > keychain), the config only ever names things.
 
 [[site]]
 name = "site-a"
 host = "192.0.2.10"
 port = 80                            # ISAPI is HTTP:80; 8000 is Hikvision's SDK port, not TLS
 iana_tz = "Europe/Bucharest"         # the ONLY source of truth for UTC (OBSERVED.md: the
-                                     # device's own offset is wrong in summer)
+                                     # device's own offset is wrong in summer). REQUIRED
+                                     # for the P2 agent (spec §2d: site tz is payroll
+                                     # truth, never defaulted); the P1 CLI still falls
+                                     # back to the compiled-in default but warns.
 device_tz = "Europe/Bucharest"       # p1-12: the zone this device's wall digits actually
                                      # live in. site-a stamps +02:00 year-round while the
                                      # wall digits ARE site-local (OBSERVED.md
@@ -29,6 +38,33 @@ isapi_user = "admin"                 # overridable by --user / GATECLERK_*_USER;
 keychain_service = "gateclerk-hikvision"  # keychain ACCOUNT is always the host
 timeout_s = 30.0                     # read timeout; the device drops idle keep-alives
 page_delay_ms = 100                  # between pages of one paged search
+
+# --- P2 agent keys (docs/P2-SITE-AGENT.md §2a–§2d; the default is shown for each) -----
+# All six are OPTIONAL for the P1 CLI (which ignores them); the P2 agent reads them per
+# site. Uncomment to override a default.
+
+# cadence_s = 300                    # seconds between polls (§2a: 5 min — the device's
+#                                    # ~190-request digest-nonce use-cap makes nonce
+#                                    # retirement routine at any minutes-scale cadence,
+#                                    # and transport recovery already fits)
+# overlap_s = 300                    # seconds of already-seen window RE-read every poll
+#                                    # (§2a: the gap-healer after clock steps or a crash
+#                                    # mid-page — UPSERT makes the re-read free)
+# db_path = "./gateclerk-site-a.sqlite3"
+#                                    # local sqlite store; the default derives from the
+#                                    # site name (`./gateclerk-<site>.sqlite3`) — omit the
+#                                    # key for that. `*.sqlite3` is gitignored: the store
+#                                    # never enters git.
+# db_warn_bytes = 2147483648         # warn past this store size (§2b: keep-everything
+#                                    # plus a watermark alert, not purging)
+# push_target = "stub://local/ingest"
+#                                    # outbound push REF (§3: P3 out of scope). `stub://`
+#                                    # appends JSONL locally for tests; a real `https://`
+#                                    # ref is allowed; ftp://, http://, file:// and
+#                                    # anything else are REFUSED. There is never a
+#                                    # hardcoded default: omitted means pusher off.
+# push_dead_letter_after_s = 86400   # continuous push failure before a batch is
+#                                    # dead-lettered into the same sqlite db (§2c: 24 h)
 
 # A second site is one more block and one more keychain item — no code change:
 #   security add-generic-password -U -s gateclerk-hikvision -a 192.0.2.11 -j 'user=admin' -w
