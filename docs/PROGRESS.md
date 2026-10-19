@@ -31,6 +31,24 @@ device truth: docs/OBSERVED.md.)
 - Owner decisions still pending: P2-00 spec sign-off (docs/P2-SITE-AGENT.md),
   3-site rollout order. BC/P3 stays closed.
 
+## 2026-10-19 — P1-12 merged (PR #27 -> b2ca061) + live acceptance PASSED (mapping silences warning, records identical)
+
+- Gate: 1150 passed / 5 skipped / 1 deselected merged-tree, ruff clean, CI green. My 4
+  mutants all killed (neuter suppression return -> 7 red; ignore device_tz -> 7 red;
+  always-declared keying -> 4 red; drop from _KNOWN_KEYS -> 14 red), restored clean.
+- LIVE (orchestrator, read-only, on b2ca061): `--site site-a --config <scratch>` with
+  device_tz=Europe/Bucharest. rc 0. chunk 13-14 NOMATCH/0; chunk 14-14:30 200 records=20
+  OK max_serial=47. **stderr: ZERO tz warning lines**; stderr still shows
+  `window_label=device-claimed +02:00` (p1-05c unchanged). Records byte-equivalent to
+  owner's faa1f52 unmapped run: 20 rows serials 27..47, wall 14:08:22..14:20:04, UTC
+  11:08:22+00:00 (site-tz math NOT moved). Provenance intact: tz_offset_mismatch=true
+  20/20, claim 120 vs site 180. `device time` shows tz_mapped_via=Europe/Bucharest.
+  Unmapped counterfactual = owner's own faa1f52 run (one warning line) -> switch proven
+  both sides without extra device calls. Raw jsonl (names) stays in scratch, never in git.
+- tz axis CLOSED. Note for owner: DESIGN.md:356 says sites.toml is committed + "hosts
+  are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
+  committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
+
 ## 2026-10-19 — PRs #26 + #25 merged; owner tz decision carded (P1-12 t_e37dfd68, running)
 
 - PR #26 (P1-11 device-time verdict) -> `99d0c65`: 1128 passed / ruff clean; the None
