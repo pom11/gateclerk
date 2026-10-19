@@ -152,6 +152,66 @@ CREATE TABLE schema_migrations (
 );
 """
 
+# --- P2-04 appends here (v3: push queue; v4: dead-letter) ------------------------------------
+
+_PUSH_QUEUE_V3 = """
+CREATE TABLE push_queue (
+    id INTEGER PRIMARY KEY,
+    -- A send buffer POINTS at a stored event; it is not a second copy of the store.
+    -- RESTRICT (not CASCADE) is the load-bearing choice: deleting an event that has not
+    -- been pushed yet is refused by the db, so no purge can outrun the queue and lose a
+    -- punch with no dead-letter row to account for it (spec §2b: purging is the owner's,
+    -- and it must not be able to do this by accident).
+    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+    -- The bytes to send, copied from events.jsonl at enqueue time: the drain must not
+    -- re-derive the payload (that would put a serialisation step on the send path, and
+    -- P2-02 proved the stored line IS `to_jsonl()` verbatim).
+    payload TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    -- The 24 h clock starts at the FIRST failure and survives a re-enqueue: it measures
+    -- the outage, not the age of this row (spec §2c "continuous failure").
+    first_failed_at TEXT,
+    last_attempt_at TEXT,
+    last_error_class TEXT,
+    -- Due when this is <= now. `attempts` + this column IS the backoff: the drain never
+    -- sleeps, it finds what is due (an agent that slept 30 s would miss the next poll
+    -- window, and a systemd kill would interrupt the sleep anyway).
+    next_attempt_at TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    -- One buffer per (event, target): the overlap poll re-stores the same events every
+    -- 5 minutes and must not grow a second row per poll — that would be a duplicate push.
+    UNIQUE (event_id, endpoint)
+);
+
+-- The drain's query shape is (endpoint, due-by); without this index every 5-min tick
+-- scans the whole backlog.
+CREATE INDEX push_queue_due ON push_queue (endpoint, next_attempt_at);
+"""
+
+_DEAD_LETTER_V4 = """
+CREATE TABLE dead_letter (
+    id INTEGER PRIMARY KEY,
+    -- No FK here, deliberately: a dead-letter row must OUTLIVE the event row (it is the
+    -- record of what could not be sent, and §2b says it is deleted only by the owner's
+    -- command), and a payload-carrying row needs no parent to be readable. `event_id`
+    -- stays for the triage join back to the store.
+    event_id INTEGER NOT NULL,
+    -- §2b: the COMPLETE JSONL payload line, so a replay needs nothing but this table.
+    payload TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    error_class TEXT NOT NULL,
+    attempts INTEGER NOT NULL CHECK (attempts >= 1),
+    first_attempt_at TEXT NOT NULL,
+    last_attempt_at TEXT NOT NULL,
+    -- "replay = re-push, UPSERT makes it safe" (spec §2b): re-failing a replay REFRESHES
+    -- this row instead of duplicating it, so the depth counts distinct pushes.
+    UNIQUE (event_id, endpoint)
+);
+
+CREATE INDEX dead_letter_endpoint ON dead_letter (endpoint);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -168,6 +228,9 @@ MIGRATIONS: tuple[Migration, ...] = (
         # not a usable state, so this entry is "the agent db".
         sql=_EVENTS_V1 + _CHECKPOINT_V1,
     ),
+    # --- P2-04 (the pusher) appends from here; the same forward-only rules apply. ----------
+    Migration(version=3, name="push_queue", sql=_PUSH_QUEUE_V3),
+    Migration(version=4, name="dead_letter", sql=_DEAD_LETTER_V4),
 )
 
 
