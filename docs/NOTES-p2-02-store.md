@@ -31,6 +31,34 @@ WHERE t.jsonl IS NOT excluded.jsonl
   statements and cannot regress the row. Equal also costs 0 (important: a 5-min poll
   with no new events re-advances the same serial every tick and must not churn).
 
+## Migration list (what P2-04 appends to)
+
+Shipped list: v1 `schema_migrations_bookkeeping`, v2 `events_and_checkpoint`
+(v2 is "the agent db": events + checkpoint in one additive entry). **P2-04 appends
+starting at v3** (e.g. v3 `push_queue`, v4 `dead_letter`) — its card calls this the
+"extensible migration seam P2-02 left"; it is pinned by
+test_a_new_migration_appends_and_applies_on_next_open, which appends a fake entry the
+same way P2-04 will and reopens the db. Each entry applies in ONE explicit
+transaction (statements run individually inside an explicit BEGIN — `executescript`
+would commit the BEGIN first), versions must be strictly ascending from 1, and a db
+newer than the code is refused rather than "migrated backwards".
+
+## Mutation probes run (backup+restore, PYTHONDONTWRITEBYTECODE=1, no cacheprovider)
+
+| mutant | caught by |
+|---|---|
+| M1 drop the free-overlap WHERE guard | idempotence + first-contact stamps (2 tests) |
+| M2 checkpoint guard `>` -> `>=` | equal-value no-op pin |
+| M3 `completed` flag ignored | refuses-an-uncompleted pin |
+| M4 regression raise swallowed | never-regresses pin |
+| M5 UPSERT RETURNING drops id | rowid/lookup pins |
+| M6 store re-serialises instead of verbatim | byte-identity pin |
+| M7 watermark `>` -> `>=` | boundary parametrization (3 cases) |
+| M8 migration ascending check removed | SURVIVED the reversed-list test (the start-at-1 guard fired by accident) — fixed by the middle-swap test (1,3,2), which trips ONLY the ascending check |
+
+M8 is the reason the order guard is pinned per-branch (ascending / start-at-1 /
+duplicate / downgrade / mid-entry rollback) instead of by one reversed-list test.
+
 ## Decision the spec leaves open, and how it is handled
 
 `EventRecord.serial_no` is `int | None`, and SQLite's UNIQUE treats NULLs as distinct:
