@@ -26,8 +26,28 @@ device truth: docs/OBSERVED.md.)
   P1-02/04/05/08/09 queued in dependency order. P1-10 live smoke = human-only.
 
 ## Next expected
-- P1 CLOSED (below). P2-00 design-spec card dispatched. Owner decisions queued:
-  device tz/NTP fix (DESIGN item 7), 3-site rollout order, BC/P3 scope (stays closed).
+- P1-12 (device_tz mapping) gate + merge -> orchestrator live read-only re-run
+  (2026-05-21 13:00-14:30, expect no warning + 20 records) -> tz axis closed.
+- Owner decisions still pending: P2-00 spec sign-off (docs/P2-SITE-AGENT.md),
+  3-site rollout order. BC/P3 stays closed.
+
+## 2026-10-19 — PRs #26 + #25 merged; owner tz decision carded (P1-12 t_e37dfd68, running)
+
+- PR #26 (P1-11 device-time verdict) -> `99d0c65`: 1128 passed / ruff clean; the None
+  pin renders "no evidence (device claims nothing)", never agreement (mutant documented).
+- PR #25 (P2-00 decision spec, docs-only) -> `e97d8fe`: 264 lines, 23 OBSERVED/DESIGN
+  citations; ~190 nonce figure correctly attributed to OBSERVED + fw V3.2.30; P2 stays
+  NOT scheduled pending OWNER SIGN-OFF on docs/P2-SITE-AGENT.md.
+- OWNER DECISION: no physical device-clock fix -> per-device `device_tz` mapping in
+  sites.toml (claims +02:00, actually Europe/Bucharest); mapped zone authoritative,
+  warning silenced for the known-wrong claim, provenance fields untouched. Carded
+  **t_e37dfd68 (P1-12)** (config.py SiteConfig/_KNOWN_KEYS, cli warning + verdict
+  surfaces; tz.py/tz_mismatch.py/paging/model NOT touched; tests: mapped/unmapped/DST
+  both sides + mutants). Note: gateway dispatcher idle ~3min; `hermes kanban dispatch`
+  manually spawned it (dry-run first, then spawn confirmed + worktree up).
+- AFTER MERGE (orchestrator, read-only per standing rule): live re-run of
+  2026-05-21 13:00-14:30 against .243 with the mapping configured -> expect NO warning
+  + same 20 records (serials 27..47).
 
 ## 2026-10-18 night — P1 CLOSED: dense-window live re-run passed on faa1f52
 
