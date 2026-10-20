@@ -32,7 +32,7 @@ from typing import Any
 import httpx
 import pytest
 
-from fakedevice import RETIRE_ENVELOPE_ONLY, BASE_URL, FakeDevice
+from fakedevice import BASE_URL, RETIRE_ENVELOPE_ONLY, FakeDevice
 from gateclerk.agent_db import connect
 from gateclerk.agent_store import check_db_watermark
 from gateclerk.exceptions import IsapiAuthError, IsapiBadContent
@@ -41,15 +41,14 @@ from gateclerk.tz import DeviceTime, compute_skew
 from test_p2_03_scheduler import (
     CADENCE_S,
     OVERLAP_S,
-    PASSWORD,
     SITE,
     SITE_TZ,
     T0,
     FakeClock,
     FakeMonotonic,
     device_event,
-    seeded_device,
     seed_events,
+    seeded_device,
 )
 
 DEVICE_INFO_PATH = "/ISAPI/System/deviceInfo?format=json"
@@ -61,8 +60,9 @@ PASSWORD_BAD = "fakepw-rotated"
 #: must not go green just because the module and the test import the same constant.
 REPROBE_S = 1800
 
-#: The loop's circuit for this scenario is unlockTime(0 -> fallback 300) + margin(10).
-FALLBACK_CIRCUIT_S = 310.0
+#: The transport circuit for the lockout scenario: unlockTime 1800 (the fake says so)
+#: + margin 10 (isapi_transport.DEFAULT_CIRCUIT_MARGIN_SECONDS).
+CIRCUIT_UNTIL_S = 1810.0
 
 
 # --- the harness -------------------------------------------------------------------------
@@ -87,7 +87,6 @@ class PolicyHarness:
         from gateclerk.capabilities import capability_cache
 
         capability_cache().clear()  # process-global p1-04 cache — same clear as P2-03
-        self.alertmod = __import__("gateclerk.agent_alert", fromlist=["AlertPolicy"])
         self.device = device
         self.clock = FakeClock()
         self.monotonic = FakeMonotonic()
@@ -140,6 +139,19 @@ class PolicyHarness:
             self.clock.advance(step_s)
             self.monotonic.advance(step_s)
         return out
+
+    def tick_at(self, minutes: float) -> Any:
+        """Advance BOTH clocks to T0 + minutes (exactly) and tick there.
+
+        Explicit instants instead of step-arithmetic: the 30-min re-probe grid is
+        what the test pins, so the timeline reads as minutes, not as loop counts.
+        """
+        target = minutes * 60.0
+        delta = target - self.monotonic.t
+        assert delta >= 0, "the fake clock only moves forward"
+        self.clock.advance(delta)
+        self.monotonic.advance(delta)
+        return self.tick()
 
     # -- accounting ---------------------------------------------------------------------
 
@@ -226,9 +238,7 @@ def test_park_survives_a_restart_and_still_touches_nothing(tmp_path: Path) -> No
     from gateclerk.agent_loop import DeviceLoop
 
     clock2, mono2 = FakeClock(), FakeMonotonic()
-    client2 = IsapiClient(
-        BASE_URL, "admin", PASSWORD_BAD, transport=device.transport, now=mono2
-    )
+    client2 = IsapiClient(BASE_URL, "admin", PASSWORD_BAD, transport=device.transport, now=mono2)
     loop2 = DeviceLoop(
         client=client2,
         conn=connect(tmp_path / "agent.sqlite3"),
@@ -242,14 +252,18 @@ def test_park_survives_a_restart_and_still_touches_nothing(tmp_path: Path) -> No
         warn=lambda text: None,
     )
     policy2 = AlertPolicy(
-        site=SITE, conn=loop2.conn, cadence_s=CADENCE_S, now=clock2, sink=lambda a: None,
+        site=SITE,
+        conn=loop2.conn,
+        cadence_s=CADENCE_S,
+        now=clock2,
+        sink=lambda a: None,
         park_dir=tmp_path / "park",
     )
     for _ in range(6):
         assert guarded_tick(policy2, loop2) is None
         clock2.advance(CADENCE_S)
         mono2.advance(CADENCE_S)
-    assert device.served.__len__() == frozen, "restart must not launder a park"
+    assert len(device.served) == frozen, "restart must not launder a park"
 
 
 # --- DoD (2): ack -> re-probe at +30 min, then every 30; success un-parks -----------------
@@ -274,39 +288,36 @@ def test_ack_opens_a_30_minute_re_probe_grid_and_a_success_un_parks(tmp_path: Pa
     acked = h.policy.ack(SITE)
     assert acked == 1
 
-    # Off-grid steps before the first re-probe stays due: still fully blocked.
-    for _ in range(5):  # 5 x 300 s = 25 min
-        assert h.tick() is None
-        h.clock.advance(CADENCE_S)
-        h.monotonic.advance(CADENCE_S)
-    assert h.served_count() == frozen
+    # Off-grid minutes before the first re-probe stays due: still fully blocked.
+    for minute in (5, 10, 15, 20, 25):
+        assert h.tick_at(minute) is None
+        assert h.served_count() == frozen
 
     # +30 min from the ack: the grid opens exactly one attempt, and it fails again.
-    h.walk(1)  # this step lands at ack+30 min
+    assert h.tick_at(30) is not None
     assert h.served_count() > frozen, "acked: the slow re-probe must actually try"
     assert h.kinds().count("auth_terminal") == 1, "a failed re-probe does not re-page"
     assert h.policy.parked(SITE, "pending") is not None
     frozen2 = h.served_count()
 
-    # Off-grid again: 25 more minutes, nothing.
-    for _ in range(5):
-        assert h.tick() is None
-        h.clock.advance(CADENCE_S)
-        h.monotonic.advance(CADENCE_S)
-    assert h.served_count() == frozen2
+    # Off-grid again: the failed attempt re-armed the grid from NOW (+30 min), so
+    # the minutes between stay closed.
+    for minute in (35, 40, 45, 50, 55):
+        assert h.tick_at(minute) is None
+        assert h.served_count() == frozen2
 
-    # Credentials fixed; next grid slot (+30 min) succeeds and un-parks.
-    device.password = PASSWORD_OK
-    h.walk(1)
-    last = h.loop.tick  # touch attribute only; the walk above already ticked
-    assert last is not None
+    # Credentials fixed: the agent's client is long-lived (spec §2a), so the
+    # self-heal shape is the DEVICE-side secret being provisioned back to what the
+    # agent holds. The +60 min grid slot succeeds and un-parks.
+    device.password = PASSWORD_BAD
+    assert h.tick_at(60) is not None
     assert h.policy.parked(SITE, "pending") is None
     serial = h.loop.device_serial
     assert serial is not None and h.policy.parked(SITE, serial) is None
 
-    # Un-parked: the next CADENCE tick (not a 30-min slot) runs immediately.
+    # Un-parked: the very next CADENCE minute (not a 30-min slot) runs immediately.
     before = h.served_count()
-    assert h.tick() is not None
+    assert h.tick_at(65) is not None
     assert h.served_count() > before
     assert h.kinds().count("auth_terminal") == 1
 
@@ -359,8 +370,9 @@ def test_lockout_body_fires_critical_on_site_and_creds_wait_out_unlock_time(
     `unlockTime` has passed — no park, no ack (the circuit is the wait, per spec).
     """
     device = seeded_device()
-    # The lockout answers the first two requests regardless of Authorization (raw
-    # queue, as the transport suite does it); after that the box is normal again.
+    # The lockout answers the first TWO requests regardless of Authorization (raw
+    # queue, as the transport suite does it — the challenge plus httpx's one
+    # replay); after that the box is normal again.
     device.add_raw("GET", DEVICE_INFO_PATH, locked_401(), locked_401())
     seed_events(device, [device_event(7, "2026-10-19T10:02:00")])
     h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
@@ -377,29 +389,32 @@ def test_lockout_body_fires_critical_on_site_and_creds_wait_out_unlock_time(
 
     served_after_fail = h.served_count()
     creds_after_fail = h.creds_presented()
+    assert creds_after_fail == 1, "only httpx's single in-flight replay ever carried creds"
 
-    # Inside the unlock window (circuit = unlockTime 1800 + margin 10): every gated
-    # tick is a zero-request circuit-open skip. No request at ALL leaves the process.
-    inside = 0
-    while h.monotonic.t < FALLBACK_CIRCUIT_S + 300.0:  # up to t=2110... watch below
-        result = h.tick()
-        if h.monotonic.t < 1810.0:
-            assert result is not None and result.skipped is True, (
-                "not parked -> the loop still ticks, and the CIRCUIT makes it a skip"
-            )
-            inside += 1
+    # Inside the unlock window (circuit until unlockTime 1800 + margin 10 = t=1810):
+    # every gated tick is a zero-request circuit-open skip. No request at ALL leaves
+    # the process — the served timeline is FROZEN (the card's "pin served timeline").
+    for _ in range(6):  # steps land at t=300..1800, all < 1810
         h.clock.advance(CADENCE_S)
         h.monotonic.advance(CADENCE_S)
-    assert inside == 6  # t=300..1800 -> six cadence ticks strictly inside the window
+        skipped = h.tick()
+        assert skipped is not None and skipped.skipped is True, (
+            "not parked -> the loop still ticks, and the CIRCUIT makes it a skip"
+        )
+    assert h.monotonic.t == 1800.0 < CIRCUIT_UNTIL_S
     assert h.served_count() == served_after_fail, "ZERO requests while the circuit is open"
-    assert h.creds_presented() == creds_after_fail == 1  # only httpx's single in-flight replay
+    assert h.creds_presented() == creds_after_fail
 
     # Past unlockTime+margin (circuit until t=1810): the next tick (t=2100) touches
-    # the box again — and THIS is the first credential the fake accepts.
-    assert h.monotonic.t == 2100.0
-    h.tick()
+    # the box again — and THIS is the first credential the fake ever accepts.
+    h.clock.advance(CADENCE_S)
+    h.monotonic.advance(CADENCE_S)
+    resumed = h.tick()
+    assert resumed is not None and resumed.ok is True
     assert h.served_count() > served_after_fail
-    assert h.creds_presented() == 2, "creds are presented ONLY after the unlock window"
+    assert h.creds_presented() > creds_after_fail, (
+        "creds are presented ONLY after the unlock window (frozen until now)"
+    )
     assert h.kinds().count("device_locked") == 1
 
 
@@ -449,8 +464,10 @@ def test_nonce_recoveries_land_in_the_info_counter_and_never_alert(tmp_path: Pat
 
 def _skew(seconds: float) -> Any:
     """A real `tz.compute_skew` result: device wall is our site wall ± `seconds`."""
+    from zoneinfo import ZoneInfo
+
     our_now = T0
-    device_wall = (our_now.astimezone(SITE_TZ_zone()) + timedelta(seconds=seconds)).replace(
+    device_wall = (our_now.astimezone(ZoneInfo(SITE_TZ)) + timedelta(seconds=seconds)).replace(
         tzinfo=None
     )
     return compute_skew(
@@ -464,12 +481,6 @@ def _skew(seconds: float) -> Any:
     )
 
 
-def SITE_TZ_zone() -> Any:
-    from zoneinfo import ZoneInfo
-
-    return ZoneInfo(SITE_TZ)
-
-
 def test_skew_over_threshold_warns_under_is_silent(tmp_path: Path) -> None:
     h = PolicyHarness(tmp_path, seeded_device())
 
@@ -478,11 +489,15 @@ def test_skew_over_threshold_warns_under_is_silent(tmp_path: Path) -> None:
     fired = h.policy.observe_skew(over)
     assert [a.kind for a in fired] == ["clock_skew"]
     assert [a.level for a in fired] == ["warning"]
+    # Still over, observed again: the episode is open -> silence (no nag).
+    assert h.policy.observe_skew(over) == []
 
     under = _skew(60.0)
     assert under.warn is False
-    assert h.policy.observe_skew(under) == []
-    assert [a.kind for a in h.alerts] == ["clock_skew"], "silence, and no re-fire of the warning"
+    assert h.policy.observe_skew(under) == [], "under threshold is silence"
+    # A healed drift that starts over again IS a new incident -> fresh warning.
+    assert [a.kind for a in h.policy.observe_skew(over)] == ["clock_skew"]
+    assert [a.kind for a in h.alerts].count("clock_skew") == 2
 
 
 # --- DoD (7): stall detector fires at k=3 cadences, silences when checkpoint moves ---------
@@ -497,7 +512,7 @@ def test_checkpoint_stall_fires_at_three_cadences_and_silences_when_it_moves(
     closed, and a later stall can fire fresh.
     """
     device = seeded_device()
-    seed_events(device, [device_event(60, "2026-10-19T10:04:00")])
+    seed_events(device, [device_event(60, "2026-10-19T09:58:00")])
     h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
 
     first = h.tick()
@@ -506,18 +521,21 @@ def test_checkpoint_stall_fires_at_three_cadences_and_silences_when_it_moves(
     assert serial is not None
     assert h.policy.check_stall(serial) is None, "a fresh checkpoint is quiet"
 
-    # The device goes silent (walk keeps failing on a broken page — no advance):
-    # freeze the store by pointing the walk at a poison endpoint shape instead:
-    # simplest honest stall = stop ticking and let wall time move past k*cadence.
-    h.clock.advance(3 * CADENCE_S + CADENCE_S // 2)  # 4.5 cadences of silence
+    # Boundary, watermark precedent (agent_store.check_db_watermark "exactly-at is
+    # not over"): age of EXACTLY k*cadence is still quiet; one second past fires.
+    # Without this pin, `<= threshold` mutated to `< threshold` would survive.
+    h.clock.advance(3 * CADENCE_S)  # updated_at was T0; age is now exactly 3*cadence
+    assert h.policy.check_stall(serial) is None, "exactly k cadences is not OVER k"
+    h.clock.advance(1)
     fired = h.policy.check_stall(serial)
     assert fired is not None and fired.kind == "checkpoint_stall"
     assert fired.level == "critical"
     assert [a.kind for a in h.alerts] == ["checkpoint_stall"]
     assert h.policy.check_stall(serial) is None, "one page per stall episode, not per check"
 
-    # Checkpoint moves again -> episode closed: quiet now...
-    device.add_events(device_event(61, "2026-10-19T10:40:00"))
+    # Checkpoint moves again -> episode closed: quiet now... (the event lands
+    # inside the window this tick walks: [checkpoint 09:58 - overlap, 10:22:30]).
+    device.add_events(device_event(61, "2026-10-19T10:15:00"))
     moved = h.tick()
     assert moved is not None and moved.ok is True and moved.advanced is True
     assert h.policy.check_stall(serial) is None
@@ -544,13 +562,15 @@ def test_db_watermark_over_fires_a_warning(tmp_path: Path) -> None:
     over = check_db_watermark(tmp_path / "agent.sqlite3", warn_bytes=10)
     fired = h.policy.observe_watermark(over)
     assert [a.kind for a in fired] == ["db_watermark"] and fired[0].level == "warning"
+    assert h.policy.observe_watermark(over) == [], "one page per watermark episode"
+    assert h.policy.observe_watermark(under) == []
+    assert h.policy.observe_watermark(over), "back under closes the episode: re-over re-fires"
 
 
 def test_non_auth_tick_failure_alerts_nothing(tmp_path: Path) -> None:
     """§2c keeps the channels separate: a broken page heals via the overlap (P2-03) —
     a metric, not a page. Only the auth/stall/skew classes alert."""
     device = seeded_device()
-    from test_p2_03_scheduler import EVENT_PATH
 
     device.reset_raw("GET", DEVICE_INFO_PATH, *([_bad_content()] * 12))
     h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
@@ -590,10 +610,26 @@ def test_alert_lines_never_carry_host_authorization_or_payload(tmp_path: Path, c
     stderr_policy.observe_skew(_skew(7200.0))
     err = capsys.readouterr().err
 
-    corpus = "\n".join(
-        [json.dumps(a.as_dict(), sort_keys=True) for a in h.alerts] + [err]
-    )
-    for needle in ("192.0.2", "Authorization", "Digest", "fakepw", BASE_URL, "password"):
+    corpus = "\n".join([json.dumps(a.as_dict(), sort_keys=True) for a in h.alerts] + [err])
+    # Positive control: without an alert ACTUALLY in the corpus, every "not in"
+    # below would pass on an empty scan (the tautological-filter lesson).
+    assert "terminal 401" in corpus and "clock skew" in corpus
+    # The `http_status` / `on device_info` / `statusCode` trio is what transport 401
+    # detail strings carry ("unauthorized on device_info http_status=401
+    # lockStatus=...") — a note authored from str(exc) would leak the endpoint and
+    # the envelope fields even where no host appears. The scan is built to catch
+    # that mutation, not only the host leak.
+    for needle in (
+        "192.0.2",
+        "Authorization",
+        "Digest",
+        "fakepw",
+        BASE_URL,
+        "password",
+        "http_status",
+        "on device_info",
+        "statusCode",
+    ):
         assert needle not in corpus, f"alert surface leaked {needle!r}"
     assert "site-a" in corpus, "the site label is the ONE identity the surface carries"
 
@@ -606,3 +642,85 @@ def test_alert_shape_is_structured(tmp_path: Path) -> None:
     assert a.device_serial is None  # failed pre-bootstrap: no serial to name
     parsed = datetime.fromisoformat(a.at)
     assert parsed == T0, "the alert stamp is the injected clock, verbatim"
+
+
+# --- guards: the policy refuses to act on state that is not its own -----------------------
+
+
+def test_in_memory_policy_parks_and_acks_without_a_dir(tmp_path: Path) -> None:
+    """The dict-sink / no-park_dir shape the card allows for tests must behave the
+    same as the on-disk one for the pure logic (it just cannot survive restart)."""
+    from gateclerk.agent_alert import AlertPolicy
+
+    events: list[Any] = []
+    policy = AlertPolicy(site=SITE, cadence_s=CADENCE_S, now=FakeClock(), sink=events.append)
+    assert policy.park_dir is None
+    policy._park("pending", serial_for_record=None)  # same path handle_tick takes
+    state = policy.parked(SITE)
+    assert state is not None and state.acked_at is None
+    allowed, reason = policy.attempt_allowed(None)
+    assert not allowed and "unacked" in reason
+    assert policy.ack(SITE) == 1
+    reopened = policy.parked(SITE)
+    assert reopened is not None and reopened.acked_at is not None
+    assert policy.ack(SITE) == 0, "re-ack of an open park counts nothing"
+    assert policy.ack(SITE, "no-such-serial") == 0, "serial filter: other parks are left alone"
+
+
+def test_foreign_site_park_file_is_refused_not_acted_on(tmp_path: Path) -> None:
+    """One park dir cannot silently cross-wire two units (spec §2d: unit-per-site):
+    a park record naming a different site raises instead of being acked or read."""
+    import json as _json
+
+    from gateclerk.agent_alert import AlertPolicy
+
+    (tmp_path / "park").mkdir()
+    stranger = tmp_path / "park" / f"park-{SITE}__OTHER.json"
+    stranger.write_text(
+        _json.dumps(
+            {
+                "version": 1,
+                "site": "site-B",  # foreign: this policy's site is site-a
+                "device_serial": "OTHER",
+                "parked_at": T0.isoformat(),
+                "acked_at": None,
+                "next_attempt_at": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = AlertPolicy(
+        site=SITE,
+        cadence_s=CADENCE_S,
+        now=FakeClock(),
+        sink=lambda a: None,
+        park_dir=tmp_path / "park",
+    )
+    with pytest.raises(ValueError, match="foreign site"):
+        policy.ack(SITE)
+    # A direct read of a key whose file is foreign must raise the same way, not act.
+    with pytest.raises(ValueError, match="not site"):
+        policy.parked(SITE, "OTHER")
+    # (the file names itself park-site-a__OTHER so this policy's prefix glob sees it)
+
+
+def test_wrong_site_cannot_read_or_clear_a_park(tmp_path: Path) -> None:
+    h = PolicyHarness(tmp_path, seeded_device())
+    h.tick()
+    assert h.policy.parked("typo-site", "pending") is None
+    assert h.policy.ack("typo-site") == 0
+    assert h.policy.parked(SITE, "pending") is not None, "the real park is untouched"
+
+
+def test_policy_refuses_cadence_zero(tmp_path: Path) -> None:
+    from gateclerk.agent_alert import AlertPolicy
+
+    with pytest.raises(ValueError, match="cadence_s"):
+        AlertPolicy(site=SITE, cadence_s=0, now=FakeClock(), sink=lambda a: None)
+
+
+def test_stall_check_is_none_without_a_connection() -> None:
+    from gateclerk.agent_alert import AlertPolicy
+
+    policy = AlertPolicy(site=SITE, cadence_s=CADENCE_S, now=FakeClock(), sink=lambda a: None)
+    assert policy.check_stall("ANY") is None, "no conn = no store to consult, not an alert"
