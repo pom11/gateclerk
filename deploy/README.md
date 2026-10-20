@@ -50,9 +50,18 @@ committed here by accident.
 ```
 sudo useradd --system --home-dir /var/lib/gateclerk --shell /usr/sbin/nologin gateclerk
 sudo install -d -m 0750 -o gateclerk -g gateclerk /var/lib/gateclerk
+sudo install -d -m 0770 -o gateclerk -g gateclerk /var/lib/gateclerk/site-a     # <STATE_ROOT>/<SITE>
 sudo install -d -m 0755 -o root     -g root     /etc/gateclerk/credentials
-uv tool install gateclerk          # or: uv sync inside a checkout of this repo
+uv venv /opt/gateclerk/venv --python 3.12          # the venv whose bin/gateclerk is <EXEC_START>
+uv pip install --python /opt/gateclerk/venv/bin/python /path/to/this/checkout
+/opt/gateclerk/venv/bin/gateclerk --version
 ```
+
+Create the site's state dir before the first start: the store layer
+(`gateclerk.agent_store.store_events`) takes an already-open sqlite connection, so opening the
+store is the caller's job — the CLI that does it is P2-07b, and `ProtectSystem=strict` means
+a directory the unit does not have cannot be created by the agent at all. `ReadWritePaths`
+opens exactly this one directory.
 
 `/var/lib/gateclerk` is the `<STATE_ROOT>` of the template: the unit's `WorkingDirectory`, and
 the parent of the one writable path (`ReadWritePaths=<STATE_ROOT>/<SITE>` — that site's
@@ -106,6 +115,28 @@ systemd-run --wait --property "ReadWritePaths=/var/lib/gateclerk/site-a" \
 under `Restart=always`, becomes a five-second poll of a door controller — the hammering
 spec §1.9 forbids. `RestartSec=5` is for crashes, not for a happy exit.)
 
+### Where the state files actually come from
+
+Both flags on that line belong to `gateclerk agent`, which is P2-07b. The one that is worth
+understanding **today**, because it decides whether the unit's hardening works, is the store
+location:
+
+- `sites.toml`'s `db_path` defaults to `./gateclerk-<site>.sqlite3`
+  (`config.DEFAULT_DB_PATH_TEMPLATE`) — a **relative** path, so it resolves against the
+  process's working directory. That is why the unit sets `WorkingDirectory=<STATE_ROOT>` and
+  why `ReadWritePaths` is `<STATE_ROOT>/<SITE>`: the agent must be writing inside the one
+  path the mount policy opens, or `ProtectSystem=strict` turns the first write into a failure
+  (`Restart=always` then loops it, which is the loud outcome we want).
+- `--state-root <STATE_ROOT>/<SITE>` is the P2-07b flag that says the same thing explicitly
+  and also relocates the `park/` dir (P2-05's policy creates it itself —
+  `agent_alert.AgentAlertPolicy._write_park` does `mkdir(parents=True, exist_ok=True)`, which
+  works because the site's state dir is the one writable path). On Linux there is no log dir
+  at all: `StandardOutput=journal` sends the alerts to journald. The launchd example is the
+  case that wants `<state dir>/logs/`, because it redirects to files there.
+
+Either way, exactly one directory is writable and it is named in the unit file. There is no
+search path, no fallback location and no default endpoint anywhere in this install.
+
 ## 3. Provision the credential, then prove it
 
 One root-owned 0600 file per device, named with the `gateclerk-<site>-<host>` reference:
@@ -143,9 +174,17 @@ Prove the secret reached the service without printing it:
 
 ```
 sudo systemctl restart gateclerk-agent@site-a
-sudo systemd-creds list gateclerk-agent@site-a        # names, sizes — never contents
-sudo systemd-run --wait --property LoadCredential=demo:/etc/hostname /bin/sh -c \
-     'cat "$CREDENTIALS_DIRECTORY/demo"'             # the shape the agent sees
+journalctl -u gateclerk-agent@site-a -n 5          # a missing credential is a loud start failure
+sudo systemctl show gateclerk-agent@site-a -p LoadCredential   # names + source paths, never values
+sudo systemd-run --wait --property LoadCredential=demo:/etc/hostname \
+     /bin/sh -c 'cd "$CREDENTIALS_DIRECTORY" && ls -l && wc -c demo'
+```
+
+`systemd-creds` (v250+) is the same proof from *inside* a service context — it lists the
+names and sizes of `$CREDENTIALS_DIRECTORY` and never a value:
+
+```
+sudo systemd-run --wait --property LoadCredential=demo:/etc/hostname /usr/bin/systemd-creds list
 ```
 
 The agent reads `$CREDENTIALS_DIRECTORY/gateclerk-<site>-<host>` and feeds it to the

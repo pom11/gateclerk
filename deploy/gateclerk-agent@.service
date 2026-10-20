@@ -121,9 +121,12 @@ LoadCredential=gateclerk-<SITE>-<HOST>:/etc/gateclerk/credentials/gateclerk-<SIT
 # is no code path here that would WANT a write to /usr or /etc.
 NoNewPrivileges=yes
 ProtectSystem=strict
-# The ONE writable location: this site's sqlite store + WAL sidecars, its park dir and its
-# log dir under <STATE_ROOT>/<SITE>. The installer creates it; the agent creates it too,
-# which is what makes a fresh box startable.
+# The ONE writable location: this site's sqlite store + WAL sidecars and its park dir under
+# <STATE_ROOT>/<SITE>. The installer creates the directory (deploy/README.md step 1 —
+# `gateclerk.agent_store` takes an already-open sqlite connection, so opening the store is the
+# caller's job, and until P2-07b ships the CLI that does it does not exist; systemd will not
+# invent a ReadWritePaths= target for you). The park dir itself is made by P2-05's policy.
+# Alerts go to journald, not to a file, so no log dir is needed here.
 ReadWritePaths=<STATE_ROOT>/<SITE>
 ProtectHome=yes
 PrivateTmp=yes
