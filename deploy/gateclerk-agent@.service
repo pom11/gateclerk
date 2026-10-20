@@ -1,0 +1,154 @@
+# gateclerk-agent@.service — the P2 site agent, ONE systemd unit per site.
+#
+# What this is: the deploy template owned by card P2-07a (docs/P2-SITE-AGENT.md §2d +
+# §6(d), DECIDED 2026-10-19: "systemd LoadCredential= unit-per-site
+# gateclerk-agent@<site>.service, naming gateclerk-<site>-<host>"). The instance name IS the
+# site name and is the only argument the agent needs: one site = one unit = one sqlite
+# store = one push target. Agent hosts are Linux (this file) or Windows
+# (deploy/README.md); macOS is the dev box and gets the EXAMPLE plist, not a product.
+#
+# The agent itself is read-only against devices (DESIGN.md "Constraints"): it polls ISAPI,
+# stores to sqlite, pushes JSONL to the site's abstract ingest target, and never writes
+# to a door.
+#
+# RENDER, DO NOT COPY-BLIND. systemd expands only its own specifiers (%i below); the
+# angle-bracket tokens are expanded by the operator (deploy/README.md step 2 shows a
+# one-line sed, and `systemd-run` proves the render before it is installed):
+#   %i              systemd's instance specifier = the site name (systemd expands this)
+#   <SITE>          the same site name, in the state dir and the credential names
+#   <HOST>          this site's device host — config (sites.toml), never a secret
+#   <STATE_ROOT>    parent of each site's state dir; the one writable location
+#   <CONFIG_PATH>   the sites.toml this unit reads (refs only, never values)
+#   <EXEC_START>    the gateclerk entry point of the venv it was installed into
+# A unit installed with a token still in it fails at ExecStart — the loud failure this
+# file wants, because a silently wrong path is a dead agent losing punches.
+#
+# No real host, IP or secret appears in this file, on purpose: it is committed. Device
+# hosts are config, passwords are credentials (see below). RFC 5737 TEST-NET addresses
+# (192.0.2.0/24) are the only addresses used anywhere in this file.
+
+[Unit]
+Description=gateclerk site agent for %i (read-only Hikvision attendance poller)
+Documentation=https://github.com/pom11/gateclerk/blob/main/deploy/README.md
+# The agent needs the site LAN before it starts. network-online is the honest dependency:
+# a LAN that is briefly down is a tick failure the overlap window heals (spec §1.3), not a
+# reason the unit should never come up.
+After=network-online.target
+Wants=network-online.target
+# Order matters: provision the credential source files (and the LoadCredential= lines,
+# rendered in or dropped in) BEFORE `systemctl enable --now`. Starting without them parks
+# the site on a terminal 401 and burns the device's lockout budget for nothing
+# (OBSERVED.md "lockout accounting"), so the agent refuses to guess a credential.
+
+[Service]
+Type=simple
+# A dedicated unprivileged account: the agent owns nothing but its state dir, and the
+# credential source files stay root-owned 0600 (systemd reads them before dropping privs).
+User=gateclerk
+Group=gateclerk
+# Relative `db_path` values (and the derived ./gateclerk-<SITE>.sqlite3 from
+# config.DEFAULT_DB_PATH_TEMPLATE) resolve here, so the working dir and the state dir are
+# the same place, once, named in the README.
+WorkingDirectory=<STATE_ROOT>
+# One state dir per site, named by the instance: a box running two sites then has two
+# stores, two WAL sets, two park dirs and two log dirs that a restart cannot cross.
+#
+# NO `--once` HERE. `--once` does one tick and exits, which under `Restart=always` becomes
+# a five-second poll of a door controller — precisely the hammering spec §1.9 forbids.
+# Smoke-test the same line by hand first (deploy/README.md step 3):
+#   <EXEC_START> agent run --site <SITE> --config <CONFIG_PATH> --state-root <STATE_ROOT>/<SITE> --once
+ExecStart=<EXEC_START> agent run --site %i --config <CONFIG_PATH> --state-root <STATE_ROOT>/<SITE>
+
+# --- lifecycle: the unit is the supervisor, the on-disk park is the memory -------------
+#
+# Restart=always + RestartSec=5 (spec §2d): a crash, an OOM kill or a reboot brings the
+# poller back on its own, because a dead agent means silent punch loss (OBSERVED.md: the
+# device log ring rolls over). The restart must NOT be able to re-present dead credentials
+# to a lockout-counting device — which is why the P2-05 park lives on DISK
+# (<STATE_ROOT>/<SITE>/park, outside the sqlite store) and why an unacked park still
+# blocks every tick after a restart, until `gateclerk agent ack`.
+Restart=always
+RestartSec=5
+# SIGTERM is the loop's cue to close the client and the db. A tick is at most one
+# chunk-walk long and the checkpoint advances only over completed chunks (spec §1.2), so a
+# kill between chunks is already safe and 30 s is generous.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# --- credentials: this unit file carries REFERENCES, never values ----------------------
+#
+# The one rule of spec §2d, expressed as one line. The credential REFERENCE for a device
+# is `gateclerk-<site>-<host>` — produced by `gateclerk.config.credential_ref(site, host)`, a
+# helper rather than a prose convention so the pusher, the alert policy and this file
+# cannot drift apart by hand-crafted strings. The line below carries a NAME and a PATH:
+LoadCredential=gateclerk-<SITE>-<HOST>:/etc/gateclerk/credentials/gateclerk-<SITE>-<HOST>.txt
+#
+# The source file holds the password, is root-owned and not world-readable:
+#   sudo install -m 0600 -o root -g root /path/to/secret \
+#        /etc/gateclerk/credentials/gateclerk-<SITE>-<HOST>.txt
+# (deploy/README.md: provisioning, rotation, and the `systemd-creds` check that proves it.)
+#
+# WHY the source is not under /run: /run is tmpfs, so a credential placed there is gone at
+# the next reboot and `Restart=always` would restart the unit into a missing credential
+# forever. systemd's own runtime directory ($CREDENTIALS_DIRECTORY, the %d specifier) is
+# where it EXPOSES loaded credentials to the service, one 0400 file per NAME — the operator
+# does not write there.
+#
+# There is deliberately no SetCredential= line and no Environment= line here: unit files
+# are world-readable, so a literal secret in one is a published secret. When no
+# credentials directory exists — a dev laptop, a launchd job, a hand-run smoke test — the
+# resolver's own rungs still work unchanged: flag > env > keychain (gateclerk.config), the
+# env rung being `GATECLERK_<HOST-sanitized>_PASSWORD` and the keychain item being service
+# `gateclerk-hikvision` with account = the host.
+#
+# TWO INSTALL PATHS, because a template unit is shared by every site on the box and the
+# credential name embeds the device host, which systemd cannot know (%i is the SITE; the
+# host lives in sites.toml, a file systemd never reads):
+#
+#   1. render this file per site, replacing <SITE> and <HOST> — the line above becomes
+#      real, one device per render; or
+#   2. install this file as the shared template and add a per-site drop-in
+#      /etc/systemd/system/gateclerk-agent@<SITE>.service.d/10-credentials.conf
+#      carrying one LoadCredential= line per device of the site. A drop-in survives a
+#      package update of the template, which is why provisioning goes there.
+# Both paths are pinned by tests/test_deploy_templates.py.
+
+# --- hardening: the read-only promise, expressed as mount policy -----------------------
+#
+# NoNewPrivileges + ProtectSystem=strict: the agent cannot escalate and cannot write
+# anywhere except the path named below. Everything device-facing is a GET or one of the
+# two stateless searches (gateclerk.endpoints is the registry and CI enforces it), so there
+# is no code path here that would WANT a write to /usr or /etc.
+NoNewPrivileges=yes
+ProtectSystem=strict
+# The ONE writable location: this site's sqlite store + WAL sidecars, its park dir and its
+# log dir under <STATE_ROOT>/<SITE>. The installer creates it; the agent creates it too,
+# which is what makes a fresh box startable.
+ReadWritePaths=<STATE_ROOT>/<SITE>
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_INET/AF_INET6 for the device poll and the HTTPS push leg; AF_UNIX for systemd
+# credentials and the journal. No packet sockets, no raw sockets: a door-credential reader
+# has no use for them.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
+# journald is the alert sink P2-05's default writes to: one stderr line per page carrying
+# level, site label, kind and serial — never a host, never a payload, never Authorization.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gateclerk-agent-%i
+
+[Install]
+WantedBy=multi-user.target
