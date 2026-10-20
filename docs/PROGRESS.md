@@ -49,6 +49,24 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-20 — P2-06 merged (#33 -> 89e10d1); P2-07 STALLED 9.7h -> reclaimed + split (P2-07a/b running)
+
+- PR #33 (healthz/metrics) merged: 1369 passed / ruff / CI green. Vocab contract =
+  sorted-name set equality vs spec (rename mutant -> red); no-fabrication (events_per_day
+  None; fabricate-0 mutant -> red); degraded real (neuter circuit-open -> red). 8-line
+  agent_loop touch = additive TickResult.termination (accepted; only way to carry
+  search_termination without re-walking).
+- P2-07 (deploy+CLI) RECLAIMED after 9.7h: 0 commits; last write 18:47 (heartbeats
+  alive = wedged, not dead); kanban log shows the loop: 20+ min re-deriving how to seed
+  FakeDevice wall digits vs real now for `agent run --once`. Partial (agent_deploy.py
+  1194L, templates, cli +261L) snapshotted to scratch/p2-07-partial/. Split:
+  **P2-07a templates-only** (t_5253d2ba, no runtime code) + **P2-07b agent CLI**
+  (t_ea27e604, clock seam PRE-DECIDED: injected now + wall = UTC + claimed, timebox +
+  BLOCK-instead-of-loop). Both running; canary now gated on both halves.
+- Lesson for cards: when a DoD test needs fake-clock coordination, the card must
+  STATE the seam (worker re-deriving foundations = wedge). Also: 0-commit + live
+  heartbeats + stale mtimes = wedged reasoning loop -> steer/reclaim at ~2h, not 9.
+
 ## 2026-10-19 — P2-05 alerts/park merged (PR #32 -> e5eddd4)
 
 - 1345 passed / ruff / CI green. Lockout-safety core = attempt_allowed hard gate:
