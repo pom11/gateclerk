@@ -434,6 +434,55 @@ def test_circuit_open_device_makes_degraded_and_names_the_serial(tmp_path: Path)
     assert "status: degraded" in text and SERIAL in text
 
 
+def test_two_park_episodes_anchor_the_second_at_its_own_first_sight(
+    tmp_path: Path,
+) -> None:
+    """Episode 2's parked age must NOT inherit episode 1's anchor (anti-M2 pin).
+
+    All real, no synthetic ticks: a locked 401 parks the circuit (episode 1's failing
+    tick anchors it — `TickResult.circuit_open` is read after the raise, so the tick
+    that opened the circuit reports it), the unlock window passes on the injected
+    clocks, the next tick is genuinely ok (the armed raw response is one-shot) — that
+    ok tick must CLEAR the anchor — then a re-armed locked 401 parks episode 2. Drop
+    the ok-branch clear and the middle assert reads 2000.0 (episode 1's anchor
+    inherited), not 0.0.
+    """
+    device = seeded_device()
+    device.add_events(device_event(120, "2026-10-19T09:56:00"))
+    device.add_raw("POST", EVENT_PATH, locked_401())  # episode 1: the search POST pays it
+    h = CollectorHarness(tmp_path, device)
+
+    def parked_now() -> float:
+        return next(d for d in h.collect().devices if d.device_serial == SERIAL).circuit_parked_s
+
+    def advance(seconds: float) -> None:
+        h.h.clock.advance(seconds)
+        h.h.monotonic.advance(seconds)
+
+    r1 = h.tick()  # mono 0: search POST pays the locked 401 -> circuit opens (until 1810)
+    assert not r1.ok and h.h.client.circuit_open()
+    # Episode 1's anchor is r1 itself: _failure reads circuit_open() AFTER the raise.
+    advance(100)
+    assert h.tick().skipped  # a later skip must NOT move the anchor
+    assert parked_now() == pytest.approx(100.0)
+
+    # unlockTime 1800 (+margin 10): wait the lockout out — the armed raw was one-shot,
+    # so this tick really walks and the ok branch must CLEAR the anchor.
+    advance(1860)  # mono 2000 > 1810 -> circuit closed again
+    r3 = h.tick()
+    assert r3.ok, "the armed 401 was one-shot: this tick really walks"
+
+    # Episode 2: park again at mono 2000; the gauge ages from episode 2's FIRST skip.
+    device.add_raw("POST", EVENT_PATH, locked_401())
+    r4 = h.tick()
+    assert not r4.ok and h.h.client.circuit_open()
+    assert h.tick().skipped  # episode 2's first skip, at mono 2000
+    assert parked_now() == pytest.approx(0.0), "episode 2 did NOT inherit episode 1's anchor"
+    advance(30)
+    assert h.tick().skipped
+    assert parked_now() == pytest.approx(30.0)
+
+
 def test_checkpoint_stall_makes_degraded_and_names_the_serial(tmp_path: Path) -> None:
     """A checkpoint older than the caller's stall threshold is critical (spec §2c).
 
