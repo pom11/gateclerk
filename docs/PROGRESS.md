@@ -49,6 +49,25 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-19 — P2 wave 2 merged: #30 (c0b8ba0) + #31 (9b7af27); 05/06 dispatched
+
+- PR #30 (scheduler) merged first per owner: 1267 passed; ONE IsapiClient/device
+  structural (handshakes==1 across many ticks, had_auth accounting); window =
+  checkpoint-overlap pinned ON THE WIRE device-claimed-labelled; cold start =
+  cadence+overlap; seam-7 only via WARNED site fallback (never naive); circuit-open
+  skip = ZERO requests (never-hammer pin). Mutants: overlap-drop 3 red, skip-neuter 1
+  red, completed-flag flip 8 red.
+- PR #31 (pusher) merged on top: 1324 passed. Backoff = busy-family ladder IMPORTED
+  from transport, cap-before-jitter, 1s floor (never-hammer-by-arithmetic), bound
+  caller-supplied inclusive-at-threshold; stub://+https only, never defaulted; replay
+  clears both tables, no double-send; logs never carry payloads; FK guards queue->events.
+  Mutants: cap-removed 4 red, bound-strict-> 14 red, stub-scheme-bypass 1 red.
+  agent_db v3/v4 additive on #29's reserved seam; P2-02 downgrade-wall test
+  strengthened (literal 3 -> len(MIGRATIONS)+1), not weakened.
+- Dispatcher auto-released P2-05 (alerts/park) + P2-06 (healthz/metrics) — both
+  running. P2-07 (deploy) todo, held by parents; canary + B/C probes behind it.
+- Main: 1324 tests green, ruff clean.
+
 ## 2026-10-19 later — P2 roots merged: #28 (fdd2f32) + #29 (ed02860); DAG auto-dispatching
 
 - P2-01 (config validator) merged fdd2f32: 1206 passed; mutants 6/2/9 red (required-zone,
