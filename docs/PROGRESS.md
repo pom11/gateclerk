@@ -49,6 +49,17 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-19 — P2-05 alerts/park merged (PR #32 -> e5eddd4)
+
+- 1345 passed / ruff / CI green. Lockout-safety core = attempt_allowed hard gate:
+  unacked park -> NEVER allowed (grid absent, not long; served-count frozen across
+  days; survives restart; cross-site park files refused). Acked -> grid starts at
+  ack+1800s, success un-parks. lockStatus=lock -> CRITICAL device_locked, creds wait
+  out unlockTime (F3). Nonce recoveries = counter only (monotone max). Mutants:
+  hard-gate neuter -> 4 red, REPROBE->0 -> 1 red, recoveries-escalate -> pin red.
+- P2-07 (deploy) stays todo, correctly gated: parents = P2-05 (done) + P2-06 (running).
+  Auto-dispatches when #healthz lands. Main 1345 green.
+
 ## 2026-10-19 — P2 wave 2 merged: #30 (c0b8ba0) + #31 (9b7af27); 05/06 dispatched
 
 - PR #30 (scheduler) merged first per owner: 1267 passed; ONE IsapiClient/device
