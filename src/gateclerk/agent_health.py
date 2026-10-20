@@ -145,6 +145,18 @@ DEVICE_METRIC_NAMES: tuple[str, ...] = tuple(
 # --- the emitted shapes -----------------------------------------------------------------
 
 
+def _parse_jsonl(line: str) -> EventRecord | None:
+    """One stored contract line -> `EventRecord`, or None if it will not parse.
+
+    A corrupt row is data, not a health crash: the health surface must keep serving
+    even when one row is junk (the same posture p1-06b took for unknown payload keys).
+    """
+    try:
+        return EventRecord.from_dict(json.loads(line))
+    except Exception:  # the row shape is the store's; a bad one skips, never kills
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class MetricLine:
     """One metric: name, value, and WHERE it is computed (the card's "value + source").
@@ -383,7 +395,9 @@ class AgentHealthCollector:
             stats.park_observed_monotonic = None  # ticking again = not parked
         elif getattr(result, "circuit_open", False):
             # The parked gauge's age anchor: first moment THIS process saw it parked.
-            stats.park_observed_monotonic = stats.park_observed_monotonic or self._monotonic()
+            # `is None` (not `or`): a legit anchor of 0.0 (fresh monotonic) is falsy.
+            if stats.park_observed_monotonic is None:
+                stats.park_observed_monotonic = self._monotonic()
         exc = getattr(result, "exception", None)
         if isinstance(exc, IsapiAuthError):
             stats.auth_terminal_failures += 1
@@ -528,10 +542,9 @@ class AgentHealthCollector:
         ).fetchall()
         out: list[EventRecord] = []
         for row in rows:
-            try:
-                out.append(EventRecord.from_dict(json.loads(row["jsonl"])))
-            except Exception:  # noqa: BLE001 - corrupt row is data, not a health crash
-                continue
+            record = _parse_jsonl(row["jsonl"])
+            if record is not None:
+                out.append(record)
         return out
 
     def _run_mismatch_policy(self, device_serial: str) -> int:
@@ -548,7 +561,7 @@ class AgentHealthCollector:
         try:
             with redirect_stderr(buffer):
                 self.mismatch_policy(records, mapping_declared=self.tz_mapping_declared)
-        except Exception:  # noqa: BLE001 - the policy must not break a health poll
+        except Exception:  # the policy must not break a health poll
             return 0
         emitted = [line for line in buffer.getvalue().splitlines() if MISMATCH_MARKER in line]
         for line in emitted:

@@ -48,24 +48,9 @@ from typing import Any
 
 import httpx
 import pytest
-from fakedevice import RETIRE_ENVELOPE_ONLY
-from test_p2_03_scheduler import (
-    CADENCE_S,
-    DEVICE_INFO_PATH,
-    EVENT_PATH,
-    OVERLAP_S,
-    PASSWORD,
-    SCENARIOS,
-    SITE,
-    SITE_TZ,
-    SYSTEM_TIME_PATH,
-    T0,
-    LoopHarness,
-    device_event,
-    seeded_device,
-)
 
 import gateclerk.cli as cli_mod
+from fakedevice import RETIRE_ENVELOPE_ONLY
 from gateclerk import __version__
 from gateclerk.agent_health import (
     DEVICE_METRIC_NAMES,
@@ -93,6 +78,21 @@ from gateclerk.agent_push import (
 from gateclerk.agent_store import event_rowid, read_checkpoint
 from gateclerk.model import EventRecord
 from gateclerk.tz import Skew
+from test_p2_03_scheduler import (
+    CADENCE_S,
+    DEVICE_INFO_PATH,
+    EVENT_PATH,
+    OVERLAP_S,
+    PASSWORD,
+    SCENARIOS,
+    SITE,
+    SITE_TZ,
+    SYSTEM_TIME_PATH,
+    T0,
+    LoopHarness,
+    device_event,
+    seeded_device,
+)
 
 SERIAL = "MASKED-SER-1"
 
@@ -277,9 +277,7 @@ def test_metric_vocabulary_is_exactly_the_spec_list() -> None:
         "push_ok",
         "push_failed",
     }
-    assert sorted(DEVICE_METRIC_NAMES) == sorted(
-        set(SPEC_METRIC_NAMES) - set(SNAPSHOT_ONLY_NAMES)
-    )
+    assert sorted(DEVICE_METRIC_NAMES) == sorted(set(SPEC_METRIC_NAMES) - set(SNAPSHOT_ONLY_NAMES))
 
 
 # --- DoD (2): healthy fake run -> ok, real ages, real gauges ---------------------------
@@ -418,6 +416,10 @@ def test_circuit_open_device_makes_degraded_and_names_the_serial(tmp_path: Path)
     mark = len(device.served)
     r2 = h.tick()
     assert r2.skipped and len(device.served) == mark, "a parked tick sends nothing"
+    h.h.clock.advance(60)
+    h.h.monotonic.advance(60)
+    r3 = h.tick()  # a SECOND skip: the park anchor must stay at first-sight, not re-anchor
+    assert r3.skipped
 
     snap = h.collect()
     assert snap.status == "degraded"
@@ -426,6 +428,8 @@ def test_circuit_open_device_makes_degraded_and_names_the_serial(tmp_path: Path)
     assert v["circuit_open_gauge"] == 1
     assert v["auth_terminal_failures"] == 1
     assert v["device_locked_events"] == 1
+    parked = next(d for d in snap.devices if d.device_serial == SERIAL).circuit_parked_s
+    assert parked == pytest.approx(60.0), "parked since FIRST sight (anchor never re-set)"
 
     text = healthz_text(snap)
     assert "status: degraded" in text and SERIAL in text
@@ -611,10 +615,16 @@ def test_emitted_text_carries_no_secret_shaped_strings(tmp_path: Path) -> None:
     # Distinctive payload values (the helper's "1"/"User E1" are substrings of
     # ordinary metric text — a scan against them would prove nothing).
     device.add_events(
-        {**device_event(150, "2026-10-19T09:52:00"),
-         "employeeNoString": "EMP90071", "name": "Zsocia Kvintal"},
-        {**device_event(151, "2026-10-19T09:55:00"),
-         "employeeNoString": "EMP90072", "name": "Vexly Quorumbat"},
+        {
+            **device_event(150, "2026-10-19T09:52:00"),
+            "employeeNoString": "EMP90071",
+            "name": "Zsocia Kvintal",
+        },
+        {
+            **device_event(151, "2026-10-19T09:55:00"),
+            "employeeNoString": "EMP90072",
+            "name": "Vexly Quorumbat",
+        },
     )
     h = CollectorHarness(tmp_path, device)
     h.ticks(2)  # both punches stored BEFORE the auth fault is armed
@@ -711,9 +721,7 @@ def test_device_health_builder_is_pure_and_callable_directly(tmp_path: Path) -> 
     first = device_health(**{**kwargs, "now": h.h.clock()})
     second = device_health(**{**kwargs, "now": h.h.clock()})
     assert len(h.h.device.served) == mark
-    assert [(m.name, m.value) for m in first.metrics] == [
-        (m.name, m.value) for m in second.metrics
-    ]
+    assert [(m.name, m.value) for m in first.metrics] == [(m.name, m.value) for m in second.metrics]
     assert first.last_poll_ok_age_s == pytest.approx(300.0)
     assert first.metrics and all(m.source for m in first.metrics)
 
@@ -786,3 +794,119 @@ def test_mismatch_policy_input_is_the_stores_own_rows_never_rederived(
         (r.tz_offset_mismatch is True) == bool(row["tz_offset_mismatch"])
         for r, row in zip(records, rows, strict=True)
     )
+
+
+# --- defensive posture: the health surface bends, never breaks ---------------------------
+
+
+def test_health_surface_survives_a_corrupt_store(tmp_path: Path) -> None:
+    """Junk in the store is data, not a crash and not a stall (the collector serves).
+
+    One unparseable contract line is SKIPPED from the policy input; an unparseable or
+    naive checkpoint stamp makes the age UNKNOWN (None) — which by rule cannot trigger
+    the stall degrade — and a garbage event_time takes events_per_day to None. Every
+    other metric of the same run still renders.
+    """
+    h = healthy(tmp_path / "corrupt")
+    h.h.conn.execute("UPDATE events SET jsonl = '{{ not json' WHERE serial_no = 101")
+    assert [r.serial_no for r in h.collector.mismatch_records(SERIAL)] == [
+        100,
+        102,
+        103,
+        104,
+        105,
+        106,
+    ]
+
+    h.h.conn.execute("UPDATE checkpoint SET updated_at = 'not a stamp'")
+    snap = h.collect()
+    dev = next(d for d in snap.devices if d.device_serial == SERIAL)
+    assert dev.checkpoint_age_s is None and snap.status == "ok"
+
+    h.h.conn.execute("UPDATE checkpoint SET updated_at = '2026-10-19T10:10:00'")  # naive
+    dev = next(d for d in h.collect().devices if d.device_serial == SERIAL)
+    assert dev.checkpoint_age_s is None
+
+    # ALL rows junked: MIN(event_time_utc) must not find a parseable stamp at all.
+    h.h.conn.execute("UPDATE events SET event_time_utc = 'nonsense'")
+    values = {m.name: m.value for m in h.collect().devices[0].metrics}
+    assert values["events_per_day"] is None
+
+
+def test_events_per_day_is_none_when_no_rate_is_definable(tmp_path: Path) -> None:
+    """No rows, or the store's first punch AT the clock instant: rate is None, not 0/inf.
+
+    0 would claim silence and inf would break the JSON contract (P2-07's reader) — the
+    honest answer is 'no rate definable yet'.
+    """
+    from gateclerk.agent_health import _events_per_day
+
+    h = healthy(tmp_path / "rate")
+    assert _events_per_day(h.h.conn, "MASKED-SER-9", h.h.clock()) is None  # no rows
+    now = h.h.clock()
+    h.h.conn.execute("UPDATE events SET event_time_utc = ?", (now.isoformat(),))
+    assert _events_per_day(h.h.conn, SERIAL, now) is None  # span <= 0
+
+
+def test_wiring_guards_and_unparseable_observations_are_loud_or_silent_as_appropriate(
+    tmp_path: Path,
+) -> None:
+    """Two wiring guards RAISE (they are agent bugs), every observation seam swallows.
+
+    A collector built with a stall threshold <= 0 degrades everything by construction,
+    and one collector fed two loops' ticks splits counters invisibly — both crash loudly
+    at wiring time. `observe_push_log` on a non-drain or malformed line just does
+    nothing: a health counter must never be able to break the drain it watches.
+    """
+    import types
+
+    h = CollectorHarness(tmp_path / "guards", seeded_device())
+    with pytest.raises(ValueError, match="checkpoint_stall_s"):
+        AgentHealthCollector(
+            site=SITE,
+            conn=h.h.conn,
+            db_path=str(h.db_path),
+            db_warn_bytes=1,
+            checkpoint_stall_s=0.0,
+            tz_mapping_declared=False,
+        )
+    wrong = types.SimpleNamespace(device_serial="MASKED-SER-9", ok=True)
+    with pytest.raises(ValueError, match="one collector per device loop"):
+        h.collector.observe_tick(wrong, device_serial=SERIAL, client=None)
+
+    for junk in (
+        "totally unrelated line",
+        "prefix push drain: sent=1 retried=0 dead_lettered=0",  # not a bare drain line
+        "push drain: sent=x retried=1 dead_lettered=0",  # non-integer field
+    ):
+        h.collector.observe_push_log(junk)
+    push = h.collector._push
+    assert (push.push_ok, push.push_failed) == (0, 0)
+
+
+def test_a_crashing_mismatch_policy_cannot_break_a_health_poll(
+    tmp_path: Path,
+) -> None:
+    """The delegated p1-06c policy raising is caught: the poll still renders, count 0."""
+    h = healthy(tmp_path / "policy-crash")
+
+    def boom(records: Any, *, mapping_declared: bool) -> None:
+        raise RuntimeError("policy exploded")
+
+    h.collector.mismatch_policy = boom  # type: ignore[assignment]
+    snap = h.collect()
+    assert snap.status == "ok"
+    assert h.stats().mismatch_warnings == 0
+
+
+def test_default_warn_sink_prints_to_stderr(tmp_path: Path) -> None:
+    """The default sink is the agent_loop precedent (rich console, stderr, no markup)."""
+    import contextlib
+    import io
+
+    from gateclerk.agent_health import _stderr_warn
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stderr(buffer):
+        _stderr_warn("healthz sink probe")
+    assert "healthz sink probe" in buffer.getvalue()
