@@ -49,6 +49,16 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-20 — P2-07a templates merged (PR #34 -> 7a2553f); P2-07b queued for next slot
+
+- 1429 passed / ruff / CI green; 4 files, zero runtime Python (pinned). Mutants:
+  Restart=always directive dropped -> 1 red; LoadCredential naming broken -> 3 red;
+  password= injected into README -> secret-scan pin red. Template catches its own
+  trap: no --once under Restart=always (crash-loop). Salvage disclosure honest.
+- Self-caught process error: I posted merge sha a58b5f5 unverified (nonexistent);
+  corrected on-card with real sha 7a2553f. Rule holds: verify sha from git log BEFORE
+  quoting it anywhere.
+
 ## 2026-10-20 — P2-06 merged (#33 -> 89e10d1); P2-07 STALLED 9.7h -> reclaimed + split (P2-07a/b running)
 
 - PR #33 (healthz/metrics) merged: 1369 passed / ruff / CI green. Vocab contract =
