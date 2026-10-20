@@ -121,6 +121,10 @@ class TickResult:
     #: THIS tick moved it (a quiet tick re-reports the serial without churning).
     checkpoint_serial: int | None = None
     advanced: bool = False
+    #: Normalized termination of the LAST completed chunk's SearchSummary
+    #: (paging.py:351) — the §2e `search_termination` observable: P2-06 reports it,
+    #: so the loop hands it over instead of the health module re-walking anything.
+    termination: str | None = None
 
 
 def _default_warn(text: str) -> None:
@@ -255,6 +259,7 @@ class DeviceLoop:
                     else (checkpoint.checkpoint_serial if checkpoint else None)
                 ),
                 advanced=advanced,
+                termination=counts.termination,
             )
         except Exception as exc:
             return self._failure(exc, since=since, until=until)
@@ -446,6 +451,8 @@ class _WalkCounts:
     inserted: int = 0
     refreshed: int = 0
     unchanged: int = 0
+    #: Termination of the LAST completed chunk — the §2e `search_termination` value.
+    termination: str | None = None
 
     def absorb(
         self,
@@ -462,6 +469,7 @@ class _WalkCounts:
         self.inserted += inserted
         self.refreshed += refreshed
         self.unchanged += unchanged
+        self.termination = chunk.termination  # last completed chunk wins
 
 
 def _search_reader(client: Any) -> Any:

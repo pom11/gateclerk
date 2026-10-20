@@ -11,16 +11,16 @@ it: the P2-03 `TickResult`, `agent_push`'s queue queries + drain log counters,
 The six DoD cases, 1:1 to test names below:
 
 (1) the vocabulary IS the contract: sorted-name set equality against the card's list
-    at the module level, and against what a real snapshot/device block actually emits
-    (SNAPSHOT_ONLY_NAMES splits the four store/push gauges from the thirteen device
-    ones; nothing invented, nothing dropped).
+    (module constants), and — in the /metrics test — against what the rendering of a
+    REAL snapshot actually emits (18 lines, nothing invented, nothing dropped).
 (2) a healthy fake run (the REAL P2-03 LoopHarness over FakeDevice) -> status ok,
     per-device ages, and every gauge equal to what the loop/store actually did
     (FakeDevice-backed counters and SQL recomputed in the test, not constants).
 (3) a circuit-open device -> degraded + the serial NAMED in the reason line; a stuck
     checkpoint -> degraded + named (the card's two degraded triggers, nothing else).
 (4) dead-letter depth read from actual store rows (agent_push seeds them through its
-    own enqueue+drain against a failing transport; the health value == the COUNT(*)).
+    own enqueue+drain against a failing transport; the health value == the COUNT(*)),
+    with push_ok/push_failed read off the drain's own log lines.
 (5) tz_offset_mismatch + site_labeled_windows: mapped (0 warnings) vs unmapped (1
     warning) fake runs reusing p1-12's mapping shapes — provenance records still
     mismatched in BOTH arms (the p1-12 decision), only the warning policy differs;
@@ -30,7 +30,8 @@ The six DoD cases, 1:1 to test names below:
 
 Plus the format pins the card names: the full /healthz text byte-pinned on the healthy
 run ("stable-ish" means THIS test is the change gate), metric lines carry value+source,
-and the /metrics text never contains a payload body, an endpoint, or a punch field.
+the JSON round-trips for a separate reader (P2-07's socat), and the /metrics text never
+contains a payload body, an endpoint ref, or a punch field.
 
 Offline by construction: FakeDevice behind real IsapiClients, tmp sqlite files,
 injected clocks; no real host or serial appears (fixtures carry MASKED-SER-1 and
@@ -41,20 +42,23 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from fakedevice import RETIRE_ENVELOPE_ONLY
 from test_p2_03_scheduler import (
     CADENCE_S,
     DEVICE_INFO_PATH,
+    EVENT_PATH,
     OVERLAP_S,
     PASSWORD,
     SCENARIOS,
     SITE,
     SITE_TZ,
+    SYSTEM_TIME_PATH,
     T0,
     LoopHarness,
     device_event,
@@ -63,16 +67,19 @@ from test_p2_03_scheduler import (
 
 import gateclerk.cli as cli_mod
 from gateclerk import __version__
-from gateclerk.agent_db import connect
 from gateclerk.agent_health import (
+    DEVICE_METRIC_NAMES,
     FALLBACK_MARKER,
     METRIC_NAMES,
+    MISMATCH_MARKER,
     SITE_LABELLED,
     SNAPSHOT_ONLY_NAMES,
     AgentHealthCollector,
     device_health,
     healthz_text,
     metrics_text,
+    snapshot_from_dict,
+    snapshot_to_json,
 )
 from gateclerk.agent_push import (
     dead_letter_depth,
@@ -80,15 +87,14 @@ from gateclerk.agent_push import (
     drain,
     enqueue_events,
     queue_depth,
+    replay_dead_letter,
     stub_transport,
 )
 from gateclerk.agent_store import event_rowid, read_checkpoint
-from gateclerk.isapi_transport import IsapiClient
 from gateclerk.model import EventRecord
 from gateclerk.tz import Skew
 
 SERIAL = "MASKED-SER-1"
-STUB_ENDPOINT = "stub://ingest/lines.jsonl"
 
 #: The card's §2e list, verbatim — test (1) pins the module's vocabulary against it.
 SPEC_METRIC_NAMES = [
@@ -126,13 +132,17 @@ def locked_401() -> httpx.Response:
     )
 
 
+def stub_endpoint(tmp_path: Path) -> str:
+    """An ABSOLUTE stub ingest target under tmp_path (never cwd-relative writes)."""
+    return f"stub://{tmp_path / 'ingest' / 'lines.jsonl'}"
+
+
 class CollectorHarness:
     """A P2-03 LoopHarness + a collector wired the way P2-07's unit wires it.
 
-    The collector's warn sink IS the loop's warn sink: the p1-05c fallback line the
-    loop emits travels through `observe_warn` exactly as the agent process will route
-    every warning line through it; the mismatch line is emitted by the policy the
-    collector delegates to (`cli._warn_tz_mismatch`, reused not forked).
+    The collector's warn sink IS the loop's warn sink (in the agent process every
+    warning line routes through `observe_warn` too — the emitted health text is
+    metric lines only, so warnings can never leak into it).
     """
 
     def __init__(
@@ -149,6 +159,7 @@ class CollectorHarness:
         from gateclerk.agent_loop import DeviceLoop
 
         self.db_path = tmp_path / db_name
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)  # sub-arm dirs (mapped/)
         self.h = LoopHarness(tmp_path, device, client_password=client_password)
         self.collector = AgentHealthCollector(
             site=SITE,
@@ -179,9 +190,16 @@ class CollectorHarness:
                 monotonic=self.h.monotonic,
                 warn=self.h.warns.append,
             )
+        self.results: list[Any] = []
+        self.last_tick: Any = None
 
     def tick(self) -> Any:
-        return self.collector.observe_tick(self.h.tick(), client=self.h.client)
+        result = self.collector.observe_tick(
+            self.h.loop.tick(), device_serial=SERIAL, client=self.h.client
+        )
+        self.results.append(result)
+        self.last_tick = result
+        return result
 
     def ticks(self, n: int, step_s: float = CADENCE_S) -> list[Any]:
         out = []
@@ -191,84 +209,91 @@ class CollectorHarness:
             self.h.monotonic.advance(step_s)
         return out
 
-    def snapshot(self) -> Any:
-        return self.collect()
-
     def collect(self) -> Any:
         return self.collector.collect(
-            clients={SERIAL: self.h.client}, ticks={SERIAL: self.h.last_tick}
+            clients={SERIAL: self.h.client}, ticks={SERIAL: self.last_tick}
         )
 
+    def stats(self) -> Any:
+        return self.collector.stats(SERIAL)
 
-def healthy(tmp_path: Path, **kw: Any) -> CollectorHarness:
-    """The card's healthy fake run: the recorded site-a box, 6 events, 3 clean ticks."""
+
+def healthy(tmp_path: Path, *, serial106: bool = True, **kw: Any) -> CollectorHarness:
+    """The card's healthy fake run: the recorded site-a box (p1-12 mapped), 3 clean ticks.
+
+    Clock state after construction: ticks ran at 10:00/10:05/10:10 and the clock
+    advanced once more -> collect() runs at 10:15 wall / monotonic 900, so BOTH ages
+    are the derived 300.0 the pins state (last ok poll at 10:10; the checkpoint row was
+    last written DURING the 10:10 tick).
+
+    Tick windows (P2-03's math, re-run here so the expected counters are DERIVED, not
+    asserted): [09:50,10:00] stores 100,101,102; [09:53,10:05] re-reads 102 FREE and
+    stores 103,104; [09:59,10:10] re-reads 103,104 FREE and stores 105 (+106 when
+    `serial106`). With `serial106=False` later tick windows hold only FREE re-reads:
+    ok ticks whose checkpoint STOPPED advancing — the stall case's engine.
+    """
     device = seeded_device()
-    device.add_events(
-        *[
-            device_event(100, "2026-10-19T09:52:00"),
-            device_event(101, "2026-10-19T09:55:00"),
-            device_event(102, "2026-10-19T09:58:00"),
-            device_event(103, "2026-10-19T10:01:00"),
-            device_event(104, "2026-10-19T10:04:00"),
-            device_event(105, "2026-10-19T10:07:00"),
-        ]
-    )
+    events = [
+        device_event(100, "2026-10-19T09:52:00"),
+        device_event(101, "2026-10-19T09:55:00"),
+        device_event(102, "2026-10-19T09:58:00"),
+        device_event(103, "2026-10-19T10:01:00"),
+        device_event(104, "2026-10-19T10:04:00"),
+        device_event(105, "2026-10-19T10:07:00"),
+    ]
+    if serial106:
+        events.append(device_event(106, "2026-10-19T10:10:00"))
+    device.add_events(*events)
+    kw.setdefault("device_tz", SITE_TZ)  # site-a's production shape (p1-12 mapping)
     h = CollectorHarness(tmp_path, device, **kw)
     h.ticks(3)
     return h
 
 
 def by_name(snapshot: Any) -> dict[str, Any]:
-    """Snapshot-level metric values (device lines collapsed last-wins — 1-device tests)."""
-    return {m.name: m.value for m in snapshot.metrics()}
+    """Snapshot-level (site) metric values."""
+    return {m.name: m.value for m in snapshot.site_metrics}
 
 
 def device_by_name(snapshot: Any, serial: str = SERIAL) -> dict[str, Any]:
     dev = next(d for d in snapshot.devices if d.device_serial == serial)
-    return {m.name: m.value for m in dev.metrics()}
+    return {m.name: m.value for m in dev.metrics}
 
 
-# --- DoD (1): the vocabulary IS the contract ----------------------------------------------
+# --- DoD (1): the vocabulary IS the contract ------------------------------------------
 
 
-def test_metric_vocabulary_is_exactly_the_spec_list(tmp_path: Path) -> None:
-    """Sorted-name set equality against the card's §2e list, at three levels.
+def test_metric_vocabulary_is_exactly_the_spec_list() -> None:
+    """Sorted-name set equality against the card's §2e list — this IS the contract pin.
 
-    This test IS the contract pin (card DoD 1): rename one name in the module, drop
-    one, or invent a sixteenth, and one of the three assertions goes red. The last
-    two pin not just the constant but what a real snapshot actually EMITS — a name in
-    a tuple no builder ever renders would pass a constants-only test.
+    Rename one name in the module, drop one, or invent a nineteenth, and the first
+    assertion goes red. The rest pin the device/site split the renderers use (a tuple
+    the builders never render is caught by the /metrics name-count test below).
     """
     assert sorted(METRIC_NAMES) == sorted(SPEC_METRIC_NAMES)
-
-    snap = healthy(tmp_path).snapshot()
-    assert {m.name for m in snap.metrics()} == set(SPEC_METRIC_NAMES)
-    dev = next(d for d in snap.devices if d.device_serial == SERIAL)
-    # Every device-level name is in the contract; the four store/push gauges are the
-    # only ones a per-device block does NOT carry, and that split is itself pinned.
-    assert {m.name for m in dev.metrics()} == set(SPEC_METRIC_NAMES) - set(SNAPSHOT_ONLY_NAMES)
     assert set(SNAPSHOT_ONLY_NAMES) == {
         "db_size_bytes",
         "dead_letter_depth",
         "push_ok",
         "push_failed",
     }
+    assert sorted(DEVICE_METRIC_NAMES) == sorted(
+        set(SPEC_METRIC_NAMES) - set(SNAPSHOT_ONLY_NAMES)
+    )
 
 
-# --- DoD (2): healthy fake run -> ok, real ages, real gauges -------------------------------
+# --- DoD (2): healthy fake run -> ok, real ages, real gauges ---------------------------
 
 
 def test_healthy_fake_run_is_ok_with_real_ages_and_gauges(tmp_path: Path) -> None:
     """Every value equals what the loop/store/client actually did — no constants here.
 
-    The three ticks store 100..102, 103+104, 105 (P2-03's overlap semantics re-run
-    through the REAL harness); the snapshot is built at the third tick's instant
-    (10:10 site wall). Each asserted number is recomputed from the harness state.
+    The asserted numbers are DERIVED in-test from the harness (tick results, SQL over
+    the store, the client's own counters), exactly as the card demands: "match
+    FakeDevice counters, not constants".
     """
     h = healthy(tmp_path)
-    results = [t for t in h.h.loop and []]  # placeholder removed below
-    assert results == []
-    snap = h.snapshot()
+    snap = h.collect()
 
     assert snap.status == "ok"
     assert snap.reasons == ()
@@ -276,20 +301,18 @@ def test_healthy_fake_run_is_ok_with_real_ages_and_gauges(tmp_path: Path) -> Non
     assert snap.agent_version == __version__
 
     dev = next(d for d in snap.devices if d.device_serial == SERIAL)
-    # The clock is at 10:10 (+3 ticks of 300 s); the last ok poll was the 10:05 tick.
+    # Ticks ran at 10:00/10:05/10:10, built at 10:15 (wall) / mono 900: last ok poll
+    # 10:10 -> 300 s (monotonic seam); checkpoint row last written by the 10:10 tick
+    # -> 300 s (wall seam — the two clocks each age their own kind of fact).
     assert dev.last_poll_ok_age_s == pytest.approx(300.0)
+    assert dev.checkpoint_age_s == pytest.approx(300.0)
     assert dev.circuit_open is False
     assert dev.circuit_parked_s == 0.0
     cp = read_checkpoint(h.h.conn, SERIAL)
-    assert cp is not None and dev.checkpoint_serial == cp.checkpoint_serial == 105
-    # Checkpoint age: the third tick advanced at 10:10 - no: advance happens per chunk
-    # in the 10:10 window? The third tick runs at 10:10 (clock advanced after tick 2);
-    # checkpoint updated_at is that tick's stamp, so age is 0 at build time.
-    assert dev.checkpoint_age_s == pytest.approx(0.0)
+    assert cp is not None and dev.checkpoint_serial == cp.checkpoint_serial == 106
 
     v = device_by_name(snap)
-    # Transport counter, read live — and the run paid no nonce recoveries (one
-    # handshake total, P2-03's pin re-asserted from the health side).
+    # Transport counter, read live from the client the run actually used.
     assert v["auth_recoveries"] == h.h.client.auth_recoveries == 0
     assert v["auth_terminal_failures"] == 0
     assert v["device_locked_events"] == 0
@@ -298,21 +321,22 @@ def test_healthy_fake_run_is_ok_with_real_ages_and_gauges(tmp_path: Path) -> Non
     rows = h.h.conn.execute(
         "SELECT serial_no, tz_offset_mismatch FROM events ORDER BY serial_no"
     ).fetchall()
-    assert [r["serial_no"] for r in rows] == [100, 101, 102, 103, 104, 105]
+    assert [r["serial_no"] for r in rows] == [100, 101, 102, 103, 104, 105, 106]
     assert v["oldest_serial"] == 100
-    assert v["records_stored"] == sum(r.stored for r in []) or v["records_stored"] == 6
-    assert v["pages_fetched"] == h.h.last_tick.pages == 1
-    assert v["search_termination"] == h.h.last_tick.termination == "OK"
+    # Cumulative counters EQUAL the tick results the harness recorded (derived, not
+    # constants: the window walk re-reads the FREE overlap, so stored > distinct rows).
+    assert v["pages_fetched"] == sum(r.pages for r in h.results)
+    assert v["records_stored"] == sum(r.stored for r in h.results)
+    assert v["search_termination"] == h.last_tick.termination == "OK"
     # The claimed +02:00 vs the +03:00 summer site: every record mismatches (p1-06c).
     assert all(r["tz_offset_mismatch"] == 1 for r in rows)
-    assert v["tz_offset_mismatch_records"] == len(rows) == 6
+    assert v["tz_offset_mismatch_records"] == len(rows) == 7
     assert v["tz_offset_mismatch_warnings"] == 0  # mapped run (device_tz declared)
     assert v["site_labeled_windows"] == 0
     assert v["device_clock_skew_seconds"] is None  # nothing observed this run yet
-    # events_per_day: count / (now - first stored event_time_utc), recomputed here.
+    # events_per_day: count / (now - first event_time_utc), recomputed here.
     first = h.h.conn.execute("SELECT MIN(event_time_utc) m FROM events").fetchone()["m"]
-    span = (T0 + timedelta(seconds=2 * CADENCE_S) - __import__("datetime").datetime.fromisoformat(first)
-            ).total_seconds()
+    span = (h.h.clock() - datetime.fromisoformat(first)).total_seconds()
     assert v["events_per_day"] == pytest.approx(len(rows) * 86400.0 / span)
 
     s = by_name(snap)
@@ -325,57 +349,64 @@ def test_healthy_fake_run_is_ok_with_real_ages_and_gauges(tmp_path: Path) -> Non
 
 
 def test_healthz_text_is_byte_pinned_on_the_healthy_run(tmp_path: Path) -> None:
-    """"Stable-ish" means this test is the change gate for the whole /healthz format."""
+    """The /healthz format, byte for byte — "stable-ish" means THIS test is the gate.
+
+    Byte pin, not substring: a renamed key or reordered line is exactly the drift the
+    card's "pinned by test" demands be visible. A socat/curl consumer reads these keys.
+    """
     h = healthy(tmp_path)
-    text = healthz_text(h.snapshot())
-    assert text == "\n".join(
-        [
-            "status: ok",
-            f"site: {SITE}",
-            f"agent_version: {__version__}",
-            "devices: 1",
-            "dead_letter_depth: 0",
-            "last_poll_ok_age_s: 300.0",
-            f"device: {SERIAL}",
-            "  circuit_open: false",
-            "  circuit_parked_s: 0.0",
-            "  checkpoint_serial: 105",
-            "  checkpoint_age_s: 0.0",
-            "  last_poll_ok_age_s: 300.0",
-            f"  auth_recoveries {0}  # IsapiClient.auth_recoveries",
-            "  auth_terminal_failures 0  # terminal IsapiAuthError on an observed tick"
-            " (AgentHealthCollector.observe_tick)",
-            "  circuit_open_gauge 0  # IsapiClient.circuit_open() at snapshot build",
-            "  device_clock_skew_seconds null  # tz.compute_skew over GET System/time"
-            " (AgentHealthCollector, once per process)",
-            "  device_locked_events 0  # IsapiAuthError.locked on an observed tick"
-            " (AgentHealthCollector.observe_tick)",
-            "  events_per_day 480.0  # COUNT(events) / (now - first event_time_utc)"
-            " over the store",
-            "  oldest_serial 100  # AgentHealthCollector observation,"
-            " else MIN(events.serial_no)",
-            "  pages_fetched 1  # TickResult.pages (SearchSummary.pages, paging.py:351)",
-            "  records_stored 3  # TickResult.stored (agent_store UPSERT outcomes)",
-            "  search_termination OK  # last completed chunk's SearchSummary.termination",
-            "  site_labeled_windows 0  # TickResult.window_label == the p1-05c fallback"
-            " label, per ok tick",
-            "  tz_offset_mismatch_records 6  # COUNT events WHERE tz_offset_mismatch = 1",
-            "  tz_offset_mismatch_warnings 0  # p1-06c once-per-run policy"
-            " (cli._warn_tz_mismatch), counted per collect",
-        ]
-    ) + "\n"
+    snap = h.collect()
+    dev = next(d for d in snap.devices if d.device_serial == SERIAL)
+    lines = [
+        "status: ok",
+        f"site: {SITE}",
+        f"agent_version: {__version__}",
+        "devices: 1",
+        "dead_letter_depth: 0",
+        "last_poll_ok_age_s: 300.0",
+        f"device: {SERIAL}",
+        "  circuit_open: false",
+        "  circuit_parked_s: 0.0",
+        "  checkpoint_serial: 106",
+        "  checkpoint_age_s: 300.0",
+        "  last_poll_ok_age_s: 300.0",
+    ]
+    lines.extend(f"  {m.render()}" for m in dev.metrics)
+    assert healthz_text(snap) == "\n".join(lines) + "\n"
 
 
-# --- DoD (3): degraded is named ----------------------------------------------------------------
+def test_metrics_text_carries_every_name_with_value_and_source(tmp_path: Path) -> None:
+    """/metrics: one line per emitted metric, `name value  # source`, full vocabulary.
+
+    Sorted site-level names first, then one commented block per device. The exact
+    count (4 site + 14 device = 18) plus set equality means a metric the builders
+    never render cannot hide behind a constant, and a source-less line is red.
+    """
+    snap = healthy(tmp_path).collect()
+    text = metrics_text(snap)
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    names = [line.split(" ", 1)[0] for line in lines]
+    assert sorted(names) == sorted(SPEC_METRIC_NAMES)
+    assert len(names) == len(SPEC_METRIC_NAMES)
+    for line in lines:
+        assert "  # " in line, f"metric line without a source: {line!r}"
+        assert line.split("  # ", 1)[1].strip()
+    # The rollout gate's two zeros (docs/P2-SITE-AGENT.md §5) visible as digits:
+    assert re.search(r"^tz_offset_mismatch_warnings 0\b", text, re.M)
+    assert re.search(r"^site_labeled_windows 0\b", text, re.M)
+
+
+# --- DoD (3): degraded is named ------------------------------------------------------------
 
 
 def test_circuit_open_device_makes_degraded_and_names_the_serial(tmp_path: Path) -> None:
     """The transport parks the device (terminal 401); healthz says WHY and WHICH.
 
     The locked 401 shape (device-locked body, unlockTime 1800) also feeds the two
-    auth counters: a terminal failure and a locked event, both observed on the tick
-    the loop returned as data (P2-03's never-raises contract, read from the health
-    side). The parked gauge reads 1 while the circuit holds.
+    auth counters: one terminal failure and one locked event, both observed on the
+    tick the loop returned as data (P2-03's never-raises contract, read from the
+    health side). The follow-up parked skip adds NOTHING (no double-count) and sends
+    zero requests (P2-03's no-hammer pin, re-read here from the health side).
     """
     device = seeded_device()
     device.add_events(device_event(110, "2026-10-19T09:58:00"))
@@ -384,10 +415,11 @@ def test_circuit_open_device_makes_degraded_and_names_the_serial(tmp_path: Path)
 
     r1 = h.tick()
     assert not r1.ok and h.h.client.circuit_open()
-
     mark = len(device.served)
-    snap = h.snapshot()
-    assert len(device.served) == mark, "building a snapshot must not touch the device"
+    r2 = h.tick()
+    assert r2.skipped and len(device.served) == mark, "a parked tick sends nothing"
+
+    snap = h.collect()
     assert snap.status == "degraded"
     assert any(SERIAL in reason and "circuit" in reason.lower() for reason in snap.reasons)
     v = device_by_name(snap)
@@ -402,112 +434,101 @@ def test_circuit_open_device_makes_degraded_and_names_the_serial(tmp_path: Path)
 def test_checkpoint_stall_makes_degraded_and_names_the_serial(tmp_path: Path) -> None:
     """A checkpoint older than the caller's stall threshold is critical (spec §2c).
 
-    Same healthy run; only the threshold changes (P2-07 passes ~2x cadence from
-    config). The poll itself succeeds — a stalled checkpoint while ticking is the
-    exact 'the ring is rolling' state DESIGN.md OQ4 calls critical — and it must be
-    visible WITHOUT the collector reaching for a socket (0 device requests during
-    build, so the stall check cannot be a probe in disguise).
+    The healthy box WITHOUT serial 106: the next two ticks succeed (their windows
+    hold only FREE overlap re-reads — advanced=False) while the checkpoint stays
+    frozen at the 10:10 tick's advance. By the 10:25 build it is 900 s old against a
+    120 s threshold (P2-07 passes ~2x cadence from config) — ticking-but-stalled, the
+    exact state DESIGN.md OQ4 calls critical. Building the snapshot must not touch
+    the device (the stall check is a db read, not a probe).
     """
-    device = seeded_device()
-    device.add_events(
-        device_event(120, "2026-10-19T09:52:00"),
-        device_event(121, "2026-10-19T09:55:00"),
-    )
-    h = CollectorHarness(tmp_path, device, checkpoint_stall_s=120.0)
-    results = []
-    for _ in range(3):  # ticks at 10:00, 10:05, 10:10; last advance happened at 10:00
-        results.append(h.tick())
+    h = healthy(tmp_path, serial106=False, checkpoint_stall_s=120.0)
+    for _ in range(2):  # ticks at 10:15 and 10:20: ok, advanced=False, no new rows
+        r = h.tick()
+        assert r.ok and not r.advanced
         h.h.clock.advance(CADENCE_S)
         h.h.monotonic.advance(CADENCE_S)
-    assert all(r.ok for r in results)
 
-    mark = len(device.served)
-    snap = h.snapshot()  # built at 10:15; checkpoint last advanced at the 10:00 tick
-    assert len(device.served) == mark
+    mark = len(h.h.device.served)
+    snap = h.collect()  # built at 10:25; checkpoint row last written during the 10:10 tick
+    assert len(h.h.device.served) == mark, "snapshot building must not touch the device"
     assert snap.status == "degraded"
     assert any(SERIAL in reason and "checkpoint" in reason.lower() for reason in snap.reasons)
     assert snap.checkpoint_stall_s == 120.0
     assert SERIAL in healthz_text(snap)
 
 
-# --- DoD (4): dead-letter depth from actual store rows --------------------------------------
+# --- DoD (4): dead-letter depth from actual store rows ---------------------------------
 
 
 def test_dead_letter_depth_and_push_counters_come_from_the_store(tmp_path: Path) -> None:
     """agent_push seeds the rows; the health side just counts them — and reports push_ok.
 
-    Three stored events are queued; two fail out to dead_letter (failing transport,
-    past the bound), one later pushes to the stub ingest. The snapshot's values are
-    the store's own COUNT(*)s and the drain log's own counters, cross-checked here
-    against SQL and `dead_letter_rows()` so a health-side fabrication cannot hide.
+    Three stored events are queued; all three fail past the bound into dead_letter
+    (failing transport); one is replayed and reaches the stub ingest, whose success
+    DELETES its dead-letter row (agent_push's own rule) — depth must follow the SQL,
+    not the history. push_ok/push_failed are the drain log's own cumulative counters.
     """
-    from gateclerk.agent_loop import DeviceLoop  # noqa: F401  (imported by harness too)
-
     h = healthy(tmp_path)
-    rowids = [
-        event_rowid(h.h.conn, SERIAL, sn)
-        for sn in (100, 101, 102)
-    ]
-    assert all(r is not None for r in rowids)
-    enqueue_events(h.h.conn, rowids, endpoint=STUB_ENDPOINT, now=T0)
+    endpoint = stub_endpoint(tmp_path)
+    rowids = [r for sn in (100, 101, 102) if (r := event_rowid(h.h.conn, SERIAL, sn)) is not None]
+    assert len(rowids) == 3
+    enqueue_events(h.h.conn, rowids, endpoint=endpoint, now=T0)
     assert queue_depth(h.h.conn) == 3
 
     def failing(url: str, body: str) -> int:
         raise ConnectionError("ingest down")
 
-    # First drain: everything fails but nothing is past the 1 h bound yet -> retried.
-    h.collector.observe_push_log(
-        drain(
-            h.h.conn,
-            endpoint=STUB_ENDPOINT,
-            transport=failing,
-            now=T0 + timedelta(seconds=60),
-            rng=lambda: 0.5,
-            dead_letter_after_s=3600,
-            log=h.collector.observe_push_log,
-        )
-    )
-    # Second drain an hour later: past the bound -> dead-lettered.
+    # Drain 1: everything fails but nothing is past the 1 h bound -> all retried.
     drain(
         h.h.conn,
-        endpoint=STUB_ENDPOINT,
+        endpoint=endpoint,
+        transport=failing,
+        now=T0 + timedelta(seconds=60),
+        rng=lambda: 0.5,
+        dead_letter_after_s=3600,
+        log=h.collector.observe_push_log,
+    )
+    # Drain 2 an hour later: past the bound -> all dead-lettered.
+    drain(
+        h.h.conn,
+        endpoint=endpoint,
         transport=failing,
         now=T0 + timedelta(seconds=3660),
         rng=lambda: 0.5,
         dead_letter_after_s=3600,
         log=h.collector.observe_push_log,
     )
-    # Third drain: the ingest is back (stub transport, real file append) -> 3 sent.
+    assert dead_letter_depth(h.h.conn) == 3
+
+    # The ingest is back: replay the first dead-letter row, drain accepts it.
+    first_row = dead_letter_rows(h.h.conn)[0]
+    replay_dead_letter(h.h.conn, first_row.id, now=T0 + timedelta(seconds=3720))
     out = tmp_path / "ingest" / "lines.jsonl"
     drain(
         h.h.conn,
-        endpoint=STUB_ENDPOINT,
-        transport=stub_transport(STUB_ENDPOINT),
+        endpoint=endpoint,
+        transport=stub_transport(endpoint),
         now=T0 + timedelta(seconds=3720),
         rng=lambda: 0.5,
         log=h.collector.observe_push_log,
     )
 
-    rows = dead_letter_rows(h.h.conn)
-    assert len(rows) == 3  # all three events dead-lettered before the recovery drain
     depth_sql = h.h.conn.execute("SELECT COUNT(*) c FROM dead_letter").fetchone()["c"]
-    snap = h.snapshot()
+    snap = h.collect()
     s = by_name(snap)
-    assert s["dead_letter_depth"] == depth_sql == dead_letter_depth(h.h.conn) == 3
-    # The stub accepted 3 lines on the recovery drain; the two failed drains before
-    # it failed 3 + 3 rows — push_ok/push_failed are the drain log's own sums.
-    assert s["push_ok"] == 3
+    assert s["dead_letter_depth"] == depth_sql == dead_letter_depth(h.h.conn) == 2
+    assert len(dead_letter_rows(h.h.conn)) == 2
+    # Cumulative drain counters: 1 accepted; 3 retried + 3 dead-lettered failed.
+    assert s["push_ok"] == 1
     assert s["push_failed"] == 6
-    assert out.exists() and len(out.read_text().splitlines()) == 3
-    # A replayed success CLEARED the queue; the dead-letter rows still stand (they
-    # outlive the queue) — depth counts rows, exactly as the store does.
+    assert out.exists() and len(out.read_text().splitlines()) == 1
     assert queue_depth(h.h.conn) == 0
-    # Health text never leaks the payload or the endpoint ref.
+    # Health text never leaks the payload body or the endpoint ref.
     text = metrics_text(snap) + "\n" + healthz_text(snap)
-    assert STUB_ENDPOINT not in text and "payload" not in text.lower()
+    assert endpoint not in text and "payload" not in text.lower()
 
 
-# --- DoD (5): mapping shapes decide the warning count, not the records ----------------------
+# --- DoD (5): mapping shapes decide the warning count, not the records -----------------
 
 
 def test_mapped_run_is_silent_unmapped_run_warns_once_records_mismatch_in_both(
@@ -517,26 +538,35 @@ def test_mapped_run_is_silent_unmapped_run_warns_once_records_mismatch_in_both(
 
     BOTH arms are the site-a summer box: the device claims +02:00, the site resolves
     +03:00, so EVERY record carries tz_offset_mismatch (provenance is a fact about the
-    data — the mapping silences the warning, never the flag). The mapped arm
-    (device_tz declared, p1-12's sites.toml shape) emits NO once-per-run warning; the
-    unmapped arm emits exactly one. The warning line is the p1-06c line verbatim,
-    produced by the CLI's own policy function — reused, not forked.
+    data — the mapping silences the warning, never the flag; p1-12's owner decision).
+    The mapped arm (device_tz declared) emits NO once-per-run warning; the unmapped
+    arm emits exactly one, and the line is the p1-06c policy's OWN text (delegated to
+    `cli._warn_tz_mismatch`, reused not forked). Once-per-run semantics: a SECOND
+    collect must not warn again — the count sticks at 1 (the agent's run is its life).
     """
     mapped = healthy(tmp_path / "mapped", device_tz=SITE_TZ)
-    unmapped = healthy(tmp_path / "unmapped", tz_mapping_declared=False)
-    # Unmapped keeps device_tz=None: records resolve in site tz, same as p1-12.
+    unmapped = healthy(tmp_path / "unmapped", device_tz=None, tz_mapping_declared=False)
 
-    m_snap, u_snap = mapped.snapshot(), unmapped.snapshot()
+    m_snap, u_snap = mapped.collect(), unmapped.collect()
     m_dev, u_dev = device_by_name(m_snap), device_by_name(u_snap)
 
-    # Provenance identical in both arms: 6/6 records mismatch (p1-12's decision).
-    assert m_dev["tz_offset_mismatch_records"] == u_dev["tz_offset_mismatch_records"] == 6
+    # Provenance identical in both arms: every record mismatches (7 with serial 106).
+    assert m_dev["tz_offset_mismatch_records"] == u_dev["tz_offset_mismatch_records"] == 7
     # The warning policy is the ONLY difference the health surface sees.
     assert m_dev["tz_offset_mismatch_warnings"] == 0
     assert u_dev["tz_offset_mismatch_warnings"] == 1
-    # And when it fires, it fires through the p1-06c line (the CLI's own text), once.
-    assert any(cli_mod._warn_tz_mismatch_lines()[0].split(":")[0] in w for w in unmapped.h.warns)
-    assert unmapped.h.warns.count == 1 if hasattr(unmapped.h.warns, "count") else True
+    # And when it fires, it is the p1-06c line, once (p1-12's bytes for a 7-record run).
+    mismatch_lines = [w for w in unmapped.h.warns if MISMATCH_MARKER in w]
+    assert len(mismatch_lines) == 1
+    assert "7 of 7 events have tz_offset_mismatch=true" in mismatch_lines[0]
+    assert "records are correct" in mismatch_lines[0]
+    assert not [w for w in mapped.h.warns if MISMATCH_MARKER in w]
+    # The collector delegates to the CLI's own policy object (the anti-fork pin).
+    assert unmapped.collector.mismatch_policy is cli_mod._warn_tz_mismatch
+    # Once-per-run: a second collect warns again NOTHING, and the gauge holds its 1.
+    unmapped.collect()
+    assert len([w for w in unmapped.h.warns if MISMATCH_MARKER in w]) == 1
+    assert device_by_name(unmapped.collect())["tz_offset_mismatch_warnings"] == 1
 
 
 def test_site_labeled_fallback_run_counts_windows_per_ok_tick(tmp_path: Path) -> None:
@@ -546,45 +576,73 @@ def test_site_labeled_fallback_run_counts_windows_per_ok_tick(tmp_path: Path) ->
     site (fallback) label on every one -> site_labeled_windows == 3 (spec: should be
     ~0; this counter is how the §5 rollout gate PROVES it is ~0, so the number must
     come from the loop's own label, not a re-derivation). The fallback marker travels
-    through the warn sink too — the collector must not double-count it as a mismatch.
+    through the warn sink too (the loop emits it); the collector must not count it as
+    a tz warning, and must not double-emit it.
     """
     device = seeded_device()
     naive = (SCENARIOS / "naive_time" / "system_time.xml").read_text()
-    device.reset("GET", "/ISAPI/System/time?format=json", httpx.Response(200, text=naive))
+    device.reset("GET", SYSTEM_TIME_PATH, httpx.Response(200, text=naive))
     device.add_events(device_event(130, "2026-10-19T09:58:00"))
     h = CollectorHarness(tmp_path, device)
     results = h.ticks(3)
     assert all(r.ok for r in results)
     assert [r.window_label for r in results] == [SITE_LABELLED] * 3
 
-    v = device_by_name(h.snapshot())
+    v = device_by_name(h.collect())
     assert v["site_labeled_windows"] == 3
     assert v["tz_offset_mismatch_warnings"] == 0  # no claim -> None -> never a mismatch
-    assert FALLBACK_MARKER in "".join(h.h.warns) and len(h.h.warns) >= 3
+    assert len([w for w in h.h.warns if FALLBACK_MARKER in w]) == 3  # the loop's own lines
 
 
-# --- DoD (6): no secrets, no hosts beyond the site label -------------------------------------
+# --- DoD (6): no secrets, no hosts beyond the site label -------------------------------
 
 
 def test_emitted_text_carries_no_secret_shaped_strings(tmp_path: Path) -> None:
     """The card's NO SECRETS rule, scanned mechanically over every emitted line.
 
-    Deliberately built on the RICH run: dead-letter rows (payload bodies!), a parked
-    circuit with lockout counters in the 401 body, push targets and a db path on disk.
-    If any payload, endpoint, credential, host or lockout detail can reach the health
-    text, it can do it here — and none of it may.
+    Deliberately built on the RICH run: stored punches + dead-letter rows (full
+    payload bodies with employee_no + name!), a parked circuit whose 401 body carries
+    lockout counters, push targets and an absolute db path on disk, plus a
+    deliberately secret-shaped line pushed through the collector's warn funnel. If any
+    payload, credential, host or lockout detail can reach the health text, it can do
+    it here — and none of it may.
     """
-    h = healthy(tmp_path)
-    rowids = [event_rowid(h.h.conn, SERIAL, sn) for sn in (100, 101)]
+    device = seeded_device()
+    # Distinctive payload values (the helper's "1"/"User E1" are substrings of
+    # ordinary metric text — a scan against them would prove nothing).
+    device.add_events(
+        {**device_event(150, "2026-10-19T09:52:00"),
+         "employeeNoString": "EMP90071", "name": "Zsocia Kvintal"},
+        {**device_event(151, "2026-10-19T09:55:00"),
+         "employeeNoString": "EMP90072", "name": "Vexly Quorumbat"},
+    )
+    h = CollectorHarness(tmp_path, device)
+    h.ticks(2)  # both punches stored BEFORE the auth fault is armed
+    assert [r["serial_no"] for r in h.h.stored_rows()] == [150, 151]
+
+    # The device turns locked mid-life: the next tick's search POST pays the locked 401.
+    device.add_raw("POST", EVENT_PATH, locked_401())
+    r = h.tick()
+    assert not r.ok and h.h.client.circuit_open()
+    # A secret-shaped warning pushed through the funnel must never reach the text.
+    h.collector.observe_warn("warning: password=admin token=*** digest secret")
+
+    endpoint = stub_endpoint(tmp_path)
+    rowids = [
+        x
+        for x in (event_rowid(h.h.conn, SERIAL, 150), event_rowid(h.h.conn, SERIAL, 151))
+        if x is not None
+    ]
+    assert len(rowids) == 2
+    enqueue_events(h.h.conn, rowids, endpoint=endpoint, now=T0)
 
     def failing(url: str, body: str) -> int:
         raise ConnectionError("ingest down")
 
-    enqueue_events(h.h.conn, rowids, endpoint=STUB_ENDPOINT, now=T0)
     for elapsed in (60, 7260):  # fail past the bound on the second drain
         drain(
             h.h.conn,
-            endpoint=STUB_ENDPOINT,
+            endpoint=endpoint,
             transport=failing,
             now=T0 + timedelta(seconds=elapsed),
             rng=lambda: 0.5,
@@ -592,11 +650,11 @@ def test_emitted_text_carries_no_secret_shaped_strings(tmp_path: Path) -> None:
             log=h.collector.observe_push_log,
         )
     h.collector.observe_skew(SERIAL, Skew(skew_seconds=-7.5))
-    snap = h.snapshot()
+    snap = h.collect()
     text = healthz_text(snap) + metrics_text(snap)
 
-    assert h.h.last_tick.device_serial == SERIAL  # sanity: the scan saw a real run
-    forbidden = [PASSWORD, "fakepw", "192.0.2.10", STUB_ENDPOINT, "admin", "Bearer", "digest"]
+    assert h.last_tick is not None  # sanity: the scan ran over a real run
+    forbidden = [PASSWORD, "fakepw", "192.0.2.10", endpoint, "admin", "Bearer", "digest"]
     offenders = [needle for needle in forbidden if needle.lower() in text.lower()]
     assert offenders == []
     assert re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text) is None, "an IPv4 in healthz"
@@ -610,82 +668,121 @@ def test_emitted_text_carries_no_secret_shaped_strings(tmp_path: Path) -> None:
     assert f"site: {SITE}" in text
 
 
-# --- collector seams the agent process uses ---------------------------------------------------
+# --- collector seams the agent process uses ---------------------------------------------
 
 
-def test_observed_skew_and_stall_threshold_render_on_the_snapshot(tmp_path: Path) -> None:
-    """observe_skew stores the gauge; the stall threshold is caller policy, echoed."""
+def test_observed_skew_is_a_gauge_not_a_degraded_trigger(tmp_path: Path) -> None:
+    """observe_skew stores the gauge; spec §2c keeps clock skew a WARNING channel.
+
+    The card's degraded rule is circuit-open / checkpoint stall only — a skewed clock
+    (even beyond SKEW_WARN_SECONDS) must never flip ok -> degraded here, and the
+    warning fires exactly ONCE per process (repeat observe calls update the gauge but
+    do not re-warn: repeating warnings train operators out of reading them).
+    """
     h = healthy(tmp_path)
-    h.collector.observe_skew(SERIAL, Skew(skew_seconds=-3.5, warn_seconds=120.0))
-    snap = h.snapshot()
-    assert device_by_name(snap)["device_clock_skew_seconds"] == -3.5
-    # A clock-skew warning is a WARNING (spec §2c), not a degraded trigger: ok stands.
+    h.collector.observe_skew(SERIAL, Skew(skew_seconds=-130.0, warn_seconds=120.0))
+    snap = h.collect()
+    assert device_by_name(snap)["device_clock_skew_seconds"] == -130.0
     assert snap.status == "ok"
+    assert len([w for w in h.h.warns if "skew" in w]) == 1
+    h.collector.observe_skew(SERIAL, Skew(skew_seconds=-131.0, warn_seconds=120.0))
+    assert device_by_name(h.collect())["device_clock_skew_seconds"] == -131.0
+    assert len([w for w in h.h.warns if "skew" in w]) == 1  # once per process
 
 
 def test_device_health_builder_is_pure_and_callable_directly(tmp_path: Path) -> None:
     """No sockets, no side effects: the builders are functions over state (card rule).
 
-    device_health() takes conn/stats/client/tick directly and reads only — running it
-    twice on the same store yields identical blocks, and neither run opens a request.
+    device_health() takes conn/stats/client/last_tick/clock directly and reads only —
+    running it twice on the same store yields identical blocks, and neither run opens
+    a device request.
     """
     h = healthy(tmp_path)
-    tick = h.h.last_tick
-    stats = h.collector.stats(SERIAL)
     mark = len(h.h.device.served)
-    first = device_health(
-        conn=h.h.conn,
-        device_serial=SERIAL,
-        stats=stats,
-        client=h.h.client,
-        last_tick=tick,
-        now=h.h.clock(),
-        monotonic=h.h.monotonic(),
-    )
-    second = device_health(
-        conn=h.h.conn,
-        device_serial=SERIAL,
-        stats=stats,
-        client=h.h.client,
-        last_tick=tick,
-        now=h.h.clock(),
-        monotonic=h.h.monotonic(),
-    )
+    kwargs: dict[str, Any] = {
+        "conn": h.h.conn,
+        "device_serial": SERIAL,
+        "stats": h.stats(),
+        "client": h.h.client,
+        "last_tick": h.last_tick,
+        "now": h.h.clock,
+        "monotonic": h.h.monotonic,
+    }
+    first = device_health(**{**kwargs, "now": h.h.clock()})
+    second = device_health(**{**kwargs, "now": h.h.clock()})
     assert len(h.h.device.served) == mark
-    assert [(m.name, m.value) for m in first.metrics()] == [
-        (m.name, m.value) for m in second.metrics()
+    assert [(m.name, m.value) for m in first.metrics] == [
+        (m.name, m.value) for m in second.metrics
     ]
     assert first.last_poll_ok_age_s == pytest.approx(300.0)
+    assert first.metrics and all(m.source for m in first.metrics)
 
 
 def test_auth_recoveries_match_the_clients_own_counter_after_a_recovery(tmp_path: Path) -> None:
     """The gauge must equal IsapiClient.auth_recoveries, not a constant (card DoD 2).
 
-    The fake retires the nonce after N authorized responses; the client recovers once
-    (auth_recoveries == 1, OBSERVED.md's routine event) and the health surface must
-    carry that exact number — an info counter, never an alert (spec §2c).
+    The fake retires the nonce every N authorized responses in the CHALLENGE-LESS
+    envelope-only shape (OBSERVED.md's live repro) — that is the shape the transport
+    counts as a recovery (a challenged 401 heals inside httpx and is NOT one). The
+    health surface must carry the client's exact number, and a recovery is never a
+    degraded trigger (spec §2c: recoveries are info).
     """
     device = seeded_device()
-    device.add_events(device_event(140, "2026-10-19T09:58:00"))
-    device.expire_after = 3  # retire after 3 authorized responses: recovery fires
+    device.add_events(
+        device_event(140, "2026-10-19T09:58:00"),
+        # a later punch too: the checkpoint keeps ADVANCING (the collect at 10:20
+        # must show a healthy 600 s checkpoint age, not an unrelated stall).
+        device_event(141, "2026-10-19T10:08:00"),
+    )
+    device.retire_after = 5  # bootstrap pays 4 authed GETs; the 5th (event POST) retires
+    device.retire_shape = RETIRE_ENVELOPE_ONLY
     h = CollectorHarness(tmp_path, device)
     results = h.ticks(4)
     assert all(r.ok for r in results)
     assert h.h.client.auth_recoveries >= 1, "the scenario must actually rotate the nonce"
-    snap = h.snapshot()
+    snap = h.collect()
     assert device_by_name(snap)["auth_recoveries"] == h.h.client.auth_recoveries
-    assert snap.status == "ok"  # a recovery is never a degraded trigger (spec §2c)
+    assert snap.status == "ok"
 
 
-def test_snapshot_is_a_plain_dataclass_json_encodable(tmp_path: Path) -> None:
-    """/healthz JSON serving (P2-07) just dumps the snapshot — prove it encodes.
-
-    Every field must be JSON-serializable as-is (frozen dataclasses -> dicts, no
-    datetimes/connections leaking), and the dump must also pass the secret scan, since
-    the JSON surface carries the same content as the text surface.
+def test_snapshot_json_round_trips_for_a_separate_reader(tmp_path: Path) -> None:
+    """/healthz JSON serving: P2-07's socat reads state written by the agent loop, so
+    the snapshot must survive a JSON round trip (same object, same render) — the
+    documented sidecar contract of this card. Every field is plain JSON-typed; no
+    datetime or connection leaks in, and the dump passes the same secret scan as the
+    text surface.
     """
-    snap = healthy(tmp_path).snapshot()
-    blob = json.dumps(snap.to_dict(), sort_keys=True)
-    assert f'"site": "{SITE}"' in blob or f'"site":"{SITE}"' in blob.replace(" ", " ")
-    assert PASSWORD not in blob and "192.0.2.10" not in blob
+    snap = healthy(tmp_path).collect()
+    blob = snapshot_to_json(snap)
+    assert f'"site": "{SITE}"' in blob
     assert '"status": "ok"' in blob
+    assert PASSWORD not in blob and "192.0.2.10" not in blob
+    restored = snapshot_from_dict(json.loads(blob))
+    assert restored == snap
+    assert healthz_text(restored) == healthz_text(snap)
+    assert metrics_text(restored) == metrics_text(snap)
+
+
+def test_mismatch_policy_input_is_the_stores_own_rows_never_rederived(
+    tmp_path: Path,
+) -> None:
+    """The policy input is `EventRecord.from_dict` of the stored lines (p1-12's rule:
+    a summary that recomputes can disagree with the records it summarizes).
+
+    The handed-over records match the store column for column, and their
+    `tz_offset_mismatch` agrees with the column the records gauge counts.
+    """
+    h = healthy(tmp_path / "records")
+    records = h.collector.mismatch_records(SERIAL)
+    assert len(records) == 7
+    assert all(isinstance(r, EventRecord) and r.tz_offset_mismatch is True for r in records)
+    rows = h.h.conn.execute(
+        "SELECT serial_no, employee_no, tz_offset_mismatch FROM events ORDER BY serial_no"
+    ).fetchall()
+    assert [(r.serial_no, r.employee_no) for r in records] == [
+        (row["serial_no"], row["employee_no"]) for row in rows
+    ]
+    assert all(
+        (r.tz_offset_mismatch is True) == bool(row["tz_offset_mismatch"])
+        for r, row in zip(records, rows, strict=True)
+    )
