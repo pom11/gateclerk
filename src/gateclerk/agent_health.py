@@ -318,7 +318,6 @@ class AgentHealthCollector:
         site: str,
         conn: sqlite3.Connection,
         db_path: str,
-        db_warn_bytes: int,
         checkpoint_stall_s: float,
         tz_mapping_declared: bool,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -333,7 +332,6 @@ class AgentHealthCollector:
         self.site = site
         self._conn = conn
         self._db_path = db_path
-        self._db_warn_bytes = db_warn_bytes
         self.checkpoint_stall_s = checkpoint_stall_s
         self.tz_mapping_declared = tz_mapping_declared
         self._now = now

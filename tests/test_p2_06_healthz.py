@@ -50,7 +50,7 @@ import httpx
 import pytest
 
 import gateclerk.cli as cli_mod
-from fakedevice import RETIRE_ENVELOPE_ONLY
+from fakedevice import RETIRE_ENVELOPE_ONLY, invalid_content
 from gateclerk import __version__
 from gateclerk.agent_health import (
     DEVICE_METRIC_NAMES,
@@ -165,7 +165,6 @@ class CollectorHarness:
             site=SITE,
             conn=self.h.conn,
             db_path=str(self.db_path),
-            db_warn_bytes=2 * 1024**3,
             checkpoint_stall_s=checkpoint_stall_s,
             tz_mapping_declared=(
                 device_tz is not None if tz_mapping_declared is None else tz_mapping_declared
@@ -597,6 +596,15 @@ def test_site_labeled_fallback_run_counts_windows_per_ok_tick(tmp_path: Path) ->
     assert v["tz_offset_mismatch_warnings"] == 0  # no claim -> None -> never a mismatch
     assert len([w for w in h.h.warns if FALLBACK_MARKER in w]) == 3  # the loop's own lines
 
+    # search_termination fallback: a collect with NO tick in hand still reports what
+    # the last OBSERVED tick said — the loop hands it over at observe_tick, the health
+    # side never re-walks (a collector whose ticks map was cleared mid-serve must not
+    # render "unknown" for a metric it already saw). Derived value: the naive box's
+    # last completed chunk ended NOMATCH, and that is exactly what both paths report.
+    assert h.last_tick.termination == "NOMATCH"  # the scenario's actual chunk verdict
+    no_tick = h.collector.collect(clients={SERIAL: h.h.client}, ticks={})
+    assert device_by_name(no_tick)["search_termination"] == h.last_tick.termination
+
 
 # --- DoD (6): no secrets, no hosts beyond the site label -------------------------------
 
@@ -866,7 +874,6 @@ def test_wiring_guards_and_unparseable_observations_are_loud_or_silent_as_approp
             site=SITE,
             conn=h.h.conn,
             db_path=str(h.db_path),
-            db_warn_bytes=1,
             checkpoint_stall_s=0.0,
             tz_mapping_declared=False,
         )
@@ -910,3 +917,47 @@ def test_default_warn_sink_prints_to_stderr(tmp_path: Path) -> None:
     with contextlib.redirect_stderr(buffer):
         _stderr_warn("healthz sink probe")
     assert "healthz sink probe" in buffer.getvalue()
+
+
+def test_warn_stream_never_double_counts_the_fallback_gauge(tmp_path: Path) -> None:
+    """`observe_warn` counts the FALLBACK marker only — not the mismatch marker, never
+    a second count from the stream when the tick label already counted (p1-05c prints
+    the fallback line per risky window; the gauge's source of truth is the loop label).
+
+    This is the anti-M5 pin: if the fallback counter were wired to the warn stream
+    instead of the tick label, an ok tick whose label is fallback would count nothing
+    here and every fallback line would count double.
+    """
+    h = CollectorHarness(tmp_path / "warnstream", seeded_device())
+    h.collector.observe_warn(f"{FALLBACK_MARKER} duplicate line one")
+    h.collector.observe_warn(f"{FALLBACK_MARKER} duplicate line two")
+    assert h.stats().site_labeled_windows == 0, "the stream must not seed the gauge"
+    h.collector.observe_warn(f"{MISMATCH_MARKER} tz summary")
+    assert h.stats().site_labeled_windows == 0, "the mismatch marker is not the fallback"
+    assert h.stats().mismatch_warnings is None, "warn observation must not run the policy"
+
+
+def test_auth_terminal_failures_counts_auth_verdicts_only(
+    tmp_path: Path,
+) -> None:
+    """A WRONG-PASSWORD terminal 401 counts once; a non-auth walk failure counts ZERO.
+
+    The counter is the transport's auth verdict (`IsapiAuthError.terminal`), not
+    "tick failed": folding every failure in would page on/off-call noise as credential
+    trouble (spec §2c splits the two). The non-auth arm: content error via the same
+    harness shape (503 -> IsapiBadContent -> ok=False, exception is NOT auth-shaped).
+    """
+    device = seeded_device()
+    device.add_events(device_event(160, "2026-10-19T09:56:00"))
+    h = CollectorHarness(tmp_path, device, client_password="wrongpw")
+    r = h.tick()
+    assert not r.ok and h.h.client.circuit_open()
+    assert device_by_name(h.collect())["auth_terminal_failures"] == 1
+
+    device2 = seeded_device()
+    device2.add_events(device_event(170, "2026-10-19T09:56:00"))
+    device2.reset_raw("POST", EVENT_PATH, invalid_content())
+    h2 = CollectorHarness(tmp_path / "nonauth", device2)
+    r2 = h2.tick()
+    assert not r2.ok and type(r2.exception).__name__ == "IsapiBadContent"
+    assert device_by_name(h2.collect())["auth_terminal_failures"] == 0
