@@ -1,9 +1,12 @@
 # Enrollment migration between devices — design (E1)
 
-Status: **ORCHESTRATOR-AUTHORED v3, operator-delegated 2026-10-21** ("you own the
+Status: **ORCHESTRATOR-AUTHORED v4, operator-delegated 2026-10-21** ("you own the
 design end to end"). Two adversarial reviews returned (write-path correctness; ISAPI
 realism + fake strictness), **both FIX-FIRST**; §11 is the real reconciliation log —
-v3 applies their new findings on top of v2's pre-hardening. Track name **E1**
+v3 applies their new findings on top of v2's pre-hardening. **v4 = operator scope
+correction + the read-axis probes it triggered** (faces and fingerprints are THE
+PRODUCT, not an optional tail; both READS are now PROVEN on bench A, so v3's
+report-only verdicts on them are replaced by capture-gated ports). Track name **E1**
 (deliberately not "P3" — P3/BC stays out of scope, owner decision).
 This is the FIRST feature that WRITES to devices; every rule below exists because of
 that.
@@ -43,38 +46,48 @@ Each row says what the probe PROVES and what it does not:
 
 | surface | endpoint (JSON form) | proven | NOT proven (gap) |
 |---|---|---|---|
-| users | POST `UserInfo/Search` | read works — 4 users; record carries `employeeNo,name,userType,Valid{enable,beginTime,endTime,timeType},doorRight,RightPlan[],belongGroup,localUIRight,maxOpenDoorTime,numOfCard,numOfFace,numOfFP,password,gender,...` | that `UserInfo/SetUp` exists/accepts this shape (write-confirm step, §5.0) |
-| cards | POST `CardInfo/Search` | query shape answers (device had 0 cards — read path exercised, data not) | that export returns real cardNo values (verify during A snapshot) or `CardInfo/SetUp` accepts them |
+| users | POST `UserInfo/Search` (cond **wrapped**: `{"UserInfoSearchCond":{searchID,…}}` — flat bodies 400 `badJsonContent`; `searchID` REQUIRED) | read works — 4 users; record carries `employeeNo,name,userType,Valid{enable,beginTime,endTime,timeType:"local"},doorRight,RightPlan[{doorNo,planTemplateNo}],belongGroup,localUIRight,maxOpenDoorTime,numOfCard,numOfFace,numOfFP,password(≤8,ch),gender,…`; `EmployeeNoList:[{employeeNo}]` filter **PROVEN HONORED** (1→1, 99→0 NO MATCH); paging `maxResults=2`→MORE | that `UserInfo/SetUp` exists/accepts this shape (write-confirm step, §5.0; caps `supportFunction @opt` DOES list `setUp`) |
+| cards | POST `CardInfo/Search` (wrapped `CardInfoSearchCond`) | query shape answers (device had 0 cards — read path exercised, data not); caps: `supportFunction` lists `setUp`, `cardNo` ≤20, `cardType ∈ normalCard,patrolCard,hijackCard,superCard`, `maxRecordNum=3000` | that export returns real cardNo values (verify during A snapshot) or `CardInfo/SetUp` accepts them |
 | per-person detail | POST `UserInfoDetail/Search` | **404/400 notSupport** on this fw — door rights live IN the UserInfo record (`RightPlan`), no separate endpoint | — |
 | face libs | GET `Intelligent/FDLib` | FDID 1 `blackFD`, FDID 2 `infraredFD` | — |
-| face records | POST `Intelligent/FDLib/FDSearch` | **400 `MessageParametersLack: faceLibType` on ~8 body shapes** — UNRESOLVED (R1) | face export entirely; ALSO unproven: which endpoint accepts a face PICTURE on the target (`FDLib/pictureUpload` vs `FDLib/FDSetUp` vs person-photo endpoint) — R1 now covers BOTH ends (§8) |
-| fingerprints | POST `AccessControl/FingerPrint/Search` | **notSupport** — templates not even readable on this fw (one user `numOfFP=1` enrolled via UI → cannot migrate) | — |
-| plan templates | `PlanTemplate*` | **notSupport** — `RightPlan[].templateNo` are device-local preset references | the preset table's meaning on each device (probe records templateNo range discovered from UserInfo records only) |
-| caps | GET `AcsCfg/capabilities` | works (JSON); `saveFacePic=true,false` | user/card MAX counts (`UserInfo/Search/capabilities` 404s on A) → capacity: fail-fast strategy §5 step 3 |
+| face records | POST `Intelligent/FDLib/FDSearch` — **FLAT body (no wrapper! device dialect differs per endpoint)**: `{searchResultPosition,maxResults,faceLibType:"blackFD",FDID:"1"[,FPID:"<employeeNo>"]}` | **RESOLVED 2026-10-21 (operator shape confirmed):** rows carry `FPID` (= employeeNo, the ACS binding), `faceURL` and **`modelData`** (base64 face TEMPLATE, 272 B, magic `FR500005\x01…`; `FDLib/capabilities isSupportModelData=true`). Paging quirk: maxResults=30 returned 3 of totalMatches=4 → walker must page to NO MATCH. `FDLib/FDSetUp` EXISTS (GET → `methodNotAllowed`, not 404) | face **photo bytes**: `faceURL` GETs 404 (with `@WEB…` token, %-encoded, fresh-cookie — dead on this fw; capture session gets one bounded retry of alternatives). face **upload**: which of `FDLib/FDSetUp` / `FaceDataRecord` accepts a `modelData` (± JPEG) is UNVERIFIED → §5.0 capture (R1 now = upload end only) |
+| fingerprints | READ: POST `AccessControl/FingerPrintUpload?format=json` `{"FingerPrintCond":{searchID,employeeNo,fpIndex,dataType:"template"}}` (misleading name = device→client) | **RESOLVED 2026-10-21 (operator shape confirmed):** emp 1 `fpID=1 normalFP` template returned (512 B, header `30 31 31`-style ASCII "301" = third-party sensor family, NOT self-identified). `FingerPrint/Search` really is notSupport; `FingerPrintDownload/capabilities` 404 | WRITE via `FingerPrintDownload` (client→device) is documented-hypothesis → §5.0 capture. Cross-device portability only claimable WITHIN the same sensor family; target fw unknown until B/C creds |
+| plan templates | `PlanTemplate*` + GET `UserInfo/capabilities` | notSupport (no content read); caps DO expose `RightPlan{maxSize:1,doorNo:1,maxPlanTemplate:4,planTemplateNo 1..255}`; **every UserInfo record on A uses `planTemplateNo:"1"`** | preset CONTENT still unreadable; `templateNo 1` = Hikvision all-day built-in is vendor convention + bench-evidence (all users), see §1a v4 rule |
+| caps | GET `UserInfo/capabilities`, `CardInfo/capabilities`, `FDLib/capabilities`, `AcsCfg/capabilities` | all four work (JSON). UserInfo: `maxRecordNum=3000`, `password ≤8`, `Valid timeType @opt "local"` ONLY, `userType @opt normal,visitor,blackList` (no admin option), time range 2000-01-01…2037-12-31. FDLib: `FDMaxNum=2`, `FDRecordDataMaxNum=3000`, `modelMaxNum=1`, **`isSuportFDSearch=false` while FDSearch demonstrably WORKS** — caps under-claim too | true device CAPACITY (max enrolled users/cards) still unexposed → capacity: fail-fast §5 step 4 (`maxRecordNum` is a batch/page cap, NOT capacity) |
 
-Scope cut (first ship): **users identity/validity port; cards port (ownership-checked,
-§4); RightPlan/doorRight REPORT-ONLY by default (§1a); fingerprints report-only never
-portable; PINs never persisted (§2); faces report-only optional (§8 R1).**
+Scope cut (v4 — faces + FP templates are THE PRODUCT, operator 2026-10-21): **users
+identity/validity port; cards port (ownership-checked, §4); face migration =
+`modelData` template port (export PROVEN, upload = critical-path capture §5.0);
+fingerprint template port (export PROVEN, write capture §5.0, same-sensor-family
+rule); RightPlan/doorRight carried per §1a v4 (templateNo 1 default-allowed);
+PINs never persisted (§2); face PHOTO bytes out of scope (faceURL 404 on this fw —
+the template is what makes a face work, not the JPEG).**
 
 `employeeNo` is an OPAQUE BYTE STRING — exact match, never int-cast, never
 case-normalized (leading zeros are data: `"007"` ≠ `"7"`; two terminals must not be
 allowed to disagree silently — a source/target pair differing only by such a
 normalization is a CONFLICT, skipped by default).
 
-**§1a — doorRight/RightPlan are REPORT-ONLY by default (reviewer BLOCKER: silent
-access corruption).** `RightPlan[].templateNo` names a DEVICE-LOCAL preset whose
-content is **unprovable on this family** (PlanTemplate is notSupport, §1): copying
-`templateNo=3` from A to B can install a DIFFERENT access schedule under the same
-number — worse than data loss, it is silently wrong ACCESS CONTROL, and neither diff
-nor verify can see it (the numbers match, the meaning differs). The only existence
-evidence is the union of templateNos observed in the target's own UserInfo records,
-and existence ≠ content. Therefore: `RightPlan`/`doorRight` are carried in the bundle
-+ diffed + **reported as needing on-site application**, and only written when the
-operator passes `--carry-templates` AND the target probe's evidence set contains the
-number — and the run report then states in terms: **template content UNVERIFIED —
-verify the schedule on-site**. `userType` (admin/normal) is likewise a security field:
-carried, but every carried `admin`/`localUIRight` value is listed in the report for
-explicit operator acknowledgement before apply.
+**§1a — doorRight/RightPlan: templateNo 1 default-allowed, custom numbers
+REPORT-ONLY (v4, operator + reviewer).** `RightPlan[].templateNo` names a
+DEVICE-LOCAL preset whose content is unreadable on this family (PlanTemplate
+notSupport, §1). v4 evidence change: on bench A **every** UserInfo record references
+`planTemplateNo:"1"` and caps expose `maxPlanTemplate:4` — Hikvision ACS convention
+is that plan template 1 is the built-in all-day schedule, identical on every device
+of the family (v3's blanket report-only made every migrated person land with NO door
+right, which is its own failure mode). v4 rule, three tiers:
+- `planTemplateNo == "1"` → **carried by default** (built-in all-day; the bench
+  capture §5.0 includes one read-back assertion that a carried template-1 person
+  shows the identical RightPlan on read-back);
+- any custom number (2..255) → REPORT-ONLY unless `--carry-templates` AND the number
+  appears in the target probe's evidence set (union of target UserInfo RightPlan
+  numbers); carried customs print in the report as **content UNVERIFIED — verify the
+  schedule on-site**;
+- `doorRight`/`belongGroup`/`doorNo` follow the same device-local-ID rule.
+`userType` (admin/normal) is likewise a security field: carried, but every carried
+`localUIRight=true` or non-`normal` userType is listed in the report for explicit
+operator acknowledgement before apply (note: A's caps only offer
+`normal,visitor,blackList` — no `admin` writable on this fw).
 
 ## 2. Portable bundle format (on disk)
 
@@ -86,8 +99,13 @@ bundles/<site>-<host>/
   people.jsonl      # normalized UserInfo records, one per line. `password` NEVER
                     # written — not even with --carry-pins (see below)
   cards.jsonl       # normalized CardInfo records (employeeNo, cardNo)
-  faces/<employeeNo>.jpg   # only if R1 cracked; absent otherwise (faces/INDEX.json
-  faces/INDEX.json         # then states faces=UNAVAILABLE with the reason)
+  faces/<employeeNo>.b64       # FDSearch `modelData` = the face TEMPLATE (base64 as
+                               # the device gave it; opaque bytes, never parsed)
+  faces/INDEX.json             # per-person: FDID, FPID, template sha256+length, and
+                               # the faceURL-404 note (photo bytes NOT exportable on
+                               # this fw — recorded fact, not an omission)
+  fingerprints/<employeeNo>-<fpIndex>.b64  # FingerPrintUpload-read templates
+                               # (opaque bytes + sensor-family note from header)
 ```
 
 - **The volatile strip list is FROZEN in the manifest**: `openDoorTime`,
@@ -162,11 +180,18 @@ flag must be explicit).
 
 **Step 0 — endpoint confirmation (a MERGE GATE, not a runtime hope).** Before any
 code containing a write verb merges: every write verb's exact endpoint+shape is
-CONFIRMED against bench A — capabilities GETs (read-only) + one operator-recorded
-live capture (orchestrator-run, post-E1-01 snapshot): one-person SetUp round-trip
-(write → read back → restore), response bodies recorded as fixtures, fake replays
-them. Unconfirmed verb ⇒ the phase ships REPORT-ONLY. This step is E1-04's first
-deliverable.
+CONFIRMED against bench A — capabilities GETs (read-only, DONE 2026-10-21: UserInfo/
+CardInfo/FDLib/AcsCfg caps recorded in §1; `UserInfo/SetUp/capabilities` and
+`FingerPrintDownload/capabilities` are 404, so the remaining verbs are confirmed only
+by live capture) + ONE operator-recorded live capture session (orchestrator-run,
+after the E1-01 export snapshot of A): users SetUp round-trip (one test person:
+write → read back → restore), one card write → NONZERO `CardInfo/Search` fixture,
+FP write via `FingerPrintDownload` → `FingerPrintUpload`-Cond read-back, face upload
+(`FDLib/FDSetUp` vs `FaceDataRecord`, modelData ± JPEG) → FDSearch read-back. The
+operator's instruction is ONE device session for all of it (export snapshot first,
+then round-trips, then restore) — fewer sessions, same fixtures. Response bodies
+recorded as fixtures; fake replays them. Unconfirmed verb ⇒ the phase ships
+REPORT-ONLY. This step is E1-04's first deliverable.
 
 1. require fresh probe (§3) + **pre-write snapshot of the target** (full export
    bundle of the target written before ANY mutation — the rollback source; on A this
@@ -176,12 +201,15 @@ deliverable.
    wall clocks (payroll-critical): ABORT the apply naming the skew — we never touch
    device clocks (standing rule), we refuse to write relative validity into a lying
    clock. `timeType=absolute` runs may proceed (wall digits are explicit).
-2. order: users phase → **verify users** → cards phase → verify cards (a card needs
-   its person; verify between phases so a bad person batch never compounds);
+2. order: users phase → **verify users** → cards phase → verify cards → fingerprints
+   phase → verify FP → faces phase → verify faces (a card/face/FP needs its person;
+   verify between phases so a bad person batch never compounds);
 3. batching + budget math (explicit, tested): per person worst case = 1 user write +
-   ≤1 card write + 1 read-back ≈ 3 authed calls ≈ ≤6 digest requests; client
-   re-bootstraps at **80 authed calls** (well inside the ~190 cap, OBSERVED.md;
-   re-bootstrap is the offline-proven P1 recovery arm — §0.5 note); sleep 1s between
+   ≤1 card write + 1 FP template write + 1 FP read-back + 1 face upload + 1 FDSearch
+   read-back ≈ 6 authed calls ≈ ≤12 digest requests (v4: FP/face phases added to the
+   ledger); client re-bootstraps at **80 authed calls** (well inside the ~190 cap,
+   OBSERVED.md; re-bootstrap is the offline-proven P1 recovery arm — §0.5 note);
+   sleep 1s between
    batches. Batch size from the device's own `@max` where discoverable, else 10
    (the ≤40 figure was invented; it is now derived, not asserted);
    **write-field set ≠ bundle record**: SetUp bodies carry ONLY the writable
@@ -204,10 +232,20 @@ deliverable.
    written, the bench capture must write one card to a test person and record the
    NONZERO `CardInfo/Search` response as a fixture (E1-05 prerequisite); until then
    card export is shape-strict (unseen keys/shape → abort, never guess);
-6. faces: only if R1 confirmed BOTH ends (§8); the face phase needs its OWN verify
-   arm — a face upload does NOT change the UserInfo content-hash, so §6's user verify
-   proves nothing about it (reviewer MAJOR). Face verify = the recorded read
-   (FDSearch row / per-FDID count delta) captured in the same bench step;
+6. faces: **template port is the product (v4)** — export is PROVEN (FDSearch
+   `modelData`, §1); the upload endpoint (`FDLib/FDSetUp` — exists per
+   `methodNotAllowed` — vs `FaceDataRecord`) + exact multipart/body shape comes from
+   the §5.0 capture BEFORE any upload code or fake route merges (capture-before-fake,
+   §9). The face phase needs its OWN verify arm — a face upload does NOT change the
+   UserInfo content-hash, so §6's user verify proves nothing about it (reviewer
+   MAJOR). **Face verify = re-run FDSearch for the FPID and compare `modelData`
+   hash + length against the journal's intended template** (FDSearch read is proven
+   on A; the capture must record the read-back pair). §6's user verify stays
+   hash-based; FP verify = re-read via `FingerPrintUpload` Cond, compare template
+   hash. `modelMaxNum=1` + `FDMaxNum=2` are recorded probe facts, not guessed
+   semantics; capacity rejects are fail-fast (§5 step 4). Face PHOTO bytes are out of
+   scope on this fw (faceURL 404s, §1); if a target fw serves photo bytes the
+   bundle format has room for them later;
 7. verify (§6) after each phase; mismatch = terminal (§0.6);
 8. **no deletions ever** in v1. Undo (§5a) is the only removal path.
 
@@ -230,11 +268,11 @@ trust):
 
 After each phase, re-`Search` the target for the touched employeeNos and compare
 content-hashes (§2) computed by the SAME normalization both sides use. **The
-server-side `employeeNoList` filter is UNPROVEN on this fw** (reviewer MAJOR): the
-verify walker must be pinned BOTH ways — try the filtered search, verify the returned
-set actually covers the requested list (the "filter is a hint, not a promise" rule
-from OBSERVED: the suffixless `employeeNo` form is SILENTLY IGNORED), and fall back
-to full paging + CLIENT-SIDE exact-match filtering whenever coverage is incomplete.
+server-side `EmployeeNoList` filter is PROVEN HONORED on A (2026-10-21 A/B:
+`[{"employeeNo":"1"}]` → 1/4, `"99"` → 0/NO MATCH)** — but the coverage-proof
+discipline stays (OBSERVED: some Hikvision filters ARE silently ignored, e.g.
+`AcsEventCond.employeeNo`): the walker asserts the returned set covers the requested
+list and falls back to full paging + CLIENT-SIDE exact-match whenever it doesn't.
 Per-person verdict `ok | mismatch | missing`. **Fail-closed on unknown fields**: a
 target record carrying fields outside the volatile list that the source record lacks
 is `mismatch`, not `ok` (a device that silently rejected/mangled data is exactly
@@ -257,16 +295,22 @@ commands: stable schema, PII-free (hashes/counts only, §4).
 
 ## 8. Open risks
 
-- **R1 — faces: BOTH ends unconfirmed (face export AND import).** Export: ~8
-  FDSearch shapes rejected (`MessageParametersLack: faceLibType`; XML variants
-  rejected at envelope — probe rounds 2026-10-21). Import: which endpoint accepts a
-  face picture for a person on this family (`FDLib/pictureUpload`? `FDLib/FDSetUp`?
-  person-photo endpoint?) is documented-hypothesis only — the claim "target
-  re-extracts its own template" is UNVERIFIED and gets its own bench-A capture under
-  E1-06 before any upload code merges. Remaining read-only options: device's
-  `FDSearch/capabilities` doc on other fw; vendor docs for this family; Hikvision
-  Web SDK samples. **Faces are OPTIONAL and additive; E1 ships users+cards with faces
-  "reported, skipped" — if either end stays unconfirmed, faces stay on-site enrolled.**
+- **R1 — faces: export end RESOLVED 2026-10-21 (operator's shape was right); the
+  upload end is the critical path, not an optional tail.** `FDSearch` (FLAT body,
+  `faceLibType:"blackFD"`, `FDID:"1"`, optional `FPID:"<employeeNo>"`) returns per
+  person a `modelData` face TEMPLATE (272 B, magic `FR500005\x01…`) — the thing that
+  actually makes face unlock work. Photo bytes via `faceURL` are DEAD on this fw
+  (404 with token, %-encoded and fresh-cookie alike, §1) — so v4 migrates the
+  TEMPLATE, and the JPEG is a nice-to-have, not the product. Remaining unknown:
+  which write verb accepts it (`FDLib/FDSetUp` exists per `methodNotAllowed`;
+  `FaceDataRecord` unprobed at write) and whether it takes modelData directly or
+  demands a JPEG for re-modeling (`modelMaxNum=1` hints the device models from
+  picture). **This is the §5.0 capture's first experiment, and E1-06 is therefore on
+  the critical path (v4, operator: "FACES ARE THE PRODUCT")** — E1-06's fake routes
+  and code both wait on the capture fixtures. If the capture shows the device only
+  accepts a JPEG it cannot obtain (photo bytes unexportable), faces fall back to
+  report-only WITH the reason recorded; that outcome is decided by evidence in the
+  capture, not by optimism.
 - **R2 — write-verb semantics** (SetUp merge vs overwrite per field, batch caps,
   response envelopes): resolved by §5 step 0 bench-A capture as E1-04's FIRST
   deliverable; code merges after, fake replays the captured fixtures.
@@ -281,8 +325,18 @@ commands: stable schema, PII-free (hashes/counts only, §4).
 FakeDevice gains enrollment endpoints **with A's discovered truth**, and its
 strictness must mirror each live-learned axis:
 - notSupport matrix exactly as probed (UserInfoDetail, FingerPrint/Search,
-  PlanTemplate, capabilities GETs 404);
-- FDSearch rejects what the device rejects (R1 shapes);
+  PlanTemplate, `UserInfo/SetUp/capabilities` + `FingerPrintDownload/capabilities`
+  404) — while the PROVEN-WORKING routes stay demanding: `UserInfo/Search` requires
+  the WRAPPED `UserInfoSearchCond` + `searchID` (flat body → `badJsonContent`,
+  missing searchID → `MessageParametersLack` — the device rejects BOTH ways, §1);
+  `FDSearch` requires the FLAT operator shape (`faceLibType`,`FDID`; FPID optional
+  filter) and rejects the wrapped style the users endpoint demands — **the per-
+  endpoint dialect split is itself a fake-strictness test**, because a client that
+  "helpfully" normalizes bodies across endpoints would pass a naive fake and die on
+  the device;
+- FDSearch behaves as discovered: FPID filter honored, `modelData` present on every
+  row, paging quirk (a page may return fewer than totalMatches with OK) — walker
+  must page to NO MATCH, the fake must be able to reproduce the quirk;
 - **write endpoints implement the bench-A CAPTURED semantics** (fixture replay from
   §5 step 0): merge-vs-overwrite per field, person-must-exist for cards, card
   uniqueness rejection, capacity rejection at the captured threshold — a fake that
@@ -304,14 +358,16 @@ strictness must mirror each live-learned axis:
 - timeType semantics: export stores BOTH raw pair and normalized absolute UTC;
   apply writes target-side wall digits when target `timeType=local` (payroll-critical,
   the p1-05 class bug applied up front);
-- **Target face/FP state is UNKNOWN, not zero** (reviewer MAJOR): FDSearch is broken
-  on this family, so a target person's face set cannot be read. Face/FP presence is
-  therefore taken from the `numOfFace`/`numOfFP` counters in the UserInfo record and
-  marked `UNKNOWN(unreadable, counter=N)`: if N > 0 and the bundle cannot account for
-  those enrollments, the person is a §4 **conflict** (skipped by default), never an
-  `update`. A count is not a set — the design never pretends otherwise. Same
-  treatment for `saveFacePic`-shaped capability switches: they are recorded as
-  discovered values with no inference about what the device will accept.
+- **Target face/FP state is UNKNOWN only when the READ fails** (v4 update — the
+  reviewer's MAJOR was written when both reads were thought dead; both now WORK on
+  A): face set = FDSearch rows for the person (compare against `numOfFace`), FP set =
+  `FingerPrintUpload`-Cond reads (compare against `numOfFP`). On a target fw where
+  either read 400s/404s mid-run, presence falls back to the counter and is marked
+  `UNKNOWN(counter=N)`: if N > 0 and the bundle cannot account for those
+  enrollments, the person is a §4 **conflict** (skipped by default), never an
+  `update`. A count is not a set — the design never pretends otherwise. Capability
+  switches (`saveFacePic`, `isSuportFDSearch=false`-despite-working) are recorded as
+  discovered values with NO inference either direction — this fw's caps under-claim.
 - freshness/drift: plan → concurrent target mutation → phase re-diff ABORTS;
   journal lifecycle: kill between `planned` and `applied` → undo touches nothing;
   undo of overwrite restores prior record; card bound to different employeeNo =
@@ -326,22 +382,28 @@ device — live bench steps are the orchestrator's, per fleet rule)
 
 | card | scope | parents |
 |---|---|---|
-| E1-01 | bundle format + export (users/cards) + hashes + PII hygiene (pin-strip at read, 0600, no-repo-out) + fail-closed reads | — |
+| E1-01 | bundle format + export (users/cards/**faces modelData/FP templates**) + hashes + PII hygiene (pin-strip at read, 0600, no-repo-out) + fail-closed reads | — |
 | E1-02 | diff engine + classification (incl. card-uniqueness/normalization conflicts) + freshness re-diff helper + report | 01 |
 | E1-03 | capability probe + matrix + staleness gate | — |
-| E1-04 | write foundation: **endpoint confirmation capture (orchestrator bench step, feeds fixtures)** + journal lifecycle + users phase + users verify | 02, 03 |
+| E1-04 | write foundation: **endpoint confirmation capture (orchestrator bench step — ONE session for users+card+FP+face fixtures per operator), feeds fixtures** + journal lifecycle + users phase + users verify | 02, 03 |
 | E1-05 | cards phase + undo (restore-before-delete) + capacity fail-fast wiring | 04 |
-| E1-06 | faces (R1: confirm BOTH ends on bench; additive; ships report-only until then) | 04 |
-| E1-07 | `gateclerk migrate` CLI group wiring 01-05 + `-o json` schema | 05 |
+| E1-06 | **faces: FDSearch template export (already PROVEN) + upload capture → fake → port + FDSearch-hash verify (critical path, v4; report-only ONLY if the capture proves the device cannot accept what export can produce)** | 04 |
+| E1-06b | fingerprints: template port (`FingerPrintDownload` write capture → fake → port + re-read verify; same-sensor-family rule) | 04 |
+| E1-07 | `gateclerk migrate` CLI group wiring 01-06b + `-o json` schema | 05, 06, 06b |
 
-Dispatch order (capture-before-fake is the spine, §9): **01 + 03 now** → 02 after 01
-→ **orchestrator bench-A step** (export snapshot via merged E1-01 first, then the
-§5.0 captures: one-person user SetUp round-trip fixture + one NONZERO `CardInfo/
-Search` fixture from a test-person card) → 04 (fake routes from fixtures, then code)
-→ 05 → 07; 06 whenever R1 falls. No PR containing a write verb is gated before its
-capture fixture exists in the tree.
+Dispatch order (capture-before-fake is the spine, §9): **01 + 03 now** (01's body
+updated to include faces/FP export — FDSearch + FingerPrintUpload reads are proven,
+so their NORMALIZERS are buildable offline against the recorded probe shapes) → 02
+after 01 → **orchestrator bench-A step, ONE session** (export snapshot via merged
+E1-01 first, then §5.0 captures in one device session: user SetUp round-trip +
+test-person card → NONZERO `CardInfo/Search` + FP write via `FingerPrintDownload` →
+read-back + face upload (`FDLib/FDSetUp` vs `FaceDataRecord`) → FDSearch read-back;
+restore everything at session end) → 04 (fake routes from fixtures, then code) → 05,
+06, 06b (06 gated on its face-upload fixture; report-only fallback recorded if the
+fixture can't exist) → 07. No PR containing a write verb is gated before its capture
+fixture exists in the tree.
 
-## 11. Review log (v1 → v2 → v3)
+## 11. Review log (v1 → v2 → v3 → v4)
 
 Two independent adversarial reviews ran on v2 — write-path correctness (3 BLOCKERs)
 and ISAPI realism + fake strictness (2 BLOCKERs, 1 MAJOR). Both verdicts FIX-FIRST.
@@ -385,3 +447,36 @@ unknown-field fail-closed verify.
 list is explicit, both sides, one module); "re-bootstrap is an unsupported claim"
 (P1 shipped it offline-proven; OBSERVED honestly says never live-exercised — E1 is
 its first live use).
+
+**v4 deltas (operator review + read-axis probes, 2026-10-21).** Operator: "FACES ARE
+THE PRODUCT… make R1 the critical path"; supplied the FDSearch and FingerPrintUpload
+shapes from K1T-family memory. Every supplied shape was verified live on A before
+being written into this doc (probe rounds 11-18, read-only, one attempt per shape):
+1. **FDSearch RESOLVED** — flat body, `faceLibType:"blackFD"`, `FDID`, optional
+   `FPID=employeeNo`; rows carry `modelData` (the portable face TEMPLATE) — face
+   export was never actually broken; v3's "8 shapes rejected" died on using the
+   users-endpoint's wrapped dialect on this endpoint (§9: dialect-split strictness).
+   `faceURL` photo bytes confirmed DEAD (404 every way). Faces port the template;
+   E1-06 moves from optional tail to critical path (§8 R1).
+2. **FP read RESOLVED** — `FingerPrintUpload` + `FingerPrintCond` returns real
+   templates (512 B, third-party sensor header); `FingerPrint/Search` notSupport was
+   the wrong door, not the only door. New card E1-06b; portability claim stays
+   same-sensor-family until B/C fw known (§1).
+3. **templateNo 1 default-carried** (§1a v4): every UserInfo on A uses
+   `planTemplateNo:"1"`, caps expose `maxPlanTemplate:4` — v3's blanket report-only
+   would have shipped every migrated person with no door right. Custom numbers keep
+   the v3 evidence-set discipline. Read-back assertion added to §5.0.
+4. **`UserInfo/Search` truth pinned**: wrapped `UserInfoSearchCond`, `searchID`
+   required, `EmployeeNoList` filter PROVEN honored (coverage discipline stays
+   anyway, §6), paging MORE/OK quirk recorded. `UserInfo/capabilities` +
+   `CardInfo/capabilities` + `FDLib/capabilities` all work (v3 claimed caps 404'd) —
+   `setUp` appears in both `supportFunction @opt`s, which is vocabulary evidence not
+   semantics evidence: R2 still waits on the §5.0 capture. Caps UNDER-claim
+   (`isSuportFDSearch=false` while FDSearch works) → §9: no inference from caps
+   either direction.
+5. **§5.0 capture = ONE orchestrator device session** (operator): export snapshot →
+   users round-trip → card → FP → face upload → read-backs → restore. E1-01 gains
+   faces/FP export (reads are proven, so normalizers build offline now).
+Not changed by v4 (operator: "rest of v3 stands"): §0 safety spine, capture-before-
+fake, journal/undo proof-of-add, freshness contract, PINs-never-persisted, card
+pair-identity.
