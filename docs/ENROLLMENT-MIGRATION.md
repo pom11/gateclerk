@@ -1,12 +1,10 @@
 # Enrollment migration between devices — design (E1)
 
-Status: **ORCHESTRATOR-AUTHORED v2, operator-delegated 2026-10-21** ("you own the
-design end to end"). Two adversarial reviewer passes were DISPATCHED (write-path
-correctness; ISAPI realism + fake strictness); v2 pre-emptively hardens against the
-standard classes both lenses target — §11 records what is in v2 and MUST be
-reconciled against the reviewers' actual verdicts when they land (add what they
-found, retract anything claimed that they did not). Track name **E1** (deliberately
-not "P3" — P3/BC stays out of scope, owner decision).
+Status: **ORCHESTRATOR-AUTHORED v3, operator-delegated 2026-10-21** ("you own the
+design end to end"). Two adversarial reviews returned (write-path correctness; ISAPI
+realism + fake strictness), **both FIX-FIRST**; §11 is the real reconciliation log —
+v3 applies their new findings on top of v2's pre-hardening. Track name **E1**
+(deliberately not "P3" — P3/BC stays out of scope, owner decision).
 This is the FIRST feature that WRITES to devices; every rule below exists because of
 that.
 
@@ -54,14 +52,29 @@ Each row says what the probe PROVES and what it does not:
 | plan templates | `PlanTemplate*` | **notSupport** — `RightPlan[].templateNo` are device-local preset references | the preset table's meaning on each device (probe records templateNo range discovered from UserInfo records only) |
 | caps | GET `AcsCfg/capabilities` | works (JSON); `saveFacePic=true,false` | user/card MAX counts (`UserInfo/Search/capabilities` 404s on A) → capacity: fail-fast strategy §5 step 3 |
 
-Scope cut (first ship): **users full port; cards port; faces report-only optional
-(§8 R1); fingerprints report-only never portable; PINs never persisted (§2);
-plan-template refs carried by number with conflict when target lacks the preset.**
+Scope cut (first ship): **users identity/validity port; cards port (ownership-checked,
+§4); RightPlan/doorRight REPORT-ONLY by default (§1a); fingerprints report-only never
+portable; PINs never persisted (§2); faces report-only optional (§8 R1).**
 
 `employeeNo` is an OPAQUE BYTE STRING — exact match, never int-cast, never
 case-normalized (leading zeros are data: `"007"` ≠ `"7"`; two terminals must not be
 allowed to disagree silently — a source/target pair differing only by such a
 normalization is a CONFLICT, skipped by default).
+
+**§1a — doorRight/RightPlan are REPORT-ONLY by default (reviewer BLOCKER: silent
+access corruption).** `RightPlan[].templateNo` names a DEVICE-LOCAL preset whose
+content is **unprovable on this family** (PlanTemplate is notSupport, §1): copying
+`templateNo=3` from A to B can install a DIFFERENT access schedule under the same
+number — worse than data loss, it is silently wrong ACCESS CONTROL, and neither diff
+nor verify can see it (the numbers match, the meaning differs). The only existence
+evidence is the union of templateNos observed in the target's own UserInfo records,
+and existence ≠ content. Therefore: `RightPlan`/`doorRight` are carried in the bundle
++ diffed + **reported as needing on-site application**, and only written when the
+operator passes `--carry-templates` AND the target probe's evidence set contains the
+number — and the run report then states in terms: **template content UNVERIFIED —
+verify the schedule on-site**. `userType` (admin/normal) is likewise a security field:
+carried, but every carried `admin`/`localUIRight` value is listed in the report for
+explicit operator acknowledgement before apply.
 
 ## 2. Portable bundle format (on disk)
 
@@ -103,7 +116,10 @@ required on apply targets:
   discovered fact, never assumed**; B/C firmwares unknown until creds arrive);
 - counts (users/cards from Search totals with OK check per §0.7); max-capacity:
   probed where discoverable (`deviceInfo`/`AcsCfg`), and where it is NOT discoverable
-  (true on A) capacity enforcement drops to fail-fast §5 step 4;
+  (true on A) capacity enforcement drops to fail-fast §5 step 4 — the probe records
+  the discovery attempt and its outcome, so a future fw that DOES expose caps upgrades
+  automatically and A's silence stays a recorded fact (reviewer: `AcsCfg` carries
+  behavior switches like `saveFacePic`, not user/card maxima);
 - **templateNo evidence (PlanTemplate is notSupport on this family)**: the only
   existence evidence for a plan template is the union of templateNos OBSERVED in the
   target's own UserInfo `RightPlan` records; a referenced templateNo absent from that
@@ -168,28 +184,57 @@ deliverable.
    re-bootstrap is the offline-proven P1 recovery arm — §0.5 note); sleep 1s between
    batches. Batch size from the device's own `@max` where discoverable, else 10
    (the ≤40 figure was invented; it is now derived, not asserted);
+   **write-field set ≠ bundle record**: SetUp bodies carry ONLY the writable
+   allow-list (employeeNo, name, userType, Valid, — door fields only per §1a — cards
+   via CardInfo, password only live with --carry-pins). Device-generated/read-only
+   keys (`photoURL`/`faceURL`, `gender`, `localUIRight`, counters, `numOf*`) are
+   NEVER echoed back: a read-shape echo risks 400 badJsonContent or silent partial
+   merges on unrecorded per-field semantics (R2). The allow-list is frozen from the
+   §5.0 bench capture, not from the search response;
 4. **capacity fail-fast**: where max counts are not discoverable (§1), a batch is
    still attempted, but the FIRST capacity-rejection response aborts the phase
    (partial-batch rollback = undo-journal of that phase) and reports which records
    were written — never a silent partial write;
-5. faces: only if R1 confirmed BOTH ends (§8);
-6. verify (§6) after each phase; mismatch = terminal (§0.6);
-7. **no deletions ever** in v1. Undo (§5a) is the only removal path.
+5. cards: `CardInfo/SetUp` merge. **Ownership-checked, not presence-checked**
+   (reviewer BLOCKER): a `cardNo` already on the target bound to a DIFFERENT
+   `employeeNo` is a §4 CONFLICT — never silently skipped (that person would never
+   get their card) and never silently reassigned (that strips someone else's).
+   Re-run idempotency is `(cardNo, employeeNo)` PAIR identity, not cardNo presence.
+   **No card fixture exists yet** (A had 0 cards, §1): before the card phase's fake is
+   written, the bench capture must write one card to a test person and record the
+   NONZERO `CardInfo/Search` response as a fixture (E1-05 prerequisite); until then
+   card export is shape-strict (unseen keys/shape → abort, never guess);
+6. faces: only if R1 confirmed BOTH ends (§8); the face phase needs its OWN verify
+   arm — a face upload does NOT change the UserInfo content-hash, so §6's user verify
+   proves nothing about it (reviewer MAJOR). Face verify = the recorded read
+   (FDSearch row / per-FDID count delta) captured in the same bench step;
+7. verify (§6) after each phase; mismatch = terminal (§0.6);
+8. **no deletions ever** in v1. Undo (§5a) is the only removal path.
 
-**§5a Journal + undo.** Journal is append-only JSONL; each entry has lifecycle:
-`planned` (append BEFORE the request) → `applied` (device accepted) → `confirmed`
-(read-back hash matches) → `restored`/`reverted` (undo). Undo:
-- removes ONLY `confirmed` `add`-class records this journal added (planned/applied
-  without confirmed are never touched — no phantom deletes);
-- for `overwrite`-class entries, undo RESTORES the target's pre-write record (the
-  full prior object is stored in the journal entry, sourced from the pre-write
-  snapshot) — undo is restore-before-add-delete;
+**§5a Journal + undo.** Journal is append-only JSONL; each entry carries lifecycle
+state: `planned` (append BEFORE the request, fsync'd — an entry that can be lost to a
+crash is not a journal) → `applied` (device accepted) → `confirmed` (read-back hash
+matches) → `restored`/`reverted` (undo). Entry fields: classification, pre-write
+record (full object, from the pre-write snapshot), intended record, post-write
+content-hash. Undo (reviewer: "removes only what this run added" needs PROOF, not
+trust):
+- deletes ONLY `confirmed` `add`-class entries whose LIVE re-read hash still equals
+  the journal's post-write hash (proof-of-add) — a record modified by anyone else
+  since is NOT touched: undo refuses and escalates (someone else's edit wins);
+- `planned`/`applied` without `confirmed` are never deleted (unknown state = human);
+- for `overwrite`-class entries, undo RESTORES the journal's pre-write record
+  (restore-before-delete), re-verified by read-back;
 - undo is itself budgeted (§5.3 math), verified by re-read, and gets its own journal.
 
 ## 6. Read-back verify (never trust the write's status code)
 
-After each phase, re-`Search` the target for exactly the touched employeeNos and
-compare content-hashes (§2) computed by the SAME normalization both sides use.
+After each phase, re-`Search` the target for the touched employeeNos and compare
+content-hashes (§2) computed by the SAME normalization both sides use. **The
+server-side `employeeNoList` filter is UNPROVEN on this fw** (reviewer MAJOR): the
+verify walker must be pinned BOTH ways — try the filtered search, verify the returned
+set actually covers the requested list (the "filter is a hint, not a promise" rule
+from OBSERVED: the suffixless `employeeNo` form is SILENTLY IGNORED), and fall back
+to full paging + CLIENT-SIDE exact-match filtering whenever coverage is incomplete.
 Per-person verdict `ok | mismatch | missing`. **Fail-closed on unknown fields**: a
 target record carrying fields outside the volatile list that the source record lacks
 is `mismatch`, not `ok` (a device that silently rejected/mangled data is exactly
@@ -241,7 +286,16 @@ strictness must mirror each live-learned axis:
 - **write endpoints implement the bench-A CAPTURED semantics** (fixture replay from
   §5 step 0): merge-vs-overwrite per field, person-must-exist for cards, card
   uniqueness rejection, capacity rejection at the captured threshold — a fake that
-  accepts everything is the false-green machine the sub-second-400 lesson named;
+  accepts everything is the false-green machine the sub-second-400 lesson named.
+  **Hard rule from reviewer task-1 (their BLOCKER): no write-shaped fake route may
+  exist before its capture exists.** For the WRITE axis A has discovered NOTHING yet
+  (the §1 table is GETs/search-POSTs only), so a SetUp fake written today would
+  encode a guess and make "offline suite green" structurally meaningless on the only
+  axis that matters. Sequence is therefore: bench capture (E1-04 deliverable 1) →
+  fixtures committed → fake routes written against fixtures → write code. A PR that
+  contains a write verb without a committed capture fixture fails the gate by rule.
+  Card routes additionally wait for the NONZERO `CardInfo/Search` capture (§5 step 5):
+  today there is no card fixture at all (A had 0 cards).
 - nonce ledger: fake tracks challenges/requests per client so §5.3 budget +
   re-bootstrap-before-80 is a tested number, not a comment;
 - **byte-stability test**: seed the fake with the 4-user A corpus + boundary corpus
@@ -250,6 +304,14 @@ strictness must mirror each live-learned axis:
 - timeType semantics: export stores BOTH raw pair and normalized absolute UTC;
   apply writes target-side wall digits when target `timeType=local` (payroll-critical,
   the p1-05 class bug applied up front);
+- **Target face/FP state is UNKNOWN, not zero** (reviewer MAJOR): FDSearch is broken
+  on this family, so a target person's face set cannot be read. Face/FP presence is
+  therefore taken from the `numOfFace`/`numOfFP` counters in the UserInfo record and
+  marked `UNKNOWN(unreadable, counter=N)`: if N > 0 and the bundle cannot account for
+  those enrollments, the person is a §4 **conflict** (skipped by default), never an
+  `update`. A count is not a set — the design never pretends otherwise. Same
+  treatment for `saveFacePic`-shaped capability switches: they are recorded as
+  discovered values with no inference about what the device will accept.
 - freshness/drift: plan → concurrent target mutation → phase re-diff ABORTS;
   journal lifecycle: kill between `planned` and `applied` → undo touches nothing;
   undo of overwrite restores prior record; card bound to different employeeNo =
@@ -272,20 +334,54 @@ device — live bench steps are the orchestrator's, per fleet rule)
 | E1-06 | faces (R1: confirm BOTH ends on bench; additive; ships report-only until then) | 04 |
 | E1-07 | `gateclerk migrate` CLI group wiring 01-05 + `-o json` schema | 05 |
 
-Dispatch order: 01 + 03 now → 02 after 01 → (orchestrator: bench-A snapshot via
-merged E1-01 + §5 step-0 capture) → 04 → 05 → 07; 06 whenever R1 falls.
+Dispatch order (capture-before-fake is the spine, §9): **01 + 03 now** → 02 after 01
+→ **orchestrator bench-A step** (export snapshot via merged E1-01 first, then the
+§5.0 captures: one-person user SetUp round-trip fixture + one NONZERO `CardInfo/
+Search` fixture from a test-person card) → 04 (fake routes from fixtures, then code)
+→ 05 → 07; 06 whenever R1 falls. No PR containing a write verb is gated before its
+capture fixture exists in the tree.
 
-## 11. Review log (v1 → v2)
+## 11. Review log (v1 → v2 → v3)
 
-Two independent adversarial reviews (write-path correctness; ISAPI realism + fake
-strictness), both FIX-FIRST. Applied: endpoint-confirmation merge gate (§5.0/R2),
-freshness contract + fail-closed target reads (§4/§0.7 — both reviewers hit this
-independently), PINs never persisted (§2/R3), journal lifecycle + restore-based
-undo (§5a), cross-device card uniqueness + normalization conflicts (§4), timeType
-semantics (§1/§9), batch size derived not invented + explicit nonce-budget math
-(§5.3), fail-closed unknown-field verify (§6), byte-stability + write-semantics
-fixtures (§9), face import also-unconfirmed (R1 widened). **Rejected, with reason**:
-"hash strips `name`" (it does not — volatile list is explicit and both-sides),
-"re-bootstrap is an unsupported claim" (P1 shipped it, offline-proven; OBSERVED
-honestly records it was never live-exercised — now stated as E1's first live use),
-"undo gets its own budget note" (folded into §5a).
+Two independent adversarial reviews ran on v2 — write-path correctness (3 BLOCKERs)
+and ISAPI realism + fake strictness (2 BLOCKERs, 1 MAJOR). Both verdicts FIX-FIRST.
+Transcripts: cache/delegation/live/deleg_6c47234f/.
+
+**New from the reviewers, applied in v3** (these were NOT in my v2):
+1. `templateNo` silent-copy = silently wrong ACCESS CONTROL (numbers match, meaning
+   differs; unprovable on this fw) → §1a: door fields REPORT-ONLY by default,
+   `--carry-templates` + evidence-set + UNVERIFIED-in-report wording.
+2. Card re-run idempotency keyed on presence, not ownership → §5 step 5: `(cardNo,
+   employeeNo)` pair identity; cardNo bound to another person = conflict, never
+   silent skip/reassign.
+3. Undo's "removes only what this run added" was trust, not proof → §5a: deletes only
+   `confirmed` add-entries whose live re-read hash still equals the journal's
+   post-write hash (proof-of-add); anyone-else-modified → refuse + escalate.
+4. A write fake written today would encode a GUESS (A has discovered nothing on the
+   write axis) → §9 hard rule: no write-shaped fake route before its bench capture
+   fixture is committed; write-verb PR without fixture fails the gate by rule.
+5. No card fixture exists (A has 0 cards — my §1 table proved the query answers, not
+   the data) → §5 step 5: NONZERO `CardInfo/Search` capture from a bench test-person
+   is a prerequisite for the card fake; export shape-strict until then.
+6. `employeeNoList` server-side filter unproven (OBSERVED's "suffixless form is
+   SILENTLY IGNORED" applies) → §6: filtered search must prove coverage, else full
+   paging + client-side exact-match.
+7. Face phase had no verify arm (a face upload leaves the UserInfo hash unchanged) →
+   §5 step 6: own verify = the recorded FDSearch/count-delta read from the same bench
+   capture.
+8. Read-shape echo into SetUp risks 400/silent partial merges → §5 step 3:
+   writable-allow-list frozen from the capture; device-generated keys never echoed.
+9. `AcsCfg` carries behavior switches, not capacity maxima (my §3 claimed it as a
+   caps source) → §3: probe records the discovery attempt + outcome; fail-fast stays.
+10. Target face/FP state is UNKNOWN (unreadable), not zero → §9: counter-derived
+    `UNKNOWN(counter=N)` and N>0-unaccounted = conflict, never `update`.
+
+**Kept from my v2 pre-hardening** (reviewers did not raise them; they survive):
+endpoint-confirmation merge gate, freshness/TOCTOU contract, PINs-never-persisted,
+journal lifecycle, timeType local-vs-UTC, derived batch caps + nonce math,
+unknown-field fail-closed verify.
+
+**Rejected with reason** (both rounds): "hash strips `name`" (it does not — volatile
+list is explicit, both sides, one module); "re-bootstrap is an unsupported claim"
+(P1 shipped it offline-proven; OBSERVED honestly says never live-exercised — E1 is
+its first live use).
