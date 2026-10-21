@@ -246,10 +246,12 @@ def stat_mode(path: Path) -> int:
 def test_manifest_is_self_describing(tmp_path: Path) -> None:
     out = write_bundle(tmp_path / "b", **bundle_kwargs())
     manifest = json.loads((out / "manifest.json").read_text())
-    assert manifest["schema_version"] == "gateclerk-enrollment-bundle/1"
+    assert manifest["schema_version"] == "gateclerk-enrollment-bundle/2"
     assert manifest["exported_at"] == "2026-10-21T12:00:00+00:00"
     assert manifest["identity"]["model"] == "DS-K1T341AMF-S"
-    assert manifest["counts"] == {"users": 1, "cards": 0, "faces": 0}
+    # E1-01b grew counts with a fingerprints section; the E1-01 seam (no walks run)
+    # stays honest UNAVAILABLE/0 for both biometric axes.
+    assert manifest["counts"] == {"users": 1, "cards": 0, "faces": 0, "fingerprints": 0}
     # The volatile list is frozen as a DIGEST (see frozen_volatile_digest): the
     # manifest commits to the exact strip set without spelling the `password` name
     # into bundle bytes (the card's byte-grep hygiene contract).
@@ -258,6 +260,7 @@ def test_manifest_is_self_describing(tmp_path: Path) -> None:
     assert manifest["faces"]["reason"] == (
         "photos not exportable on this fw (faceURL 404); templates handled by E1-01b"
     )
+    assert manifest["fingerprints"]["state"] == "UNAVAILABLE"
     assert list(manifest["people_hashes"]) == ["007"]
 
 
@@ -321,10 +324,11 @@ def test_naive_exported_at_is_treated_as_utc(tmp_path: Path) -> None:
 def test_read_bundle_round_trips(tmp_path: Path) -> None:
     out = write_bundle(tmp_path / "b", **bundle_kwargs())
     data = read_bundle(out)
-    assert data.manifest.schema_version == "gateclerk-enrollment-bundle/1"
+    assert data.manifest.schema_version == "gateclerk-enrollment-bundle/2"
     assert [p["employeeNo"] for p in data.people] == ["007"]
     assert data.cards == ()
     assert data.faces.state == "UNAVAILABLE"
+    assert data.fingerprints.state == "UNAVAILABLE"
     assert data.person_hashes() == dict(data.manifest.people_hashes)
 
 
@@ -367,7 +371,14 @@ def test_reader_refuses_tampered_counts(tmp_path: Path) -> None:
 
 
 def test_reader_refuses_unknown_schema_and_frozen_list_drift(tmp_path: Path) -> None:
-    out = _tamper(tmp_path, "manifest.json", lambda t: t.replace("/1", "/2"))
+    # E1-01b bumped SCHEMA_VERSION to .../2 (fingerprints dir + manifest sections),
+    # so the tamper now swaps the WHOLE version token for a version no reader here
+    # reviewed — replacing "/1"->"/2" would silently match the live version.
+    out = _tamper(
+        tmp_path,
+        "manifest.json",
+        lambda t: t.replace("gateclerk-enrollment-bundle/2", "gateclerk-enrollment-bundle/3"),
+    )
     with pytest.raises(ValueError, match="schema"):
         read_bundle(out)
     out2 = _tamper(
@@ -383,7 +394,9 @@ def test_reader_refuses_unknown_schema_and_frozen_list_drift(tmp_path: Path) -> 
 def test_reader_refuses_faces_state_it_cannot_back(tmp_path: Path) -> None:
     out = write_bundle(tmp_path / "faces-b", **bundle_kwargs())
     (out / "faces" / "INDEX.json").write_text('{"state":"AVAILABLE","reason":"x"}')
-    with pytest.raises(ValueError, match="not readable"):
+    # An AVAILABLE claim with no entries list is exactly "a state this reader cannot
+    # back" (E1-01's wording, still true under the E1-01b two-state index).
+    with pytest.raises(ValueError, match=r"not readable|cannot be checked"):
         read_bundle(out)
 
 

@@ -1,6 +1,6 @@
-"""The read-only enrollment export (card E1-01): device -> bundle, fail closed.
+"""The read-only enrollment export (cards E1-01 + E1-01b): device -> bundle, fail closed.
 
-Design docs/ENROLLMENT-MIGRATION.md §0.7/§2/§9. This is the snapshot every E1 write
+Design docs/ENROLLMENT-MIGRATION.md §0.7/§1/§2/§9. This is the snapshot every E1 write
 run is gated behind (§0.1: the export IS the rollback source), so its one absolute
 rule is **a failure is never "empty"**: any error on a required read aborts the
 export loudly (`EnrollmentReadAborted`). "The device answered zero people" is a fact
@@ -12,30 +12,57 @@ What the walk reuses (import, never re-express — card rule):
 * `gateclerk.paging` owns every cursor rule — one byte-stable `searchID` per logical
   search, advance by returned `numOfMatches`, termination on normalized
   `responseStatusStrg` != MORE, the page-count runaway cap. `user_info_search` and
-  `card_info_search` are the two engines; this module adds only the per-page
-  fail-closed verdict the enrollment use case demands (the events walk warns, E1
-  aborts) and the identity read.
+  `card_info_search` are the two wrapped-dialect engines; `fd_search` uses the
+  FLAT-dialect knobs (§9 dialect split, §1 paging quirk). This module adds only the
+  per-page fail-closed verdict the enrollment use case demands (the events walk
+  warns, E1 aborts) and the identity read.
 * `gateclerk.migrate_bundle` owns normalization + hashing + the file layout.
+
+E1-01b adds the two biometric READS that are the product (operator, v4):
+* `export_faces()` walks FDSearch FDID 1 (`blackFD`) — the FLAT dialect the device
+  accepts (the wrapped style is what 400'd, §1) — and keeps `modelData` as OPAQUE
+  bytes: base64 as the device sent it, sha256/length over the decoded form, never
+  parsed. `FPID` joins to `employeeNo` by opaque string equality (§1).
+* `export_fingerprints()` reads `FingerPrintUpload` (misleading device name:
+  device->client) per employee, fpIndex by fpIndex, until the device's stop shape.
+  Templates are opaque exactly like faces; the sensor-family NOTE is a label about
+  the header bytes, not a parse of them (§1 same-family rule).
 
 The client seam is `IsapiClient`-shaped (`get(name)` / `search(name, body)`), asserted
 against `SEARCH_ENDPOINTS` before any call — the same registry guard the pipeline
 walker uses. Nothing here can reach a write path: the only POSTs possible are the
-stateless searches the registry allows, and this card is read-only by design.
+stateless searches the registry allows (FDSearch and FingerPrintUpload are both
+READS — the write verbs FDSetUp/FaceDataRecord/FingerPrintDownload are registered
+nowhere), and these cards are read-only by design.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from gateclerk.capabilities import device_identity
 from gateclerk.endpoints import SEARCH_ENDPOINTS
-from gateclerk.exceptions import EnrollmentReadAborted, IsapiError, GateclerkError
-from gateclerk.migrate_bundle import FacesIndex, content_hash, write_bundle
+from gateclerk.exceptions import (
+    EnrollmentReadAborted,
+    IsapiError,
+    GateclerkError,
+)
+from gateclerk.migrate_bundle import (
+    PHOTO_BYTES_ABSENT_REASON,
+    FacesIndex,
+    FaceTemplate,
+    FingerprintIndex,
+    FingerprintTemplate,
+    content_hash,
+    write_bundle,
+)
 from gateclerk.paging import (
     DEFAULT_INTER_PAGE_DELAY,
     DEFAULT_MAX_PAGES,
@@ -43,6 +70,8 @@ from gateclerk.paging import (
     PagingLimits,
     SearchSummary,
     card_info_search,
+    fd_search,
+    new_search_id,
     user_info_search,
 )
 
@@ -51,9 +80,58 @@ __all__ = [
     "ClientLike",
     "EnrollmentState",
     "ExportResult",
+    "FaceWalk",
+    "FingerprintWalk",
     "collect_enrollment_state",
     "export_bundle",
+    "export_faces",
+    "export_fingerprints",
+    "export_full_bundle",
 ]
+
+# --- FDSearch dialect facts (bench A, 2026-10-21; ENROLLMENT-MIGRATION.md §1) ------------
+#
+# OBSERVED records the REQUEST body and the ROW keys exactly, but NOT the response
+# envelope/record key names — so these two names are a documented extrapolation that
+# mirrors what `tests/fakedevice.py` pins (the same convention the E1-03 probe branch
+# chose for its enrollment knobs). The §5.0 bench capture replaces them with the
+# recorded value; until then a real device answering a DIFFERENT envelope fails
+# CLOSED (`SearchProtocolError` -> `EnrollmentReadAborted`), never as an empty face
+# set — the failure direction of §0.7 is kept honest either way.
+FD_SEARCH_ENVELOPE_KEY = "FDSearch"
+FD_SEARCH_RECORD_KEY = "Records"
+
+#: The one portable FD library of the family (§1: FDID 1 = blackFD; FDID 2 is
+#: infraredFD, recorded but out of the port scope). Values are the strings bench A
+#: answered — callers may override per device after the probe says otherwise.
+FD_PORTABLE_FDID = "1"
+FD_PORTABLE_FACE_LIB_TYPE = "blackFD"
+
+#: FingerPrintUpload read shape (§1): the `FingerPrintCond` wrapper is REQUIRED (the
+#: plain form 400s `MessageParametersLack:FingerPrintCond`, probed), and rows arrive
+#: under `FingerPrintInfo.FingerPrintList`.
+FP_COND_KEY = "FingerPrintCond"
+FP_ENVELOPE_KEY = "FingerPrintInfo"
+FP_RECORD_KEY = "FingerPrintList"
+FP_DATA_TYPE = "template"
+
+#: Stop label recorded when every employee's fpIndex walk ended on the device's
+#: empty-`FingerPrintList` answer. NOT device vocabulary — the FingerPrintUpload
+#: response was probed WITHOUT a `responseStatusStrg`, so the manifest records an
+#: engine-side label rather than inventing a device word (reviewer question #2 in
+#: the PR body explains why the empty list, not a 404, is the stop shape).
+FP_STOP_LABEL = "OK-EMPTY-LIST"
+
+#: Runaway guard for the per-person fpIndex walk: A's UserInfo caps never recorded
+#: a per-person FP capacity, and a device that answers a template for EVERY fpIndex
+#: is misbehaving. Exceeding the guard ABORTS (fail closed) — it is a cap on how
+#: long we knock, never a truncation of the answer.
+MAX_FP_TEMPLATES_PER_PERSON = 10
+
+#: The sensor-family NOTE recorded when a template's first three bytes are the ASCII
+#: `301` bench A's fingerprints carried (OBSERVED.md: "third-party sensor family,
+#: NOT self-identified"). A label about the bytes, never a parse of them.
+_FP_SENSOR_301_NOTE = "301-header (third-party sensor family, not self-identified; §1)"
 
 #: The only `responseStatusStrg` values a page may carry (design §0.7). OK and MORE
 #: are the walk's normal vocabulary (paging module); NO MATCH is the device *saying*
@@ -97,13 +175,20 @@ class EnrollmentState:
 
 @dataclass(frozen=True, slots=True)
 class ExportResult:
-    """What an export produced — counts and hashes for reports, never names (design §4)."""
+    """What an export produced — counts and hashes for reports, never names (design §4).
+
+    E1-01b additions carry defaults so E1-01's call sites (and their pinned tests)
+    construct the same result they always did: `fingerprints` defaults to the
+    recorded-absence index, `enrollment_counters` to the empty report-only section.
+    """
 
     bundle_dir: Path
     counts: dict[str, int]
     people_hashes: dict[str, str]
     faces: FacesIndex
     termination: dict[str, str]
+    fingerprints: FingerprintIndex = field(default_factory=FingerprintIndex)
+    enrollment_counters: dict[str, Any] = field(default_factory=dict)
 
 
 def _search_reader(client: ClientLike, endpoint: str) -> Callable[[Mapping[str, Any]], dict]:
@@ -134,7 +219,12 @@ def _abort(endpoint: str, reason: str, cause: Exception | None = None) -> Enroll
     return EnrollmentReadAborted(message, endpoint=endpoint, reason=reason, cause=cause)
 
 
-def _walk(engine: PagedSearch, endpoint: str, label: str) -> tuple[list[dict[str, Any]], str]:
+def _walk(
+    engine: PagedSearch,
+    endpoint: str,
+    label: str,
+    cond: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     """Drain one paged search, checking EVERY page's device verdict.
 
     The paging engine terminates on non-MORE; it does not judge statuses, because an
@@ -145,7 +235,7 @@ def _walk(engine: PagedSearch, endpoint: str, label: str) -> tuple[list[dict[str
     """
     records: list[dict[str, Any]] = []
     try:
-        for page in engine.pages({}):
+        for page in engine.pages(cond or {}):
             if page.status not in ACCEPTED_STATUSES:
                 raise _abort(
                     endpoint,
@@ -294,4 +384,395 @@ def export_bundle(
         people_hashes=people_hashes,
         faces=faces,
         termination=state.termination,
+    )
+
+
+# --- E1-01b: the two biometric READS ----------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FaceWalk:
+    """What the FDSearch walk saw — the bundle inputs plus audit labels.
+
+    `templates` maps employeeNo -> the device's `modelData` base64 VERBATIM (the
+    bundle writes exactly those characters; sha256/length in `entries` are over the
+    decoded bytes, which is transport bookkeeping, not parsing — design §2 "opaque").
+    """
+
+    templates: Mapping[str, str]
+    entries: tuple[FaceTemplate, ...]
+    termination: str
+
+
+@dataclass(frozen=True, slots=True)
+class FingerprintWalk:
+    """What the per-person fpIndex reads saw; `files` is write_bundle's input shape."""
+
+    files: tuple[tuple[str, int, str], ...]
+    entries: tuple[FingerprintTemplate, ...]
+    termination: str
+
+
+def _decoded_length(endpoint: str, employee_no: str, value: Any, field: str) -> tuple[bytes, str]:
+    """Decode one device base64 template strictly and return (bytes, sha256).
+
+    Decoding to HASH is transport, not parsing: the bytes are never interpreted.
+    Whitespace between the b64 characters is tolerated (some firmwares wrap lines)
+    but anything else that fails `validate=True` aborts — a half-decodable template
+    must never ride into a bundle as "probably fine" (§0.7).
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise _abort(endpoint, f"employeeNo {employee_no!r} row carries no usable {field}")
+    compact = "".join(value.split())
+    try:
+        raw = base64.b64decode(compact, validate=True)
+    except Exception as exc:  # binascii.Error is a ValueError subclass
+        raise _abort(
+            endpoint,
+            f"employeeNo {employee_no!r} {field} is not clean base64 ({exc.__class__.__name__})",
+            cause=exc,
+        ) from exc
+    if not raw:
+        raise _abort(endpoint, f"employeeNo {employee_no!r} {field} decodes to zero bytes")
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _sensor_family_note(raw: bytes) -> str:
+    """A LABEL about a fingerprint template's leading bytes — not a parse of them (§1).
+
+    Bench A's templates start with ASCII `301` (OBSERVED.md: "third-party sensor
+    family, NOT self-identified"); anything else is recorded as `unknown` rather
+    than guessed. The same-sensor-family portability claim rests on a reader seeing
+    this note, which is why it travels in the INDEX entry.
+    """
+    return (
+        _FP_SENSOR_301_NOTE
+        if raw[:3] == b"301"
+        else "unknown (header is not the recorded 301 family)"
+    )
+
+
+def export_faces(
+    client: ClientLike,
+    *,
+    employee_nos: Collection[str],
+    fdid: str = FD_PORTABLE_FDID,
+    face_lib_type: str = FD_PORTABLE_FACE_LIB_TYPE,
+    limits: PagingLimits | None = None,
+    page_size: int | None = None,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    inter_page_delay: float = DEFAULT_INTER_PAGE_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> FaceWalk:
+    """Walk FDSearch FDID `fdid` once and join rows to the roster by OPAQUE equality.
+
+    The engine (`paging.fd_search`) owns the flat dialect and the §1 paging quirk
+    (bench A answered 3 of 4 rows on one OK page, so only a zero-row page ends the
+    walk); this function adds the enrollment verdicts:
+
+    * every page must answer OK / MORE / NO MATCH (`_walk`, §0.7);
+    * `modelData` is kept VERBATIM as the device sent it; sha256/length are over the
+      decoded bytes (transport bookkeeping, never a parse);
+    * `FPID` joins to `employeeNo` by plain string equality — "007" joins "007",
+      never "7" (§1: leading zeros are data);
+    * a row whose FPID is not on the roster ABORTS (an orphan face is a join bug or
+      a tampered row — the bundle writer would refuse it anyway; failing at the read
+      names the device as the source);
+    * two rows for one person disagreeing on bytes ABORTS (a contradiction, not a
+      duplicate — §0.7 says a human decides); identical duplicates collapse.
+    """
+    roster = {str(no) for no in employee_nos}
+    rows, termination = _walk(
+        fd_search(
+            _search_reader(client, "fd_search"),
+            limits=limits,
+            page_size=page_size,
+            max_pages=max_pages,
+            inter_page_delay=inter_page_delay,
+            sleep=sleep,
+            clock=clock,
+        ),
+        "fd_search",
+        "faces",
+        # The two REQUIRED flat parameters (§1: missing either is MessageParametersLack).
+        {"faceLibType": face_lib_type, "FDID": fdid},
+    )
+    templates: dict[str, str] = {}
+    entries: dict[str, FaceTemplate] = {}
+    for row in rows:
+        employee_no = str(row.get("FPID") if row.get("FPID") is not None else "")
+        if employee_no not in roster:
+            raise _abort(
+                "fd_search",
+                f"FDSearch row FPID {employee_no!r} is not on the exported roster — an "
+                "orphan template is a join bug or a tampered search row (fail closed)",
+            )
+        raw, digest = _decoded_length("fd_search", employee_no, row.get("modelData"), "modelData")
+        entry = FaceTemplate(
+            employee_no=employee_no,
+            fdid=fdid,
+            face_lib_type=face_lib_type,
+            sha256=digest,
+            length=len(raw),
+        )
+        previous = entries.get(employee_no)
+        if previous is not None:
+            if previous.sha256 != entry.sha256:
+                raise _abort(
+                    "fd_search",
+                    f"two FDSearch rows for employeeNo {employee_no!r} carry DIFFERENT "
+                    "templates — a contradiction the export must not pick a winner for",
+                )
+            continue  # byte-identical duplicate: collapse, keep the verbatim string
+        templates[employee_no] = str(row["modelData"])  # device's own characters
+        entries[employee_no] = entry
+    order = sorted(entries)
+    return FaceWalk(
+        templates={no: templates[no] for no in order},
+        entries=tuple(entries[no] for no in order),
+        termination=termination,
+    )
+
+
+def export_fingerprints(
+    client: ClientLike,
+    *,
+    employee_nos: Collection[str],
+    inter_request_delay: float = DEFAULT_INTER_PAGE_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    pacing_clock: Callable[[], float] = time.monotonic,
+) -> FingerprintWalk:
+    """Read FingerPrintUpload per employeeNo, fpIndex 0..N, until the device's stop shape.
+
+    The endpoint is a one-shot read, not a paged search (no searchID cursor semantics
+    were probed on it), so this is a bounded per-person loop through the same
+    registry-guarded seam. The shapes are the probed ones (§1): the
+    `FingerPrintCond` wrapper is REQUIRED (the plain form 400s
+    `MessageParametersLack FingerPrintCond`), rows arrive under
+    `FingerPrintInfo.FingerPrintList`.
+
+    Stop rule (PR-body reviewer question #2, stated honestly): the probed response
+    carries NO `responseStatusStrg`, so there is no device word for "no more". The
+    stop shape pinned here is a 200 whose `FingerPrintInfo` has an absent-or-empty
+    `FingerPrintList` (`FP_STOP_LABEL` records that as an ENGINE label, not device
+    vocabulary). Everything else continues the fail-closed side: a missing envelope,
+    a non-list record key, a multi-row answer (the probed shape is one row per read)
+    or any transport/`statusCode` error aborts the export naming the person and
+    index — "empty" is only ever the device's own empty list, never our error path.
+
+    `MAX_FP_TEMPLATES_PER_PERSON` caps how long we knock per person; exceeding it
+    aborts (a runaway guard never truncates an answer, same rule as max_pages).
+    """
+    read = _search_reader(client, "finger_print_upload")
+    files: list[tuple[str, int, str]] = []
+    entries: list[FingerprintTemplate] = []
+    issued = False
+    last_seen = pacing_clock()
+    for employee_no in sorted({str(no) for no in employee_nos}):
+        for fp_index in range(MAX_FP_TEMPLATES_PER_PERSON + 1):
+            if issued:
+                # Space request STARTS like the paging engine does (small box,
+                # serial sessions) — including the first read of a new person.
+                wait = inter_request_delay - (pacing_clock() - last_seen)
+                if wait > 0:
+                    sleep(wait)
+            issued = True
+            body = {
+                FP_COND_KEY: {
+                    "searchID": new_search_id(),
+                    "employeeNo": employee_no,
+                    "fpIndex": fp_index,
+                    "dataType": FP_DATA_TYPE,
+                }
+            }
+            last_seen = pacing_clock()
+            try:
+                response = read(body)
+            except GateclerkError as exc:
+                # Includes the 400 MessageParametersLack family: if the wrapper we
+                # send stops being accepted, that is a protocol break, not "no FP".
+                raise _abort(
+                    "finger_print_upload",
+                    f"employeeNo {employee_no!r} fpIndex {fp_index}: {exc}",
+                    cause=exc,
+                ) from exc
+            info = response.get(FP_ENVELOPE_KEY)
+            if not isinstance(info, Mapping):
+                raise _abort(
+                    "finger_print_upload",
+                    f"employeeNo {employee_no!r} fpIndex {fp_index}: response has no "
+                    f"{FP_ENVELOPE_KEY!r} envelope — reading a protocol break as 'no more "
+                    "fingerprints' is the silence §0.7 refuses",
+                )
+            rows = info.get(FP_RECORD_KEY)
+            if rows is None or rows == []:
+                break  # the pinned stop shape: the device's OWN empty list
+            if not isinstance(rows, list) or len(rows) != 1:
+                raise _abort(
+                    "finger_print_upload",
+                    f"employeeNo {employee_no!r} fpIndex {fp_index}: {FP_RECORD_KEY} is "
+                    f"{type(rows).__name__} with {len(rows) if isinstance(rows, list) else '?'} "
+                    "row(s); the probed shape is exactly one (OBSERVED.md) — refusing to "
+                    "guess which row is the person's",
+                )
+            row = rows[0]
+            if not isinstance(row, Mapping):
+                raise _abort(
+                    "finger_print_upload",
+                    f"employeeNo {employee_no!r} fpIndex {fp_index}: row is "
+                    f"{type(row).__name__}, not an object",
+                )
+            raw, digest = _decoded_length(
+                "finger_print_upload", employee_no, row.get("fingerData"), "fingerData"
+            )
+            files.append((employee_no, fp_index, str(row["fingerData"])))
+            entries.append(
+                FingerprintTemplate(
+                    employee_no=employee_no,
+                    fp_index=fp_index,
+                    sha256=digest,
+                    length=len(raw),
+                    sensor_family=_sensor_family_note(raw),
+                )
+            )
+        else:
+            # The inner loop ended WITHOUT the stop shape: the device answered a
+            # template for EVERY fpIndex we asked (0..MAX). That is a runaway, and a
+            # runaway guard must never truncate an answer — abort (same rule as the
+            # paging engine's max_pages cap).
+            raise _abort(
+                "finger_print_upload",
+                f"employeeNo {employee_no!r} answered a template for every fpIndex up to "
+                f"{MAX_FP_TEMPLATES_PER_PERSON} — a device that never says stop is "
+                "misbehaving; aborting instead of guessing where the list ends",
+            )
+    return FingerprintWalk(files=tuple(files), entries=tuple(entries), termination=FP_STOP_LABEL)
+
+
+def export_full_bundle(
+    out_dir: Path,
+    *,
+    client: ClientLike,
+    clock: Callable[[], datetime],
+    limits: PagingLimits | None = None,
+    page_size: int | None = None,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    inter_page_delay: float = DEFAULT_INTER_PAGE_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    pacing_clock: Callable[[], float] = time.monotonic,
+) -> ExportResult:
+    """One read-only pass over ALL FOUR reads -> one bundle (the E1-01b composite).
+
+    E1-01's `export_bundle` stays exactly as shipped (users+cards, faces/FP recorded
+    as absences) so its pinned regression tests keep testing what they tested; this
+    is the function the E1-07 CLI calls once the biometric reads are wanted. Same
+    fail-closed contract: any read failing leaves no bundle at the final path.
+
+    `enrollment_counters` is REPORT-ONLY (v4 §9 "counter vs set"): the per-person
+    `numOfFace`/`numOfFP` the roster carries next to what the walks actually
+    exported — the disagreement is data for E1-02's conflict classification, never
+    something this export resolves (card: cross-check is report-only).
+    """
+    if clock is None:  # defensive: "injected" is a contract, not a default
+        raise ValueError("export_full_bundle requires an injected clock (no wall-clock default)")
+    state = collect_enrollment_state(
+        client,
+        limits=limits,
+        page_size=page_size,
+        max_pages=max_pages,
+        inter_page_delay=inter_page_delay,
+        sleep=sleep,
+        clock=pacing_clock,
+    )
+    roster = sorted(
+        {
+            str(record["employeeNo"])
+            for record in state.users
+            if record.get("employeeNo") not in (None, "")
+        }
+    )
+    faces_walk = export_faces(
+        client,
+        employee_nos=roster,
+        limits=limits,
+        page_size=page_size,
+        max_pages=max_pages,
+        inter_page_delay=inter_page_delay,
+        sleep=sleep,
+        clock=pacing_clock,
+    )
+    fp_walk = export_fingerprints(
+        client,
+        employee_nos=roster,
+        inter_request_delay=inter_page_delay,
+        sleep=sleep,
+        pacing_clock=pacing_clock,
+    )
+    faces_index = FacesIndex(
+        state="AVAILABLE",
+        reason="FDSearch FDID 1 (blackFD) walked to a zero-row page (modelData templates)",
+        entries=faces_walk.entries,
+        photo_bytes={"reason": PHOTO_BYTES_ABSENT_REASON},
+    )
+    fp_index = FingerprintIndex(
+        state="AVAILABLE",
+        reason=(
+            "every roster employee read fpIndex-by-fpIndex to the device's empty-list "
+            f"stop shape ({FP_STOP_LABEL})"
+        ),
+        entries=fp_walk.entries,
+    )
+    counters: dict[str, Any] = {}
+    for record in state.users:
+        employee_no = str(record.get("employeeNo") or "")
+        if not employee_no:
+            continue
+        counters[employee_no] = {
+            "numOfFace": record.get("numOfFace"),
+            "numOfFP": record.get("numOfFP"),
+            "exported_faces": sum(1 for e in faces_walk.entries if e.employee_no == employee_no),
+            "exported_fingerprints": sum(
+                1 for e in fp_walk.entries if e.employee_no == employee_no
+            ),
+        }
+    bundle_dir = write_bundle(
+        Path(out_dir),
+        identity=state.identity,
+        exported_at=clock(),
+        people=state.users,
+        cards=state.cards,
+        faces=faces_index,
+        fingerprints=fp_index,
+        face_templates=faces_walk.templates,
+        fingerprint_templates=fp_walk.files,
+        enrollment_counters=counters,
+        termination={
+            **state.termination,
+            "FDSearch": faces_walk.termination,
+            "FingerPrintUpload": fp_walk.termination,
+        },
+    )
+    people_hashes = {
+        str(record["employeeNo"]): content_hash(record)
+        for record in state.users
+        if "employeeNo" in record
+    }
+    return ExportResult(
+        bundle_dir=bundle_dir,
+        counts={
+            "users": len(state.users),
+            "cards": len(state.cards),
+            "faces": len(faces_walk.entries),
+            "fingerprints": len(fp_walk.entries),
+        },
+        people_hashes=people_hashes,
+        faces=faces_index,
+        fingerprints=fp_index,
+        enrollment_counters=counters,
+        termination={
+            **state.termination,
+            "FDSearch": faces_walk.termination,
+            "FingerPrintUpload": fp_walk.termination,
+        },
     )

@@ -561,3 +561,30 @@ device truth: docs/OBSERVED.md.)
 - Next: gate E1-01 + E1-03 PRs as they land (with v4 lens); then E1-02; then the
   ONE-session bench-A capture (export snapshot → users/card/FP/face fixtures →
   restore); then E1-04/05/06/06b/07. No write fake route before its fixture.
+
+## 2026-10-21 (evening) — E1-01b shipped as STACKED PR (biometric template export).
+
+- Card t_18a670bd: the two PROVEN reads became code — `export_faces()` (FDSearch
+  FDID 1, FLAT dialect via new `paging.fd_search` engine: no searchID in body,
+  page-until-zero-row because bench A answered 3-of-4 on one OK page) and
+  `export_fingerprints()` (FingerPrintUpload, FingerPrintCond wrapper required,
+  fpIndex 0..N to the empty-`FingerPrintList` stop shape; runaway abort at
+  MAX_FP_TEMPLATES_PER_PERSON, never a silent truncation).
+- Bundle SCHEMA_VERSION → `gateclerk-enrollment-bundle/2`: faces/*.b64 + AVAILABLE
+  faces/INDEX (FDID/FPID/sha256/len + the faceURL-404 photo_bytes recorded fact),
+  fingerprints/<emp>-<idx>.b64 + INDEX (301-header sensor-family NOTE), manifest
+  face/FP sections + INDEX digests + REPORT-ONLY numOfFace/numOfFP counters.
+  Templates opaque everywhere (device base64 verbatim on disk; digests over decoded
+  bytes = transport, never parsing). E1-01's `export_bundle` untouched — its
+  UNAVAILABLE-absence regression still ships (new composite is `export_full_bundle`).
+- Registry: `fd_search` + `finger_print_upload` registered as stateless-search POSTs
+  (names ALIGNED with E1-03 PR #37 — one path, one name fleet-wide). FakeDevice grew
+  `seed_biometric()` (rule-3 trap armed until then), flat-vs-wrapper dialect
+  strictness, MessageParametersLack shapes, FPID filter honored, the paging quirk
+  reproduced. FingerPrint/Search stays notSupport; face photo GETs stay unrouted 404s.
+- Tests: 35 new in tests/test_e1_01b_biometric_export.py (byte-stability, opaque
+  mutation, "007"≠"7" join, orphan-row abort, empty-honest-zeros, reader tamper
+  verify, no-photo-GET pin). Full offline suite 1567 passed / 5 skipped; ruff clean.
+- Stack note for the orchestrator: PR base is `wt/t_bd1faed8` (E1-01, PR #38 — still
+  open); E1-03 (PR #37) touches the same fakedevice region — merge order 38 → this →
+  37 recommended; fake blocks will need a one-line reconcile on #37's side.

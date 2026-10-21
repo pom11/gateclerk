@@ -121,6 +121,7 @@ __all__ = [
     "clamp_page_size",
     "collect_users",
     "envelope_records",
+    "fd_search",
     "is_more",
     "iter_event_windows",
     "iter_users",
@@ -367,6 +368,14 @@ class PagedSearch:
     in production, a scripted callable in unit tests — the end-to-end tests wire the
     real client over `FakeDevice`). The engine owns `searchID`/`searchResultPosition`
     /`maxResults`; callers supply only the query conditions.
+
+    The three constructor knobs below encode the PER-ENDPOINT dialect split design
+    docs/ENROLLMENT-MIGRATION.md §9 makes load-bearing: the same "helpful" body
+    normalization that passes a naive fake dies on the device, so the dialect is a
+    named, device-sourced fact per factory, not a guess at call time. Defaults are
+    the P1 dialect (`AcsEvent`/`UserInfo/Search`/`CardInfo/Search` — wrapped cond,
+    searchID always present, non-MORE terminates) and are behavior-identical to the
+    pre-E1-01b engine, which `tests/test_paging.py` keeps pinned.
     """
 
     def __init__(
@@ -374,7 +383,7 @@ class PagedSearch:
         reader: PageReader,
         *,
         endpoint: str,
-        cond_key: str,
+        cond_key: str | None,
         envelope_key: str,
         record_key: str,
         limits: PagingLimits | None = None,
@@ -383,6 +392,8 @@ class PagedSearch:
         inter_page_delay: float = DEFAULT_INTER_PAGE_DELAY,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        search_id_field: str | None = "searchID",
+        terminate_on_non_more: bool = True,
     ) -> None:
         if max_pages < 1:
             raise ValueError(f"max_pages must be >= 1, got {max_pages}")
@@ -390,9 +401,23 @@ class PagedSearch:
             raise ValueError(f"inter_page_delay must be >= 0, got {inter_page_delay}")
         self._reader = reader
         self.endpoint = endpoint
+        #: None => FLAT dialect: cursor fields and conditions share the body root.
+        #: `FDSearch` is device-proven FLAT (ENROLLMENT-MIGRATION.md §1: the wrapped
+        #: `FDSearchCond` style is what 400'd `MessageParametersLack faceLibType`).
         self._cond_key = cond_key
         self._envelope_key = envelope_key
         self._record_key = record_key
+        #: None => the endpoint's proven body carries NO searchID (again FDSearch:
+        #: the operator-confirmed shape is `{searchResultPosition,maxResults,
+        #: faceLibType,FDID[,FPID]}` — §1). Injecting an unproven key is the v3
+        #: "8 rejected shapes" mistake class, so the dialect says so explicitly.
+        self._search_id_field = search_id_field
+        #: False => OK does NOT mean done: a page may answer OK while carrying fewer
+        #: rows than `totalMatches` (bench A FDSearch: 3 of 4, status OK, §1) — the
+        #: walk continues until a page returns ZERO rows (or NO MATCH). The P1
+        #: endpoints keep the OBSERVED rule (non-MORE terminates); the zero-row stop
+        #: clause they already had stays armed for both modes.
+        self._terminate_on_non_more = terminate_on_non_more
         self.limits = limits or PagingLimits()
         self._page_size = clamp_page_size(self.limits, page_size)
         self._max_pages = max_pages
@@ -416,16 +441,22 @@ class PagedSearch:
         """Walk every page of one logical search; yields pages in device order.
 
         `cond` is the caller's query conditions (`major`, `startTime`, ...). The
-        engine adds the three cursor fields and refuses — before any request — to
+        engine adds the cursor fields and refuses — before any request — to
         overwrite one a caller tried to pass by hand: the cursor is ours.
         """
-        overlap = {"searchID", "searchResultPosition", "maxResults"} & set(cond)
+        own_fields = {"searchResultPosition", "maxResults"}
+        if self._search_id_field is not None:
+            own_fields.add(self._search_id_field)
+        overlap = own_fields & set(cond)
         if overlap:
             raise SearchProtocolError(
                 f"caller passed cursor field(s) {sorted(overlap)} in cond — the engine "
                 "owns searchID/searchResultPosition/maxResults (mid-walk changes make "
                 "the device silently restart or skip: references §1.2/§1.3)"
             )
+        # The id is generated ONCE per logical search even on a dialect whose body
+        # never carries it (FDSearch): PageRecord.search_id stays the audit value,
+        # and the P1 cursor rules are unchanged where the dialect has them.
         sid = search_id if search_id is not None else new_search_id(self.limits.search_id_max_len)
         position = 0
         pages_read = 0
@@ -448,14 +479,17 @@ class PagedSearch:
                 # Between REQUESTS, not between walks: this also spaces the first
                 # page of a new chunk after the last page of the previous chunk.
                 self._pace()
-            body: dict[str, Any] = {
-                self._cond_key: {
-                    "searchID": sid,
-                    "searchResultPosition": position,
-                    "maxResults": self._page_size,
-                    **cond,
-                }
+            cursor: dict[str, Any] = {
+                "searchResultPosition": position,
+                "maxResults": self._page_size,
             }
+            if self._search_id_field is not None:
+                cursor[self._search_id_field] = sid
+            if self._cond_key is None:
+                # FLAT dialect: cursor + conditions at the body root (FDSearch, §1).
+                body: dict[str, Any] = {**cursor, **cond}
+            else:
+                body = {self._cond_key: {**cursor, **cond}}
             self._last_request_at = self._clock()
             self._ever_issued = True
             response = self._reader(body)
@@ -481,7 +515,12 @@ class PagedSearch:
             # Termination (module docstring, third bullet): MORE is the only
             # continuation value, and an empty record list ends the walk too —
             # the empty-window response has NO InfoList key at all (OBSERVED.md).
-            if not is_more(status) or returned == 0:
+            # The FDSearch dialect (`terminate_on_non_more=False`) widens the stop
+            # test deliberately: bench A answered a TRUNCATED page with OK (3 of 4
+            # rows, §1), so on that endpoint OK may be a lie of completeness and
+            # only a zero-row page ends the walk. P1 endpoints keep the OBSERVED
+            # rule: non-MORE terminates.
+            if returned == 0 or (is_more(status) is False and self._terminate_on_non_more):
                 break
             # Advance by what the device SAYS it matched — but never past what it
             # actually handed back. When the two disagree (a firmware contradiction
@@ -759,6 +798,57 @@ def card_info_search(
         inter_page_delay=inter_page_delay,
         sleep=sleep,
         clock=clock,
+    )
+
+
+def fd_search(
+    reader: PageReader,
+    *,
+    limits: PagingLimits | None = None,
+    page_size: int | None = None,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    inter_page_delay: float = DEFAULT_INTER_PAGE_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> PagedSearch:
+    """A cursor bound to `POST /ISAPI/Intelligent/FDLib/FDSearch?format=json` (E1-01b).
+
+    The face-library walk shares the cursor rules but NOT the dialect — every
+    difference is device-proven (docs/ENROLLMENT-MIGRATION.md §1, OBSERVED.md E1
+    probe rounds 11-18), which is exactly the §9 dialect split this engine exists
+    to make impossible to "helpfully" normalize away:
+
+    * FLAT body: `{searchResultPosition, maxResults, faceLibType, FDID[, FPID]}` —
+      no cond wrapper (the wrapped `FDSearchCond` style is what 400s
+      `MessageParametersLack faceLibType` on this fw);
+    * NO `searchID` in the proven body — the operator-confirmed shape carries none,
+      and injecting an unproven key is the "8 rejected shapes" mistake class (§11
+      v4 delta 1). `PageRecord.search_id` still carries the generated id for audit;
+    * `terminate_on_non_more=False`: bench A answered 3 of 4 rows on ONE page with
+      status OK, so on this endpoint OK is not a completeness promise — the walk
+      keeps paging until a page returns ZERO rows (NO MATCH or OK-with-nothing).
+
+    The envelope/record keys (`FDSearch`/`Records`) are a DOCUMENTED EXTRAPOLATION:
+    the probe recorded the rows ({FPID, faceURL, modelData}) but not the wrapper
+    names. `tests/fakedevice.py` pins the same convention and the §5.0 bench capture
+    replaces both with the recorded value; a real device answering different names
+    fails CLOSED (missing envelope -> SearchProtocolError), never as an empty face
+    set — the fail-closed direction of §0.7 holds under either value.
+    """
+    return PagedSearch(
+        reader,
+        endpoint="fd_search",
+        cond_key=None,
+        envelope_key="FDSearch",
+        record_key="Records",
+        limits=limits,
+        page_size=page_size,
+        max_pages=max_pages,
+        inter_page_delay=inter_page_delay,
+        sleep=sleep,
+        clock=clock,
+        search_id_field=None,
+        terminate_on_non_more=False,
     )
 
 

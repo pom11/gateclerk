@@ -74,6 +74,7 @@ filtering mode too — presence still gates the request before arithmetic runs.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -741,6 +742,55 @@ A_CORPUS_USERS: list[dict] = [
 A_CORPUS_CARDS: list[dict] = []
 
 
+# --- biometric template stores (card E1-01b; graft onto the merged enrollment axis) ----
+#
+# Device truth (bench A, OBSERVED.md "E1 enrollment-read probes" 2026-10-21): FDSearch
+# rows carry `modelData` (base64 face TEMPLATE, 272 B, magic FR500005\x01...); the
+# FingerPrintUpload-Cond read returns `fingerData` (512 B, ASCII `301` header —
+# third-party sensor family). The BYTES here are synthetic stand-ins (hygiene: no real
+# biometric bytes ever enter this repo — OBSERVED records shape/size/hash-prefix only).
+# What makes them faithful is exactly the three properties the export may depend on:
+# recorded SIZE, recorded MAGIC, base64-ness — built from a hash stream so a dependency
+# on more than size+magic cannot hide.
+FD_SEARCH_PATH = "/ISAPI/Intelligent/FDLib/FDSearch"
+FINGER_PRINT_UPLOAD_PATH = "/ISAPI/AccessControl/FingerPrintUpload"
+_BIOMETRIC_POST_PATHS = frozenset({FD_SEARCH_PATH, FINGER_PRINT_UPLOAD_PATH})
+
+
+def _synthetic_template(size: int, magic: bytes, key: str) -> bytes:
+    """Deterministic `size` bytes starting with `magic` — a stand-in template."""
+    if len(magic) > size:
+        raise ValueError("magic longer than the template")
+    stream = b""
+    counter = 0
+    while len(stream) < size - len(magic):
+        stream += hashlib.sha256(f"{key}:{counter}".encode()).digest()
+        counter += 1
+    return magic + stream[: size - len(magic)]
+
+
+FD_TEMPLATE_SIZE = 272  # recorded modelData decoded size (OBSERVED.md)
+FD_TEMPLATE_MAGIC = b"FR500005\x01\x00\x00\x00"  # recorded face-template magic
+FP_TEMPLATE_SIZE = 512  # recorded fingerData decoded size (OBSERVED.md)
+FP_TEMPLATE_MAGIC = b"301"  # recorded ASCII header of the third-party family
+
+#: A_CORPUS faces: every bench-A user carries numOfFace=1 (§1), so the face store has
+#: one row per user, keyed by the OPAQUE employeeNo the FPID must join to.
+A_FD_ROWS: dict[str, bytes] = {
+    user["employeeNo"]: _synthetic_template(
+        FD_TEMPLATE_SIZE, FD_TEMPLATE_MAGIC, f"face:{user['employeeNo']}"
+    )
+    for user in A_CORPUS_USERS
+}
+#: A's fingerprints: ONLY user "1" has one (numOfFP=1, the §1 "cannot migrate" one);
+#: keyed (employeeNo, fpIndex) the way the cond asks.
+A_FP_ROWS: dict[tuple[str, int], bytes] = {
+    ("1", 0): _synthetic_template(FP_TEMPLATE_SIZE, FP_TEMPLATE_MAGIC, "fp:1:0"),
+}
+
+
+
+
 def _caps_user_info_body() -> dict:
     """A's UserInfo caps (OBSERVED 2026-10-21): timeType @opt "local" ONLY,
     password @max 8 (PIN length), maxRecordNum 3000 (a BATCH cap, not capacity —
@@ -882,6 +932,13 @@ class FakeDevice:
         #: wrapped-dialect + searchID strictness. Arming this (and NOT
         #: `install_enrollment`) keeps the unknown-enrollment-POST trap live.
         self._enrollment_store: dict[str, list[dict]] | None = None
+        #: E1-01b: None = the two biometric READs answer from the installed axis
+        #: (E1-03 default); a dict once `seed_biometric` arms store mode:
+        #: {"faces": {employeeNo: bytes}, "fingerprints": {(employeeNo, fpIndex): bytes}}.
+        self._biometric_store: dict[str, dict] | None = None
+        #: The recorded FDSearch paging quirk (bench A: one OK page answered 3 of 4
+        #: rows). True = reproduce it on the first unfiltered store-mode page.
+        self.fd_first_page_short = True
         self.transport = httpx.MockTransport(self._handle)
 
     # -- budget counter helpers (E1-03) -------------------------------------------------
@@ -1167,6 +1224,125 @@ class FakeDevice:
         store_cards = A_CORPUS_CARDS if cards is None else list(cards)
         self._enrollment_store = {"UserInfo": store_users, "CardInfo": store_cards}
 
+    def seed_biometric(
+        self,
+        faces: dict[str, bytes] | None = None,
+        fingerprints: dict[tuple[str, int], bytes] | None = None,
+        *,
+        empty: bool = False,
+    ) -> None:
+        """Arm store mode for the two biometric READs (E1-01b; filter-mode like events).
+
+        Defaults replay bench A: one face template per corpus user (numOfFace=1 on
+        all four, §1) and exactly one fingerprint — user "1" fpIndex 0 (the recorded
+        numOfFP=1). `empty=True` models EMPTY libraries (face walk ends on the
+        device's zero-row answer, FP walk on an empty `FingerPrintList`) — the
+        honest-zero shapes §0.7 demands an export distinguish from failure.
+
+        Bytes (not base64) keep the STORE the device's truth: handlers encode like
+        the firmware's response, so a test mutating stored bytes sees the effect in
+        the export's hashes. Store mode takes precedence over the installed axis for
+        these two paths only; everything else keeps answering from `install_enrollment`.
+        """
+        if empty:
+            self._biometric_store = {"faces": {}, "fingerprints": {}}
+            return
+        self._biometric_store = {
+            "faces": dict(A_FD_ROWS if faces is None else faces),
+            "fingerprints": dict(A_FP_ROWS if fingerprints is None else fingerprints),
+        }
+
+    def _biometric_fd_search(self, request: httpx.Request) -> httpx.Response:
+        """Store-mode FDSearch — FLAT dialect or 400 (the §9 dialect split).
+
+        Wrapped cond of ANY name is the wrong dialect here (the wrapped style is
+        exactly what 400'd on this fw); required flat params answer
+        `MessageParametersLack`; the FPID filter is HONORED (A: FPID=1 -> 1 of 4).
+        Rows carry {FPID, faceURL, modelData}; faceURL's PHOTO bytes stay unrouted
+        (every GET form 404s on the real fw — the fake mirrors the dead end). The
+        recorded paging quirk fires on the first unfiltered store page.
+        """
+        try:
+            body = json.loads(request.content.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return bad_json_content("FDSearch")
+        if not isinstance(body, dict) or any(isinstance(v, dict) for v in body.values()):
+            return bad_json_content("FDSearch")
+        for param in ("faceLibType", "FDID"):
+            if not body.get(param):
+                return message_parameters_lack(param)
+        position = body.get("searchResultPosition", 0) or 0
+        max_results = body.get("maxResults", 0) or 0
+        faces: dict[str, bytes] = (self._biometric_store or {}).get("faces", {})
+        fpid = body.get("FPID")
+        people = sorted(faces) if fpid is None else ([str(fpid)] if str(fpid) in faces else [])
+        total = len(people)
+        window = people[position : position + max_results] if max_results else []
+        if (
+            self.fd_first_page_short
+            and fpid is None
+            and position == 0
+            and 1 < len(window) < max_results
+        ):
+            window = window[:-1]  # one row fewer than fits, status still OK — the lie is the point
+        rows = [
+            {
+                "FPID": person,
+                "faceURL": f"http://{FAKE_HOST}/LOCALS/pic/enrlFace/0/{person}.jpg@WEBx",
+                "modelData": base64.b64encode(faces[person]).decode("ascii"),
+            }
+            for person in window
+        ]
+        return httpx.Response(
+            200,
+            json=_search_envelope(
+                search_id=body.get("searchID"),
+                envelope_key="FDSearch",
+                record_key="Records",
+                rows=rows,
+                total_override=total,
+            ),
+        )
+
+    def _biometric_fp_read(self, request: httpx.Request) -> httpx.Response:
+        """Store-mode FingerPrintUpload — `FingerPrintCond` wrapper REQUIRED (§1).
+
+        Plain-cond form 400s `MessageParametersLack FingerPrintCond` exactly as
+        probed; every probed inner field is required and each missing one answers
+        the same subStatusCode naming it. The answer is the recorded shape —
+        `FingerPrintInfo.FingerPrintList` with ONE row (fingerPrintID = fpIndex+1,
+        fingerType "normalFP", base64 fingerData) — and the honest not-found shape
+        is an EMPTY list: no probed error word exists for "this person has no
+        finger N", so the fake never invents one.
+        """
+        try:
+            body = json.loads(request.content.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return message_parameters_lack("FingerPrintCond")
+        cond = body.get("FingerPrintCond") if isinstance(body, dict) else None
+        if not isinstance(cond, dict):
+            return message_parameters_lack("FingerPrintCond")
+        for param in ("searchID", "employeeNo", "fpIndex", "dataType"):
+            if cond.get(param) in (None, ""):
+                return message_parameters_lack(param)
+        store: dict[tuple[str, int], bytes] = (self._biometric_store or {}).get("fingerprints", {})
+        key = (str(cond["employeeNo"]), int(cond["fpIndex"]))
+        row_bytes = store.get(key)
+        info: dict[str, object] = {}
+        if row_bytes is not None:
+            info["FingerPrintList"] = [
+                {
+                    "cardReaderNo": 1,
+                    "fingerPrintID": key[1] + 1,  # recorded: fpIndex 0 -> fingerPrintID 1
+                    "fingerType": "normalFP",
+                    "fingerData": base64.b64encode(row_bytes).decode("ascii"),
+                    "leaderFP": "true" if key[1] == 0 else "false",
+                }
+            ]
+        else:
+            info["FingerPrintList"] = []  # the device's own empty list: honest zero
+        return httpx.Response(200, json={"FingerPrintInfo": info})
+
     # -- the server --------------------------------------------------------------------
 
     #: path (no query) -> handler name; the enrollment routes the fake answers when
@@ -1221,6 +1397,12 @@ class FakeDevice:
             if path == "/ISAPI/AccessControl/UserInfo/Search":
                 return self._enroll_user_search(request)
             return self._enroll_card_search(request)
+        # E1-01b store mode: the two biometric READs answer from the seeded store
+        # when armed (precedence over the installed axis for THESE paths only).
+        if is_post and self._biometric_store is not None and path in _BIOMETRIC_POST_PATHS:
+            if path == FD_SEARCH_PATH:
+                return self._biometric_fd_search(request)
+            return self._biometric_fp_read(request)
         if self._enrollment is not None:
             answered = self._handle_enrollment(request)
             if answered is not None:

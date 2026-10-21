@@ -124,6 +124,21 @@ bundles/<site>-<host>/
   and verify (§6) compare hashes computed by the same function over live reads.
 - Bundle dir 0700, files 0600, always under the configured root (`--out` inside the
   repo is REFUSED — public-repo hygiene). Reports print hashes/counts, never names.
+- **E1-01b (template export) is IMPLEMENTED** on the stack branch (E1-01's shipped
+  state was `faces/INDEX.json` = UNAVAILABLE + FP absent, which its tests keep
+  pinned). `export_faces()` walks FDSearch FDID 1 in the proven FLAT dialect via the
+  `paging.fd_search` engine (flat body, no `searchID`, page-until-zero for the
+  3-of-4-on-one-OK-page quirk); `export_fingerprints()` reads FingerPrintUpload per
+  employee fpIndex-by-fpIndex to the pinned empty-`FingerPrintList` stop shape (no
+  probed device word exists for "no more" — recorded as engine label
+  `OK-EMPTY-LIST`, PR reviewer question); `export_full_bundle()` composites the four
+  reads. Bundle schema bumped to `gateclerk-enrollment-bundle/2`: AVAILABLE-state
+  INDEX.json files (per-person FDID/FPID/sha256/length + the faceURL-404
+  `photo_bytes` recorded fact), manifest face/FP sections + INDEX digests +
+  REPORT-ONLY `numOfFace`/`numOfFP` counters (counter-vs-set §9: reported, never
+  resolved), `fingerprints/` dir. Template bytes stay OPAQUE end to end: files carry
+  the device's base64 verbatim; digests are over the decoded bytes (transport, not
+  parsing); the sensor-family value is a header-bytes NOTE.
 
 ## 3. Capability probe (gate for every export AND apply)
 
