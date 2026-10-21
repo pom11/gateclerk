@@ -49,6 +49,28 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-21 — Canary started (operator: orchestrator runs P2-10 itself). Live smoke found a real device bug.
+
+- Operator unblocked P2-10 from human-run: the orchestrator now runs the site-a canary
+  as launchd user agent `com.gateclerk.agent.site-a` (rendered from the shipped template:
+  KeepAlive + Throttle 5, TZ=UTC, logs + state under ~/gateclerk/site-a,
+  sites.toml local + chmod 600 OUTSIDE the repo, creds keychain rung only). Daily
+  snapshot job `com.gateclerk.p2-10-snapshot` (07:05 local) reads health/agent.json +
+  store, evaluates the four CLEAN criteria, and posts one comment on t_e6cdb2e9 per day
+  (JSONL history in the state dir). Day-7 verdict carded to fire after day 7.
+- LIVE SMOKE caught what 1465 offline tests could not (FakeDevice accepts any
+  startTime string): the agent's `now`-derived window carries microseconds and the
+  device 400s them — `badJsonContent errorMsg=startTime` — while the byte-identical
+  body WITHOUT microseconds is ACCEPTED (one read-only A/B POST each; the p1-05c
+  +02:00 relabel itself was correct). CLI never hit this: operator windows are
+  whole-minute strings. Fix card t_48c6dd44 (search_pair floors to whole seconds;
+  FakeDevice gains the strictness so this class can't hide again). **Agent launch is
+  blocked on that merge** — the launchd job is rendered and waiting. Tick failure was
+  clean: checkpoint unmoved, zero loss, no 401 (400 = shape answer, not credential).
+- Noted, not carded (owner's call later): tick_reports drops TickResult.error, so a
+  failed tick is silent on stderr — the reason the 400 needed an in-process probe to
+  name. Minor observability gap, no payroll risk (checkpoint/overlap semantics correct).
+
 ## 2026-10-21 — P2 CODE COMPLETE (PR #35 -> 32dbfd8). Board holds only the 3 HUMAN-RUN cards.
 
 - PR #35 (agent CLI run|ack|deadletter + PushLedger) merged: gate 1465 passed / 5
