@@ -49,6 +49,29 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-21 — E1 (enrollment migration) opened: canary skipped by operator, design v2 after dual adversarial review.
+
+- Operator skipped P2-10 (site-a = bench device, 7 clean days prove nothing): all 3
+  launchd jobs unloaded, plists kept in ~/gateclerk/launchd/, card closed with the
+  P2-fix-A catch as its receipt. Canary re-arms for free if a real site appears.
+- NEW FEATURE E1 — enrollment migration device↔device (first feature that WRITES):
+  operator dropped the sign-off gate ("you own the design end to end"). Design doc
+  docs/ENROLLMENT-MIGRATION.md v1 written FROM LIVE PROBES of bench A (read-only,
+  ~15 requests total across 8 rounds): UserInfo/CardInfo search work (4 users, 0
+  cards, record shape incl. RightPlan+Valid+password); UserInfoDetail/FingerPrint/
+  PlanTemplate all notSupport on this fw; FDSearch rejects ~8 body shapes (R1, both
+  face ends unconfirmed); no caps endpoint for max-counts on A. Two adversarial
+  reviewer subagents (write-path correctness / ISAPI realism + fake strictness), both
+  FIX-FIRST → v2: endpoint-confirmation MERGE gate (§5.0), freshness contract +
+  fail-closed reads (TOCTOU — found independently by both), PINs never persisted to
+  bundles, journal lifecycle planned→applied→confirmed with restore-before-delete
+  undo, cross-device card-uniqueness + employeeNo-normalization conflict classes,
+  timeType local-vs-UTC semantics, derived batch caps + explicit nonce-budget math,
+  fail-closed unknown-field verify, byte-stability round-trip test. §11 logs what was
+  applied vs rejected-with-reason.
+- Next: E1-01 (bundle+export) + E1-03 (probe) dispatch; bench-A snapshot is the
+  first live write-adjacent step; write code merges only after §5.0 captures.
+
 ## 2026-10-21 — Canary started (operator: orchestrator runs P2-10 itself). Live smoke found a real device bug.
 
 - Operator unblocked P2-10 from human-run: the orchestrator now runs the site-a canary
