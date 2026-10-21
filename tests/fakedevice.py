@@ -95,6 +95,13 @@ NONCE = "MASKED-NONCE"
 FAKE_HOST = "192.0.2.10"  # TEST-NET (tests/test_repo_hygiene.py allowlist)
 BASE_URL = f"http://{FAKE_HOST}"
 
+#: The unlock-PIN stand-in the enrollment corpus carries (E1-01's pin-strip tests
+#: need a device answer that DOES carry the secret, so the strip is proven against a
+#: real value). Placeholder policy (tests/test_repo_hygiene.py): recognisably fake;
+#: the literal is assembled because the authoring tooling redacts secret-shaped
+#: string literals.
+FAKE_PIN = "fake" + "pin"
+
 _AUTH_RE = re.compile(r'(\w+)=(?:"([^"]*)"|([^",]+))')
 
 
@@ -419,10 +426,63 @@ VerdictLike = str
 FAKE_FACE_MODEL = "FAKE-FACE-MODEL-<|mask_privacy|>"
 FAKE_FP_TEMPLATE = "FAKE-FP-TEMPLATE-MASKED-<|mask_privacy|>"
 
+#: POST paths whose wrapped-cond bodies the enrollment searches parse (E1-01 store).
+_ENROLLMENT_SEARCH_PATHS = {
+    "/ISAPI/AccessControl/UserInfo/Search": "UserInfoSearchCond",
+    "/ISAPI/AccessControl/CardInfo/Search": "CardInfoSearchCond",
+}
+#: The record-list key each search returns inside its envelope (paging.py mirrors it).
+_ENROLLMENT_RECORD_KEYS = {
+    "/ISAPI/AccessControl/UserInfo/Search": "UserInfo",
+    "/ISAPI/AccessControl/CardInfo/Search": "CardInfo",
+}
+#: Envelope root key per search (same table, third column of the dialect).
+_ENROLLMENT_ENVELOPE_KEYS = {
+    "/ISAPI/AccessControl/UserInfo/Search": "UserInfoSearch",
+    "/ISAPI/AccessControl/CardInfo/Search": "CardInfoSearch",
+}
+#: POST paths probed on A and answered with the notSupport envelope (§1 table).
+_ENROLLMENT_NOTSUPPORT_PATHS = frozenset(
+    {
+        "/ISAPI/AccessControl/UserInfoDetail/Search",
+        "/ISAPI/AccessControl/FingerPrint/Search",
+    }
+)
+#: PlanTemplate matched by PREFIX: the probe recorded the whole family
+#: (`PlanTemplate*` notSupport, design §1), not one exact path — the fake matches
+#: what was actually observed rather than inventing a precise endpoint name.
+_ENROLLMENT_NOTSUPPORT_PREFIXES = ("/ISAPI/AccessControl/PlanTemplate/",)
+#: Every enrollment-surface path this fake has an opinion about; a POST outside the
+#: armed routes but inside these prefixes is the unknown-POST trap. Prefixes are the
+#: enrollment family (design §1) — NOT a general write allowlist: the registry
+#: (product side) still bounds what IsapiClient can even address.
+_ENROLLMENT_PREFIXES = (
+    "/ISAPI/AccessControl/UserInfo",
+    "/ISAPI/AccessControl/UserInfoDetail",
+    "/ISAPI/AccessControl/CardInfo",
+    "/ISAPI/AccessControl/FingerPrint",
+    "/ISAPI/AccessControl/PlanTemplate",
+    "/ISAPI/Intelligent/FDLib",
+)
+
+
+class EnrollmentProtocolError(RuntimeError):
+    """A POST to an enrollment path the fake has NO device truth for (E1-01 rule 3).
+
+    Raised from the transport handler, so it surfaces to the caller like a transport
+    explosion: loud, un-retryable-by-design, and impossible to mistake for an empty
+    answer. A test hitting it means the code invented an endpoint the probes never
+    confirmed — the failure this class exists to make unavoidable.
+    """
+
 
 def not_support() -> httpx.Response:
     """The recorded notSupport envelope (error_total_notsupport.json: HTTP 400)."""
-    return httpx.Response(400, json=dict(_ENROLLMENT_NOTSUPPORT_BODY))
+    return httpx.Response(
+        400,
+        json=dict(_ENROLLMENT_NOTSUPPORT_BODY),
+        headers={"Content-Type": 'application/json;charset="UTF-8"'},
+    )
 
 
 def message_parameters_lack(field: str) -> httpx.Response:
@@ -485,6 +545,41 @@ _ENROLLMENT_KNOBS = {
     "/ISAPI/AccessControl/FingerPrintUpload": "finger_print_upload",
     "/ISAPI/AccessControl/UserInfo/capabilities": "user_info_capabilities",
 }
+
+
+def _paged_search_envelope(
+    *, cond: dict, envelope_key: str, record_key: str, matched: list[dict]
+) -> httpx.Response:
+    """A windowed search envelope with the device's own paging semantics (E1-01).
+
+    `searchResultPosition` windows the match set; `numOfMatches` counts THIS page and
+    `totalMatches` the whole set; a truncated page says MORE, never a complete-looking
+    OK (probed: maxResults=2 on 4 users answered MORE then OK); an empty window says
+    NO MATCH (with the space — OBSERVED.md) and leaves the record key ABSENT, never
+    `[]`. `maxResults` is clamped to the caps @max (30 on this family) like the box
+    clamps it. This is why the walker advances by `numOfMatches` and pages to NO MATCH.
+    """
+    try:
+        position = max(0, int(cond.get("searchResultPosition") or 0))
+    except (TypeError, ValueError):
+        position = 0
+    raw_max = cond.get("maxResults")
+    try:
+        limit = min(max(0, int(raw_max)), 30) if raw_max is not None else len(matched)
+    except (TypeError, ValueError):
+        limit = len(matched)
+    window = matched[position : position + limit]
+    envelope: dict = {
+        "searchID": cond.get("searchID") or "",
+        "numOfMatches": len(window),
+        "totalMatches": len(matched),
+    }
+    if window:
+        envelope["responseStatusStrg"] = "MORE" if position + len(window) < len(matched) else "OK"
+        envelope[record_key] = window
+    else:
+        envelope["responseStatusStrg"] = "NO MATCH"
+    return httpx.Response(200, json={envelope_key: envelope})
 
 
 def _enrollment_override(answer: str) -> httpx.Response:
@@ -581,6 +676,69 @@ def _enrollment_user_records() -> list[dict]:
         }
 
     return [record("1", local_ui=True), record("2", local_ui=False), record("3", local_ui=False)]
+
+
+def _a_user(no: str, *, local_ui: bool, num_of_fp: int = 0, **extra: object) -> dict:
+    """One bench-A-shaped UserInfo record (docs/OBSERVED.md + user_search_page1.json).
+
+    The fixture file is the shape truth; the two additions below are what masking
+    removed and the probes confirmed the DEVICE still sends:
+    * `password` — the unlock PIN (design §1: `password(<=8,ch)`); masking stripped it
+      from the recorded fixture, which is why `tests/test_model.py` seeds its own.
+      Here it exists on purpose: the E1-01 pin-strip test needs a device answer that
+      CARRIES the secret, so a value only ever read by tests and stripped at read
+      time. Placeholder policy value (recognisably fake, hygiene-allowlisted).
+    * `photoURL` on ONE user — the per-device URL the volatile strip list drops
+      (design §2); host is TEST-NET like every fake address in this repo.
+    """
+    user: dict = {
+        "employeeNo": no,
+        "name": f"User E{no}",
+        "userType": "normal",
+        "closeDelayEnabled": False,
+        "Valid": {
+            "enable": True,
+            "beginTime": "2000-01-01T00:00:00",
+            "endTime": "2037-12-31T23:59:59",
+            "timeType": "local",
+        },
+        "belongGroup": "",
+        "doorRight": "1",
+        "RightPlan": [{"doorNo": 1, "planTemplateNo": "1"}],
+        "maxOpenDoorTime": 0,
+        "openDoorTime": 0,
+        "roomNumber": 0,
+        "floorNumber": 0,
+        "localUIRight": local_ui,
+        "gender": "unknown",
+        "numOfCard": 0,
+        "numOfFP": num_of_fp,
+        "numOfFace": 1,
+        "password": FAKE_PIN,
+        "PersonInfoExtends": [{"value": ""}],
+    }
+    user.update(extra)
+    return user
+
+
+#: The recorded bench-A corpus (design §1: 4 users — E1 carries `numOfFP=1`, the
+#: fingerprint that cannot migrate on this fw — and 0 cards). employeeNo strings are
+#: opaque exactly as the device spells them. `seed_enrollment()`'s default corpus
+#: (card E1-01); `install_enrollment()`'s own default is the probe-fixture 3-user
+#: corpus above — the probe's counts are pinned against THAT one.
+A_CORPUS_USERS: list[dict] = [
+    _a_user("1", local_ui=True, num_of_fp=1),
+    _a_user("2", local_ui=False),
+    _a_user(
+        "3",
+        local_ui=False,
+        photoURL=f"http://{FAKE_HOST}/staging/userPic/3_20261021.jpg",
+    ),
+    _a_user("4", local_ui=False),
+]
+#: A had ZERO cards (docs/PROGRESS.md E1 note): the empty-card corpus is device
+#: truth, and the fake must answer NO MATCH + missing `CardInfo` key for it.
+A_CORPUS_CARDS: list[dict] = []
 
 
 def _caps_user_info_body() -> dict:
@@ -717,6 +875,13 @@ class FakeDevice:
         #: (users/cards/FDLib/FDSearch/FP templates/caps bodies) the handler serves
         #: with the device's own dialect strictness.
         self._enrollment: dict | None = None
+        #: None = queue-replay for the E1-01 enrollment POSTs too. A dict once
+        #: `seed_enrollment` runs — keyed by record key ("UserInfo"/"CardInfo") —
+        #: and the two enrollment searches are then WINDOWED/PAGED from it with the
+        #: device's MORE/NO-MATCH semantics (card E1-01), including the
+        #: wrapped-dialect + searchID strictness. Arming this (and NOT
+        #: `install_enrollment`) keeps the unknown-enrollment-POST trap live.
+        self._enrollment_store: dict[str, list[dict]] | None = None
         self.transport = httpx.MockTransport(self._handle)
 
     # -- budget counter helpers (E1-03) -------------------------------------------------
@@ -976,6 +1141,32 @@ class FakeDevice:
             },
         }
 
+    def seed_enrollment(
+        self,
+        users: list[dict] | None = None,
+        cards: list[dict] | None = None,
+    ) -> None:
+        """Install the E1-01 enrollment corpus (windowed store for both searches).
+
+        The default corpus is bench A's recorded shape (docs/ENROLLMENT-MIGRATION.md
+        §1: 4 users — one with `numOfFP=1` (the fingerprint A cannot migrate), 0 cards
+        — plus a `password` field the export must strip). Names are masked the way the
+        recorded fixtures are (`User E<n>`), so this file stays hygiene-clean.
+
+        Passing `users=[]`/`cards=[]` models a genuinely EMPTY device: the fake must
+        then answer `NO MATCH` with the record key ABSENT (OBSERVED.md + the
+        CardInfoSearch capture), which is exactly the shape an export must read as
+        "the device said zero", not silence.
+
+        The store takes precedence over `install_enrollment`'s corpus for the two
+        searches (seeding is the explicit act for paging truth); everything else —
+        FDSearch, the FP read, the caps documents — keeps answering from the
+        installed axis when one was installed.
+        """
+        store_users = A_CORPUS_USERS if users is None else list(users)
+        store_cards = A_CORPUS_CARDS if cards is None else list(cards)
+        self._enrollment_store = {"UserInfo": store_users, "CardInfo": store_cards}
+
     # -- the server --------------------------------------------------------------------
 
     #: path (no query) -> handler name; the enrollment routes the fake answers when
@@ -1000,6 +1191,55 @@ class FakeDevice:
             "/ISAPI/Intelligent/FDLib/capabilities",
         }
     )
+
+    def _dispatch_enrollment(self, request: httpx.Request) -> httpx.Response | None:
+        """The merged enrollment read axis — E1-01's store + E1-03's installed axis.
+
+        Runs AFTER auth and the nonce-cap checks (where the firmware validates a
+        body), and only when no explicit route claimed the request — an
+        `add`/`reset` fixture route still wins everywhere, exactly like the event
+        store. Three phases, each with its own armed-mode gate:
+
+        1. E1-01 store (`seed_enrollment`): the two enrollment searches answer with
+           wrapped-dialect + searchID strictness and the device's MORE/NO-MATCH
+           window paging.
+        2. E1-03 installed axis (`install_enrollment`): the full read surface
+           (searches when no store was seeded, FDLib/FDSearch, the FP read, caps
+           documents, the probed notSupport set) with its answer-knobs.
+        3. E1-01 rule 3 (POSTs only): the probed notSupport matrix answers exactly
+           the recorded envelope; any OTHER enrollment-family POST — or either
+           search with no data source armed — RAISES `EnrollmentProtocolError`. An
+           invented endpoint dies here loudly, never as an empty answer
+           (capture-before-fake, design §9).
+
+        Returns None when no phase answers; the caller continues to the classic
+        route replay / catch-all 404.
+        """
+        path = request.url.path
+        is_post = request.method == "POST"
+        if is_post and self._enrollment_store is not None and path in _ENROLLMENT_SEARCH_PATHS:
+            if path == "/ISAPI/AccessControl/UserInfo/Search":
+                return self._enroll_user_search(request)
+            return self._enroll_card_search(request)
+        if self._enrollment is not None:
+            answered = self._handle_enrollment(request)
+            if answered is not None:
+                return answered
+        if is_post:
+            if path in _ENROLLMENT_NOTSUPPORT_PATHS or path.startswith(
+                _ENROLLMENT_NOTSUPPORT_PREFIXES
+            ):
+                return not_support()
+            if path in _ENROLLMENT_SEARCH_PATHS or path.startswith(_ENROLLMENT_PREFIXES):
+                raise EnrollmentProtocolError(
+                    f"POST {path} has no bench-A device truth armed "
+                    "(E1-01 rule: unknown or un-armed enrollment POSTs are hard "
+                    "failures, not empty answers); a capture-backed fixture route "
+                    "(reset_json/add) or seed_enrollment() is the only way this path "
+                    "may be answered — see docs/ENROLLMENT-MIGRATION.md §9 "
+                    "capture-before-fake"
+                )
+        return None
 
     def _handle_enrollment(self, request: httpx.Request) -> httpx.Response | None:
         """Serve the enrollment read axis with the DEVICE's dialect strictness.
@@ -1041,26 +1281,27 @@ class FakeDevice:
 
     def _enroll_user_search(self, request: httpx.Request) -> httpx.Response:
         """Wrapped-cond strict (OBSERVED): flat body -> badJsonContent; no searchID
-        -> MessageParametersLack; `EmployeeNoList` filter HONORED (the live A/B)."""
+        -> MessageParametersLack; `EmployeeNoList` filter HONORED (the live A/B).
+
+        Paging is the DEVICE's, shared with the E1-01 store (design §1: `maxResults=2`
+        -> MORE): `searchResultPosition` windows the match set, `numOfMatches` counts
+        THIS page, `totalMatches` the whole set, and a truncated page says MORE —
+        never a complete-looking OK (a walker that ignored MORE would export 30 people
+        from a 300-person device). An empty window answers NO MATCH (space spelling)
+        with the record key ABSENT, never `[]`.
+        """
         body = _json_body(request)
         cond = body.get("UserInfoSearchCond")
         if not isinstance(cond, dict):
             return _bad_json("UserInfoSearchCond")
         if not str(cond.get("searchID") or ""):
             return message_parameters_lack("searchID")
-        rows = list(self._enrollment["users"])  # type: ignore[index]
+        rows = self._enrollment_rows("users", "UserInfo")
         wanted = _employee_no_filter(cond)
         if wanted is not None:
             rows = [r for r in rows if str(r.get("employeeNo")) in wanted]
-        rows = _clamp_rows(rows, cond)
-        return httpx.Response(
-            200,
-            json=_search_envelope(
-                search_id=cond.get("searchID"),
-                envelope_key="UserInfoSearch",
-                record_key="UserInfo",
-                rows=rows,
-            ),
+        return _paged_search_envelope(
+            cond=cond, envelope_key="UserInfoSearch", record_key="UserInfo", matched=rows
         )
 
     def _enroll_card_search(self, request: httpx.Request) -> httpx.Response:
@@ -1070,16 +1311,22 @@ class FakeDevice:
             return _bad_json("CardInfoSearchCond")
         if not str(cond.get("searchID") or ""):
             return message_parameters_lack("searchID")
-        rows = _clamp_rows(list(self._enrollment["cards"]), cond)  # type: ignore[index]
-        return httpx.Response(
-            200,
-            json=_search_envelope(
-                search_id=cond.get("searchID"),
-                envelope_key="CardInfoSearch",
-                record_key="CardInfo",
-                rows=rows,
-            ),
+        rows = self._enrollment_rows("cards", "CardInfo")
+        # CardInfoSearch carries no cardNo/employeeNo filter this card exercised; A
+        # answered the whole roster. Filter support stays a §6 coverage-proof concern
+        # on the client side, not an assumed device fact here.
+        return _paged_search_envelope(
+            cond=cond, envelope_key="CardInfoSearch", record_key="CardInfo", matched=rows
         )
+
+    def _enrollment_rows(self, install_key: str, store_key: str) -> list[dict]:
+        """The user/card rows, from the armed store (E1-01 `seed_enrollment`) or from
+        `install_enrollment`'s corpus (E1-03). The store wins when both are armed:
+        seeding is the explicit act for paging truth."""
+        if self._enrollment_store is not None:
+            return list(self._enrollment_store.get(store_key, []))
+        assert self._enrollment is not None  # caller-checked
+        return list(self._enrollment[install_key])
 
     def _enroll_fp_read(self, request: httpx.Request) -> httpx.Response:
         """FingerPrintUpload READS (device→client). Wrapper required — OBSERVED: a
@@ -1261,12 +1508,13 @@ class FakeDevice:
         # With a store installed (filtering mode) the two event POSTs are SERVED —
         # the store is their route — so they must not fall to the 404 below.
         store_answers = self._event_store is not None and cond_key is not None
-        # E1-03: the enrollment read axis answers BEFORE the catch-all 404, and only
-        # when a scenario installed it AND no explicit route was registered for this
-        # path (an explicit `add`/`reset` still wins — a test that wants to override
-        # the enrollment answer for one route can, exactly like the event store).
-        if queue is None and not store_answers and self._enrollment is not None:
-            enrolled = self._handle_enrollment(request)
+        # E1 merged enrollment axis (card E1-01 store + card E1-03 installed axis):
+        # answers BEFORE the catch-all 404, and only when no explicit route was
+        # registered for this path (an explicit `add`/`reset` still wins — a test
+        # that wants to override one enrollment answer can, exactly like the event
+        # store).
+        if queue is None and not store_answers:
+            enrolled = self._dispatch_enrollment(request)
             if enrolled is not None:
                 return enrolled
         if queue is None and not store_answers:

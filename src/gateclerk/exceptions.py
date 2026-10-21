@@ -24,6 +24,7 @@ from typing import Any
 __all__ = [
     "ConfigError",
     "CredentialUnavailable",
+    "EnrollmentReadAborted",
     "EventBoundsError",
     "IsapiAuthError",
     "IsapiBadContent",
@@ -222,6 +223,37 @@ class SearchProtocolError(GateclerkError):
     a well-formed body under the wrong root key means the device changed protocol on
     us. Returning "no records" here would read as "nobody clocked in" — never.
     """
+
+
+# --- enrollment export (E1) --------------------------------------------------------------
+
+
+class EnrollmentReadAborted(GateclerkError):
+    """A required enrollment read failed CLOSED (design §0.7; card E1-01).
+
+    An enrollment export/diff is only trustworthy if every required read said OK:
+    a non-OK `responseStatusStrg` (anything beyond OK/MORE/NO MATCH — FAIL,
+    UNKNOWN…), a missing `responseStatusStrg`, or a transport/auth error on
+    `UserInfo/Search` / `CardInfo/Search` ABORTS the export. Interpreting any of
+    them as "the device has zero people/cards" fabricates an empty state — which on
+    E1's rollback-snapshot use (design §0.1) means a snapshot that cannot roll back.
+
+    `endpoint` and `reason` name what failed; `cause` carries the underlying typed
+    error when there was one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        endpoint: str | None = None,
+        reason: str | None = None,
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.endpoint = endpoint
+        self.reason = reason
+        self.cause = cause
 
 
 # --- error-message redaction ---------------------------------------------------------

@@ -116,6 +116,7 @@ __all__ = [
     "SearchSummary",
     "acs_event_search",
     "build_event_cond",
+    "card_info_search",
     "chunk_window",
     "clamp_page_size",
     "collect_users",
@@ -718,6 +719,40 @@ def user_info_search(
         cond_key="UserInfoSearchCond",
         envelope_key="UserInfoSearch",
         record_key="UserInfo",
+        limits=limits,
+        page_size=page_size,
+        max_pages=max_pages,
+        inter_page_delay=inter_page_delay,
+        sleep=sleep,
+        clock=clock,
+    )
+
+
+def card_info_search(
+    reader: PageReader,
+    *,
+    limits: PagingLimits | None = None,
+    page_size: int | None = None,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    inter_page_delay: float = DEFAULT_INTER_PAGE_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> PagedSearch:
+    """A cursor bound to `POST /ISAPI/AccessControl/CardInfo/Search?format=json`.
+
+    Added by card E1-01 (enrollment export): the card-enrollment walk shares EVERY
+    paging rule of `user_info_search` — one byte-stable `searchID` per logical
+    search, cursor advanced by returned `numOfMatches`, termination via normalized
+    `responseStatusStrg`, empty response = no `CardInfo` key at all (the third-party
+    capture in references/isapi-client-gotchas.md [15] shows exactly that missing-key
+    shape for `NO MATCH`). Only the three key names differ.
+    """
+    return PagedSearch(
+        reader,
+        endpoint="card_info_search",
+        cond_key="CardInfoSearchCond",
+        envelope_key="CardInfoSearch",
+        record_key="CardInfo",
         limits=limits,
         page_size=page_size,
         max_pages=max_pages,

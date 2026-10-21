@@ -75,6 +75,7 @@ heal gaps.
 | `/ISAPI/System/time` | GET | XML here too. device clock + tz; drift/offset is our problem, not the device's (see Time handling) |
 | `/ISAPI/AccessControl/UserInfo/Count` | GET | GET only — POST → `methodNotAllowed` on this fw |
 | `/ISAPI/AccessControl/UserInfo/Search` | POST (JSON body) | employee roster, paged. Records carry a `password` hash key — strip before storing |
+| `/ISAPI/AccessControl/CardInfo/Search` | POST (JSON body) | card enrollments (employeeNo, cardNo, cardType), paged; wrapped `CardInfoSearchCond` body. Added by E1-01 (enrollment export) with `gateclerk.endpoints.SEARCH_ENDPOINTS` + the registry test — bench A answers the shape (0 cards recorded), design docs/ENROLLMENT-MIGRATION.md §1 |
 | `/ISAPI/AccessControl/AcsEvent` | POST (JSON body) | events, paged |
 | `/ISAPI/AccessControl/AcsEvent/capabilities` | GET | **the important one** — see below |
 | `/ISAPI/AccessControl/capabilities` | GET | AccessControl-wide caps (per-group `maxCapacity`; the `AcsEvent` group's is the event-ring capacity — advisory for open question 4). Absent on some firmware: a 404 `notSupport` here is recorded as data, not failure. |
