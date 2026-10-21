@@ -532,3 +532,32 @@ device truth: docs/OBSERVED.md.)
   probed server filters. Also added: three error-envelope shapes + machine-readable
   lockout fields (`lockStatus/unlockTime`), silent maxResults clamping rationale,
   digest uri=/thread-safety/version-pin rules. Card comments updated for p1-03/04/05/08/09.
+
+## 2026-10-21 (afternoon) — E1 v4: operator scope correction — faces + fingerprints are THE PRODUCT.
+
+- Operator review of v3: keep the safety spine; faces can't be "report-only,
+  re-enroll on site"; supplied K1T-family shapes for FDSearch + FingerPrintUpload
+  from memory and ordered ONE capture session for users+card+FP+face fixtures.
+- Every supplied shape VERIFIED LIVE on bench A (read-only rounds 11-18, one attempt
+  per shape, no retries — raw facts + masking in docs/OBSERVED.md, design in v4 §1):
+  * FDSearch RESOLVED (FLAT dialect!): rows carry `modelData` = the face TEMPLATE
+    (272 B, FR500005 magic) — portable bytes; faceURL PHOTO bytes dead (404s).
+    v3's "faces unexportable" was my wrong-dialect mistake, not a device limit.
+  * FP read RESOLVED via FingerPrintUpload+FingerPrintCond (512 B template for E1);
+    FingerPrint/Search notSupport was the wrong door.
+  * UserInfo/Search truth: wrapped UserInfoSearchCond + searchID REQUIRED;
+    EmployeeNoList filter PROVEN honored (coverage discipline kept anyway);
+    paging MORE/OK quirk. Caps GETs work (v3 said 404) and UNDER-CLAIM
+    (isSuportFDSearch=false while FDSearch works) → no inference from caps.
+  * templateNo "1" default-carried now (all bench users use it; caps
+    maxPlanTemplate=4) — v3's blanket report-only would ship migrated people with
+    NO door right.
+- Design v4 committed `2007681` (v4 delta log §11), OBSERVED.md `81655af`, pushed.
+- Cards: E1-01b t_18a670bd created (faces+FP export, child of E1-01, reads proven
+  so it builds offline NOW); steering comments posted on t_bd1faed8 (scope trim),
+  t_9c5732ff (fake matrix corrections BEFORE it lands), t_0fd87e2f (templateNo-1 +
+  set-diff), t_bbddb8f5 (§5.0 = ONE session, four fixtures; capture-before-fake
+  unchanged). E1-06 = critical path; E1-06b (FP port) added to the DAG in §10.
+- Next: gate E1-01 + E1-03 PRs as they land (with v4 lens); then E1-02; then the
+  ONE-session bench-A capture (export snapshot → users/card/FP/face fixtures →
+  restore); then E1-04/05/06/06b/07. No write fake route before its fixture.
