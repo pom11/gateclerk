@@ -60,11 +60,13 @@ from gateclerk.paging import (
     chunk_window,
     clamp_page_size,
     collect_users,
+    fd_search,
     iter_event_windows,
     iter_users,
     new_search_id,
     normalize_status,
     parse_chunk,
+    response_envelope,
 )
 from gateclerk.tz import (
     DeviceWindow,
@@ -664,6 +666,56 @@ def test_cursor_fields_cannot_be_smuggled_by_caller() -> None:
     with pytest.raises(SearchProtocolError):
         list(engine.pages({"maxResults": 9999}))
     assert sent == [], "the guard fired before any request"
+
+
+# --- captured FDSearch root dialect (§5.0 capture, bench A 2026-10-22) -------------------
+
+# THE byte-for-byte key set bench A answered on FDSearch. Captured live: there is NO
+# `{"FDSearch": ...}` wrapper (the v4 design guess; it failed CLOSED on the real box),
+# and the honest zero (FPID of a person with no face) omits `MatchList` ENTIRELY.
+CAPTURED_FD_ROW = {
+    "statusCode": 1,
+    "statusString": "OK",
+    "subStatusCode": "ok",
+    "responseStatusStrg": "OK",
+    "numOfMatches": 1,
+    "totalMatches": 1,
+    "MatchList": [{"FPID": "1", "faceURL": "…", "modelData": "RlI1MDAwMDUB"}],
+}
+CAPTURED_FD_ZERO = {
+    "statusCode": 1,
+    "statusString": "OK",
+    "subStatusCode": "ok",
+    "responseStatusStrg": "NO MATCH",
+    "numOfMatches": 0,
+    "totalMatches": 0,
+}
+
+
+def test_response_envelope_root_dialect_accepts_captured_shapes() -> None:
+    env = response_envelope(CAPTURED_FD_ROW, "", search_id="cap")
+    assert env is CAPTURED_FD_ROW  # the root IS the envelope
+    assert response_envelope(CAPTURED_FD_ZERO, "", search_id="cap")["numOfMatches"] == 0
+
+
+def test_response_envelope_root_dialect_still_fails_closed() -> None:
+    """The root dialect must NOT become 'any dict is a search answer': a body without
+    the count fields is a protocol break, read as zero records only by the bug §0.7
+    exists to stop."""
+    with pytest.raises(SearchProtocolError, match="no count fields"):
+        response_envelope({"somethingElse": True}, "", search_id="cap")
+
+
+def test_fd_search_walks_captured_root_dialect_to_zero_page() -> None:
+    """A full walk on the CAPTURED dialect: one row page, then the honest zero page
+    (record key absent) terminates it — exactly what the real device answered."""
+    reader, _sent = scripted(CAPTURED_FD_ROW, CAPTURED_FD_ZERO)
+    engine = fd_search(reader, sleep=no_sleep, inter_page_delay=0.0)
+    pages = list(engine.pages({"faceLibType": "blackFD", "FDID": "1"}))
+    assert [r["FPID"] for p in pages for r in p.records] == ["1"]
+    assert engine.summary is not None
+    assert engine.summary.pages == 2
+    assert engine.summary.termination == "NOMATCH"
 
 
 # --- AcsEvent windows: chunking, ordering, serial checkpoints ----------------------------

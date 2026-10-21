@@ -287,6 +287,18 @@ fingerData) are never committed here or in fixtures — shape/size/hash-prefix o
   **faceURL photo bytes DEAD**: `http://<device-a>/LOCALS/pic/enrlFace/0/…jpg@WEB…`
   404s (plain, %-encoded @, fresh-cookie same-session alike). Not retry-spamming:
   5 GETs total across rounds.
+- **FDSearch RESPONSE shape CAPTURED** (§5.0 capture session, 2026-10-22, during the
+  first live `export_full_bundle` — the read failed CLOSED and named the gap, which
+  is §0.7 working as designed): there is **no `{"FDSearch": ...}` wrapper** —
+  `statusCode/statusString/subStatusCode/responseStatusStrg/numOfMatches/totalMatches`
+  sit at the body ROOT (root keys captured verbatim: `MatchList,numOfMatches,
+  responseStatusStrg,statusCode,statusString,subStatusCode,totalMatches`), rows under
+  **`MatchList`**, and the honest zero (FPID of a person with no face: 1 request,
+  FPID=99) answers `NO MATCH` with **`MatchList` absent entirely** — same
+  empty-is-absence rule as the P1 windows. The design's `FDSearch`/`Records` guess is
+  retired; `paging.fd_search` carries the captured values (`envelope_key=""`).
+  FingerPrintUpload zero shape re-confirmed the same day: `FingerPrintInfo:{searchID,
+  status:"NoFP"}` with `FingerPrintList` absent (the probed full shape is unchanged).
 - **FingerPrint read WORKS** (misleading name, device→client): POST
   `/ISAPI/AccessControl/FingerPrintUpload?format=json`
   `{"FingerPrintCond":{"searchID":"…","employeeNo":"1","fpIndex":0,"dataType":"template"}}`

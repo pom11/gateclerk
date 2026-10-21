@@ -305,7 +305,21 @@ def response_envelope(
     empty-window shape keeps the root key and merely omits `InfoList`
     (OBSERVED.md). A rootless body means the device changed protocol on us —
     reading that as zero records is how "nobody clocked in" gets fabricated.
+
+    `envelope_key == ""` is the captured ROOT-envelope dialect (FDSearch, bench A
+    capture 2026-10-22): the status/count fields and the record list sit at the
+    body root with no wrapper object at all. The fail-closed rule survives intact
+    — the root always "exists", but a root without `numOfMatches`/`totalMatches`
+    still cannot be read as zero records (`_coerce_count` and the missing-record-
+    key path catch every malformed shape the old check used to).
     """
+    if envelope_key == "":
+        if "numOfMatches" not in body and "totalMatches" not in body:
+            raise SearchProtocolError(
+                f"search response root has no count fields (keys={sorted(body)!r}, "
+                f"searchID={search_id}) — refusing to read a protocol break as zero records"
+            )
+        return body
     envelope = body.get(envelope_key)
     if not isinstance(envelope, Mapping):
         raise SearchProtocolError(
@@ -828,19 +842,21 @@ def fd_search(
       status OK, so on this endpoint OK is not a completeness promise — the walk
       keeps paging until a page returns ZERO rows (NO MATCH or OK-with-nothing).
 
-    The envelope/record keys (`FDSearch`/`Records`) are a DOCUMENTED EXTRAPOLATION:
-    the probe recorded the rows ({FPID, faceURL, modelData}) but not the wrapper
-    names. `tests/fakedevice.py` pins the same convention and the §5.0 bench capture
-    replaces both with the recorded value; a real device answering different names
-    fails CLOSED (missing envelope -> SearchProtocolError), never as an empty face
-    set — the fail-closed direction of §0.7 holds under either value.
+    The envelope/record keys are CAPTURED DEVICE TRUTH (§5.0 capture, bench A
+    2026-10-22): FDSearch answers with NO wrapper — status/count fields sit at the
+    body root (`envelope_key=""`, the dialect `response_envelope` documents) and
+    rows sit under `MatchList`. The honest zero (FPID of a person with no face)
+    omits `MatchList` entirely, same rule as the P1 empty windows. The v4 design's
+    `{"FDSearch": ...}` guess was wrong and the first live export failed CLOSED on
+    it exactly as §0.7 promises; the capture replaced the extrapolation with the
+    recorded value, which is the loop this note always described.
     """
     return PagedSearch(
         reader,
         endpoint="fd_search",
         cond_key=None,
-        envelope_key="FDSearch",
-        record_key="Records",
+        envelope_key="",
+        record_key="MatchList",
         limits=limits,
         page_size=page_size,
         max_pages=max_pages,

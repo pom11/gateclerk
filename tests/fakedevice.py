@@ -514,11 +514,30 @@ def _search_envelope(
 ) -> dict:
     """Search envelope with the OBSERVED empty-shape: NO MATCH + record key ABSENT.
 
+    `envelope_key == ""` is the CAPTURED FDSearch dialect (bench A §5.0 capture,
+    2026-10-22): the fields sit at the body ROOT — no wrapper object, and NO
+    `searchID` echoed back (the captured root keys are exactly `statusCode`,
+    `statusString`, `subStatusCode`, `responseStatusStrg`, `numOfMatches`,
+    `totalMatches` plus the record key). A root answer carries those status fields
+    because the device sends them there; the wrapped dialects echo `searchID`.
+
     `total_override` reproduces bench A's paging quirk (FDSearch: numOfMatches=3 on
     one page while totalMatches=4, status OK) — `totalMatches` counts the whole match
     set, `numOfMatches` only this page, which is exactly why a walker must keep
     paging to NO MATCH instead of trusting a single OK page.
     """
+    if envelope_key == "":
+        body: dict[str, object] = {
+            "statusCode": 1,
+            "statusString": "OK",
+            "subStatusCode": "ok",
+            "responseStatusStrg": "OK" if rows else "NO MATCH",
+            "numOfMatches": len(rows),
+            "totalMatches": total_override if total_override is not None else len(rows),
+        }
+        if rows:  # the captured honest zero OMITS the record key entirely
+            body[record_key] = rows
+        return body
     if rows:
         return {
             envelope_key: {
@@ -1297,8 +1316,8 @@ class FakeDevice:
             200,
             json=_search_envelope(
                 search_id=body.get("searchID"),
-                envelope_key="FDSearch",
-                record_key="Records",
+                envelope_key="",  # CAPTURED: root-level, no wrapper (§5.0 capture)
+                record_key="MatchList",
                 rows=rows,
                 total_override=total,
             ),
@@ -1581,8 +1600,8 @@ class FakeDevice:
                 200,
                 json=_search_envelope(
                     search_id=body.get("searchID"),
-                    envelope_key="FDSearch",
-                    record_key="Records",
+                    envelope_key="",
+                    record_key="MatchList",
                     rows=[],
                 ),
             )
@@ -1595,8 +1614,8 @@ class FakeDevice:
             200,
             json=_search_envelope(
                 search_id=body.get("searchID"),
-                envelope_key="FDSearch",
-                record_key="Records",
+                envelope_key="",
+                record_key="MatchList",
                 rows=rows,
                 total_override=len(matched),
             ),

@@ -89,17 +89,18 @@ __all__ = [
     "export_full_bundle",
 ]
 
-# --- FDSearch dialect facts (bench A, 2026-10-21; ENROLLMENT-MIGRATION.md §1) ------------
+# --- FDSearch dialect facts (bench A, 2026-10-21 request side; §5.0 capture 2026-10-22
+#     response side; ENROLLMENT-MIGRATION.md §1) ------------------------------------------
 #
-# OBSERVED records the REQUEST body and the ROW keys exactly, but NOT the response
-# envelope/record key names — so these two names are a documented extrapolation that
-# mirrors what `tests/fakedevice.py` pins (the same convention the E1-03 probe branch
-# chose for its enrollment knobs). The §5.0 bench capture replaces them with the
-# recorded value; until then a real device answering a DIFFERENT envelope fails
-# CLOSED (`SearchProtocolError` -> `EnrollmentReadAborted`), never as an empty face
-# set — the failure direction of §0.7 is kept honest either way.
-FD_SEARCH_ENVELOPE_KEY = "FDSearch"
-FD_SEARCH_RECORD_KEY = "Records"
+# The REQUEST body and the ROW keys were probed 2026-10-21. The response envelope was
+# CAPTURED live on 2026-10-22: FDSearch answers with NO wrapper — counts/status sit at
+# the body root (`""` = the root-envelope dialect `paging.response_envelope` documents)
+# and rows sit under `MatchList`; the honest zero omits `MatchList` entirely. The
+# earlier `{"FDSearch": {...}}/Records` guess (a documented extrapolation that mirrored
+# the fake) failed CLOSED on the real device exactly as §0.7 promises, and the capture
+# replaced it with the recorded value.
+FD_SEARCH_ENVELOPE_KEY = ""
+FD_SEARCH_RECORD_KEY = "MatchList"
 
 #: The one portable FD library of the family (§1: FDID 1 = blackFD; FDID 2 is
 #: infraredFD, recorded but out of the port scope). Values are the strings bench A

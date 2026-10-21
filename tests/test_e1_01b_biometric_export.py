@@ -188,7 +188,7 @@ def test_manifest_sections_digests_and_report_only_counters(tmp_path: Path) -> N
     # and labels do. (The word "modelData" may legitimately appear in reason prose.)
     dumped = json.dumps(manifest)
     device_sample = _fd_first_page(seeded_device())
-    for row in device_sample["FDSearch"]["Records"]:
+    for row in device_sample["MatchList"]:
         assert row["modelData"][:32] not in dumped
     assert FD_TEMPLATE_MAGIC.decode(errors="ignore") not in dumped
     # v4 §9 counter-vs-set: reported per person, disagreement left for E1-02 to classify.
@@ -240,7 +240,7 @@ def test_template_files_are_the_devices_own_base64_verbatim(tmp_path: Path) -> N
     out = export(tmp_path, seeded_device()).bundle_dir
     device = seeded_device()
     body = _fd_first_page(device)
-    for row in body["FDSearch"]["Records"]:
+    for row in body["MatchList"]:
         person = row["FPID"]
         on_disk = (out / "faces" / f"{person}.b64").read_text().rstrip("\n")
         assert on_disk == row["modelData"]
@@ -360,7 +360,7 @@ def test_fd_search_fpid_filter_honored_and_rows_carry_model_data() -> None:
                 "FDID": "1",
                 "FPID": "1",
             },
-        ).json()["FDSearch"]
+        ).json()
         miss = client.post(
             FD_PATH,
             json={
@@ -370,16 +370,16 @@ def test_fd_search_fpid_filter_honored_and_rows_carry_model_data() -> None:
                 "FDID": "1",
                 "FPID": "99",
             },
-        ).json()["FDSearch"]
+        ).json()
     assert hit["numOfMatches"] == 1 and hit["totalMatches"] == 1
     # (totalMatches counts the FILTERED set — the same reviewed convention the
     # E1-01 users/cards fake uses; "FPID=1 -> 1/4" on the device side means "1 of the
     # 4-person library", which the numOfMatches above is the honest answer to.)
-    row = hit["Records"][0]
+    row = hit["MatchList"][0]
     assert row["FPID"] == "1"
     assert base64.b64decode(row["modelData"], validate=True).startswith(FD_TEMPLATE_MAGIC)
     assert len(base64.b64decode(row["modelData"])) == FD_TEMPLATE_SIZE
-    assert miss["responseStatusStrg"] == "NO MATCH" and "Records" not in miss
+    assert miss["responseStatusStrg"] == "NO MATCH" and "MatchList" not in miss
 
 
 def test_fd_search_paging_quirk_walk_still_exports_every_person(tmp_path: Path) -> None:
