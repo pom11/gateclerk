@@ -46,10 +46,13 @@ worktree-editable-import bug, applied to request shapes). The live run of 2026-1
 (docs/OBSERVED.md "Event-window startTime form: offset REQUIRED") proved this
 firmware 400s an AcsEvent/AcsEventTotalNum body whose `startTime`/`endTime` is
 naive: `statusCode=6`, `subStatusCode=badJsonContent`, `errorMsg=startTime` (the
-recorded shape: `error_naive_start_time.json`). So `_handle` rejects a naive bound
-on those two paths with exactly that envelope, *after* auth, like the device
-validates at handler time. A walk that still sends naive now fails loudly instead
-of being served fixture pages.
+recorded shape: `error_naive_start_time.json`). The P2-10 canary's first real tick
+(2026-10-21, OBSERVED.md "sub-second REJECTED") proved the SAME envelope for a
+FRACTIONAL-SECOND bound — the agent's microsecond-carrying `now` 400s on every
+tick while any fake that accepts it stays green. So `_handle` rejects a naive OR
+fractional bound on those two paths with exactly that envelope, *after* auth, like
+the device validates at handler time. A walk that still sends either shape fails
+loudly here instead of being served fixture pages.
 
 The event store FILTERS by ARITHMETIC (p1-05c — the anti-false-green core)
 ---------------------------------------------------------------------------
@@ -182,15 +185,30 @@ _ENVELOPE_ONLY_401_BODY = (
 #: shape the device answers with `badJsonContent`/`errorMsg=startTime`.
 _HAS_OFFSET = re.compile(r"(?:Z|[+-]\d{2}:\d{2})$")
 
+#: A fractional-seconds leg anywhere in the bound (`...:06.031165+02:00` -> `.031165`).
+#: RECORDED live 2026-10-21 ~03:21Z (the P2-10 canary's first real agent tick,
+#: operator-authorized read-only POST): the byte-identical body carrying
+#: `"startTime":"2026-10-21T06:22:06.031165+02:00","endTime":"2026-10-21T06:32:06.031165+02:00"`
+#: -> HTTP 400, `statusCode=6`, `statusString=Invalid Content`,
+#: `subStatusCode=badJsonContent`, `errorMsg=startTime`, `errorCode=1610612759`; the
+#: same body with the microseconds REMOVED -> 200 (`responseStatusStrg=NO MATCH`,
+#: `totalMatches=0`). This firmware rejects sub-second precision in the bounds — the
+#: same `badJsonContent`/errorMsg class as the naive form above, the fractional leg.
+#: Before this the fake accepted ANY offset-bearing string, and the agent's
+#: microsecond-carrying `now` died on every tick while 1465 offline tests stayed green:
+#: a fake more lenient than the device is a false-green machine (module docstring).
+_HAS_FRACTION = re.compile(r"\.\d+")
+
 
 def bad_json_content(field: str) -> httpx.Response:
-    """The RECORDED rejection of a naive event bound (error_naive_start_time.json).
+    """The RECORDED rejection of a malformed event bound (error_naive_start_time.json).
 
     Envelope verbatim from the owner's 2026-10-17 live probe (OBSERVED.md "Event-window
     startTime form: offset REQUIRED"): HTTP 400, statusCode 6, badJsonContent, errorMsg
-    naming the offending bound. Only the startTime case is device-observed; naming
-    endTime is the symmetric extrapolation that keeps the fake at least as strict as
-    the device on the pair.
+    naming the offending bound. The 2026-10-21 canary captured the SAME envelope for a
+    fractional-second bound (see _HAS_FRACTION; errorMsg=startTime there too), so both
+    rejections below answer with it. Naming `endTime` is the symmetric extrapolation
+    that keeps the fake at least as strict as the device on the pair.
     """
     return httpx.Response(
         400,
@@ -206,10 +224,14 @@ def bad_json_content(field: str) -> httpx.Response:
 def naive_event_bound(body: bytes, cond_key: str) -> str | None:
     """Name the bound of a posted event body that the device would reject, else None.
 
-    A bound that is ABSENT is not this check's business (the engine cannot build one —
-    `build_event_cond` raises first — and test_paging's `_UnboundedQueryRejector`
-    simulates that hazard separately). A bound that is PRESENT must carry an offset.
-    Bodies that do not parse as JSON (transport-level probes) are left to the route.
+    Two documented device rejections, both `badJsonContent` with errorMsg naming the
+    bound (see _HAS_OFFSET and _HAS_FRACTION for the live captures): the bound carries
+    NO UTC offset (naive — the 2026-10-17 probe), or it carries FRACTIONAL SECONDS
+    (the 2026-10-21 canary probe). A bound that is ABSENT is not this check's business
+    (the engine cannot build one — `build_event_cond` raises first — and
+    test_paging's `_UnboundedQueryRejector` simulates that hazard separately). A bound
+    that is PRESENT must be offset-bearing AND whole-second. Bodies that do not parse
+    as JSON (transport-level probes) are left to the route.
     """
     try:
         payload = json.loads(body)
@@ -223,6 +245,8 @@ def naive_event_bound(body: bytes, cond_key: str) -> str | None:
         if value is None:
             continue
         if not (isinstance(value, str) and _HAS_OFFSET.search(value)):
+            return name
+        if _HAS_FRACTION.search(value):
             return name
     return None
 
@@ -249,8 +273,8 @@ def _split_bound(value: str, field: str) -> tuple[datetime, int]:
     match = _BOUND_RE.match(value) if isinstance(value, str) else None
     if match is None:
         raise AssertionError(
-            f"store-mode fake got bound {value!r} in {field}: the naive check already "
-            "400s offset-less values, so reaching here means the fake flow broke"
+            f"store-mode fake got bound {value!r} in {field}: the naive/fractional check "
+            "already 400s those shapes, so reaching here means the fake flow broke"
         )
     return datetime.fromisoformat(match.group("digits")), _label_minutes(match.group("label"))
 
@@ -682,12 +706,13 @@ class FakeDevice:
                 headers={"Content-Type": 'application/json;charset="UTF-8"'},
             )
         # Body-strictness at HANDLER time (after auth, like the firmware): an event
-        # window bound without a UTC offset is rejected exactly as the device rejected
-        # it on 2026-10-17 — recorded in error_naive_start_time.json, policy in
-        # OBSERVED.md "Event-window startTime form: offset REQUIRED". A walk that
-        # still sends naive fails loudly here instead of being served pages. This
-        # check runs in BOTH modes: presence gates the request BEFORE any arithmetic
-        # does (p1-05c keeps the p1-05b arm alive in filtering mode too).
+        # window bound without a UTC offset, or carrying fractional seconds, is
+        # rejected exactly as the device rejected it — recorded 2026-10-17
+        # (error_naive_start_time.json, OBSERVED.md "offset REQUIRED") and 2026-10-21
+        # (canary 400, OBSERVED.md "sub-second REJECTED"; see _HAS_FRACTION). A walk
+        # that still sends either shape fails loudly here instead of being served
+        # pages. This check runs in BOTH modes: presence gates the request BEFORE any
+        # arithmetic does (p1-05c keeps the p1-05b arm alive in filtering mode too).
         if cond_key is not None:
             rejected = naive_event_bound(request.content, cond_key)
             if rejected is not None:

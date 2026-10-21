@@ -632,18 +632,45 @@ class DeviceWindow:
         default exists so the struct's raw wall pair stays reachable for audit and
         test use. Nothing on the event wire may use the naive pair — this firmware
         400s it.
+
+        **Both wire-reachable paths floor fractional seconds.** The live canary tick
+        of 2026-10-21 (OBSERVED.md "Event-window startTime form: sub-second REJECTED",
+        A/B same day) proved this firmware answers `startTime`/`endTime` carrying a
+        `.ffffff` leg with the same `badJsonContent`/`errorMsg=startTime` 400 as the
+        naive form. The floor is toward the past (truncate, never round up, never
+        roll a minute): rounding a bound forward could name an instant the caller
+        never asked for, and payroll windows must not widen on their own. The agent
+        hits this on EVERY tick — its window comes from `datetime.now`, which always
+        carries microseconds — while operator CLI windows are whole-minute strings,
+        which is why only the live canary caught it. The raw struct fields stay
+        verbatim: they are audit/provenance strings; only the wire pair is floored.
         """
         if device_offset_min is not None:
             label = offset_hhmm(device_offset_min)
             return (
-                _relabel(self.since_site_iso, label),
-                _relabel(self.until_site_iso, label),
+                _relabel(_whole_seconds(self.since_site_iso), label),
+                _relabel(_whole_seconds(self.until_site_iso), label),
             )
-        return (
-            (self.since_site_iso, self.until_site_iso)
-            if with_offset
-            else (self.since_device_local, self.until_device_local)
-        )
+        if with_offset:
+            return (_whole_seconds(self.since_site_iso), _whole_seconds(self.until_site_iso))
+        return (self.since_device_local, self.until_device_local)
+
+
+#: The fractional-seconds leg of an ISO time string (`...:06.031165+02:00` -> the
+#: `.031165` part). `search_pair` strips exactly this from the wire pair.
+_FRACTION_RE = re.compile(r"\.\d+")
+
+
+def _whole_seconds(iso: str) -> str:
+    """Floor an ISO time string to whole seconds — drop the `.\\d+` leg.
+
+    Truncation toward the past, never rounding: `23:59:59.999999` -> `23:59:59`. This
+    is the floor the live canary of 2026-10-21 proved the wire needs (sub-second
+    bounds are rejected, OBSERVED.md "Event-window startTime form: sub-second
+    REJECTED"); it lives here, at the seam, so every caller — agent loop and CLI
+    alike — gets the same rule without any of them rounding their own `now`.
+    """
+    return _FRACTION_RE.sub("", iso)
 
 
 def offset_hhmm(minutes: int) -> str:

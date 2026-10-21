@@ -124,6 +124,29 @@ sparse 6-week window; a dense-window A/B (one read-only POST pair on a busy day)
 whether the label shifts the effective window by an hour. Until proven otherwise we send
 site `+03:00` — self-consistent with site-tz-is-truth.
 
+## Event-window `startTime` form: sub-second REJECTED (canary live 2026-10-21, VERIFIED)
+
+The same endpoint also **rejects fractional seconds** in the bounds. The P2-10 canary's
+first real agent tick (operator-authorized read-only POST, ~03:21Z): body
+`"startTime":"2026-10-21T06:22:06.031165+02:00","endTime":"2026-10-21T06:32:06.031165+02:00"`
+→ HTTP 400, `statusCode=6 Invalid Content`, `subStatusCode=badJsonContent`,
+`errorMsg=startTime`, `errorCode=1610612759`. The **byte-identical body with the
+microseconds removed** → 200 (`responseStatusStrg=NO MATCH`, `totalMatches=0`). One
+request per form, no retry loop (owner-authorized A/B). Same error class as the naive
+form above — the fractional leg of "bounds must be whole-second, offset-bearing".
+
+Consequences, both load-bearing:
+1. `DeviceWindow.search_pair()` floors the `.ffffff` leg (toward the past — never round
+   up, never roll a minute) on both wire paths (claimed-offset relabel AND the
+   site-labeled fallback). The struct's raw fields keep the microseconds verbatim:
+   audit strings are not wire bytes. The **agent** hits this every tick — its window
+   comes from `datetime.now`, which always carries microseconds — while operator
+   `--since/--until` windows are whole-minute strings, which is why 1465 offline tests
+   and every CLI run missed it and only the live canary bit it.
+2. FakeDevice rejects fractional bounds with the same recorded envelope (its docstring
+   quotes this capture). The permissive fake was the false-green machine again: it
+   accepted ANY offset-bearing string, so the pre-fix wire shape was never once seen.
+
 ## Digest nonce use-cap → deterministic 401 mid-backfill (owner live 2026-10-17; fix MERGED, live recovery path NOT exercised)
 
 Long `--chunk 1h` backfill hit **401 Unauthorized with the correct password** at exactly
