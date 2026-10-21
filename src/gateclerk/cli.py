@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
@@ -1648,8 +1649,9 @@ def agent_run(
 
     Wiring only — P2-03's loop per device, P2-05's park gate around every tick (a refused tick
     sends ZERO requests), P2-02's store, P2-04's queue and drain, P2-06's health snapshot.
-    Exits 2 on a config or credential problem (p1-08's contract) and 3 if a device answered a
-    terminal 401, which is the transport's circuit-open signal and needs a human.
+    Exits 2 on a config or credential problem (p1-08's contract) and 3 when the run ends with
+    the site needing a human — a device parked unacked (terminal 401) or a transport
+    circuit open — which `--once` is how an operator finds out (deploy/README.md step 3).
     """
     from gateclerk import agent_cli
 
@@ -1670,6 +1672,18 @@ def agent_run(
         # adds no codes of its own, so a script that knows the CLI's contract knows this one.
         raise _fail(output, exc) from exc
     payload = report.as_dict()
+    if payload.pop("needs_human"):
+        # The table form prints the report first: the counters are what the operator reads
+        # to decide WHY. JSON forms stay one-document (the error object), like every other
+        # exit path. The unit form never gets here — the loop never returns — so a park
+        # cannot turn into a Restart=always crash loop against a door controller.
+        if output not in (OutputFormat.JSON, OutputFormat.JSONL):
+            render([payload], fmt=output.value, columns=tuple(payload))
+        raise _auth_exit(
+            output,
+            f"site {target.name!r} needs a human: parked={list(report.parked)} "
+            f"circuit_open={list(report.circuit_open)}",
+        )
     render([payload], fmt=output.value, columns=tuple(payload))
 
 
@@ -1699,6 +1713,15 @@ def agent_ack(
 
     target = _agent_site(site, config, output=output)
     db_path = agent_cli.resolve_db_path(target, state_root)
+    if not Path(db_path).exists():
+        # No store yet = no park can exist: the same exit-2 "nothing to ack" as an empty
+        # park dir, phrased so the operator sees WHY (a crash from sqlite cannot open on a
+        # missing directory is not an answer to a command typed in good faith).
+        raise _config_exit(
+            output,
+            f"no store at {db_path} for site {target.name!r}: nothing to ack "
+            "(has `gateclerk agent run` ever run for this site?)",
+        )
     try:
         conn = agent_cli.connect(db_path)
     except (ConfigError, OSError) as exc:
@@ -1708,6 +1731,11 @@ def agent_ack(
         cadence_s=target.cadence_s,
         conn=conn,
         park_dir=agent_cli.resolve_state_root(target, state_root) / agent_cli.PARK_DIR_NAME,
+        # The ack stamps the re-probe grid from the AGENT's clock — the same `agent_cli._now`
+        # indirection `agent run` threads through every seam. Production behaviour is
+        # identical (the seam defaults to wall clock); it just keeps ack and run inside ONE
+        # time universe for the suite and for an ops smoke test.
+        now=agent_cli._now,
     )
     opened = policy.ack(target.name, device_serial)
     render(
@@ -1772,9 +1800,7 @@ def deadletter_list(
 
 @deadletter_app.command("delete")
 def deadletter_delete(
-    id_: Annotated[
-        int, typer.Argument(help="dead_letter row id (from `agent deadletter list`).")
-    ],
+    id_: Annotated[int, typer.Argument(help="dead_letter row id (from `agent deadletter list`).")],
     site: AgentSiteOpt,
     config: AgentConfigOpt = None,
     state_root: AgentStateRootOpt = None,
@@ -1785,12 +1811,18 @@ def deadletter_delete(
     Deleting is a human call: the payload is the only copy of a punch that never reached the
     ingest, and a dead letter is never retried again once it is removed. An id that does not
     exist exits 2 — a typo must not read as a deletion.
+
+    The removal is recorded in the site's push ledger (`agent_cli.discard_dead_letter`):
+    without that line the event row — still in the store, now unexcluded — would be re-queued
+    and RE-PUSHED on the next pass, which would undo the owner's decision (§2b).
     """
-    from gateclerk import agent_cli, agent_push
+    from gateclerk import agent_cli
 
     target = _agent_site(site, config, output=output)
+    state_dir = agent_cli.resolve_state_root(target, state_root)
     conn = agent_cli.connect(agent_cli.resolve_db_path(target, state_root))
-    removed = agent_push.delete_dead_letter(conn, id_)
+    ledger = agent_cli.PushLedger(state_dir / agent_cli.PUSH_LEDGER_FILE_NAME)
+    removed = agent_cli.discard_dead_letter(conn, id_, ledger=ledger)
     if not removed:
         raise _config_exit(output, f"no dead_letter row with id {id_}: nothing was deleted")
     render([{"id": id_, "removed": True}], fmt=output.value, columns=("id", "removed"))

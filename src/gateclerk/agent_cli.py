@@ -54,6 +54,7 @@ ships only the `stub://` ingest — §3); device hosts come from sites.toml, nev
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import time
@@ -90,10 +91,13 @@ __all__ = [
     "HEALTH_DIR_NAME",
     "HEALTH_FILE_NAME",
     "PARK_DIR_NAME",
+    "PUSH_LEDGER_FILE_NAME",
+    "PushLedger",
     "SiteAgent",
     "SiteRunReport",
     "SiteTickReport",
     "build_site_agent",
+    "discard_dead_letter",
     "flag_rung_password",
     "queue_new_events",
     "resolve_db_path",
@@ -123,12 +127,133 @@ def _now() -> datetime:
 # --- the queue seam the poller owns ---------------------------------------------------------
 
 
+#: The poller's own record of what it has already pushed (see `PushLedger`).
+PUSH_LEDGER_FILE_NAME = "push-ledger.jsonl"
+
+
+class PushLedger:
+    """Which events this site's poller has already pushed (or the owner discarded), on disk.
+
+    Why this exists at all: P2-04's `drain` DELETEs the queue row on success and keeps no
+    "sent" marker — correct for the pusher (the store is the truth, the queue is a buffer) —
+    and P2-03's `TickResult` reports counts, not rowids. Neither module is wrong; together
+    they leave the POLLER unable to answer "has this event already left the building?", so a
+    fresh `agent run` process would re-queue and re-push the ENTIRE store on every restart
+    (and re-push a payload the owner just deleted with `agent deadletter delete`). The ledger
+    is the poller's own bookkeeping, and it follows the fleet's existing precedent for exactly
+    this problem — P2-05's park: a small append-only file under the site's state dir, never
+    a db schema change (the schema belongs to P2-04's forward-only MIGRATIONS, untouched).
+
+    It is a CACHE of observed outcomes, never an authority: the db stays the truth, and the
+    ingest's idempotency key (DESIGN.md "Event model") stays the final dedupe authority. A
+    lost or stale ledger line means at worst one re-push, which the UPSERT makes harmless.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        warn: Callable[[str], None] | None = None,
+    ) -> None:
+        self.path = Path(path)
+        # Resolved at call time, like the SiteAgent clock: a test that monkeypatches the
+        # module-level warn after construction still sees the ledger's lines.
+        self._warn = warn
+        self._known: dict[str, set[int]] | None = None  # endpoint -> event ids (lazy load)
+
+    def known(self, endpoint: str) -> set[int]:
+        """Event ids already `sent` or `gone` for this endpoint (loads the file once)."""
+        if self._known is None:
+            self._known = self._load()
+        return self._known.setdefault(endpoint, set())
+
+    def _load(self) -> dict[str, set[int]]:
+        out: dict[str, set[int]] = {}
+        if not self.path.exists():
+            return out
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                out.setdefault(record["t"], set()).add(int(record["e"]))
+            except (ValueError, KeyError, TypeError):
+                # A torn final line (killed mid-append) or corruption must not stop a poll:
+                # the worst case is one re-push the UPSERT absorbs. Warn, skip, continue.
+                (self._warn or _stderr_warn)(
+                    f"push ledger: skipping unreadable line in {self.path}"
+                )
+        return out
+
+    def append(self, event_ids: Sequence[int], *, endpoint: str, kind: str = "sent") -> None:
+        """Record what just happened for these events. Append-only: small lines, atomic enough.
+
+        One writer per site (the unit is per-site), so appends cannot interleave with each
+        other; a concurrent CLI `deadletter delete` appends its own line (O_APPEND keeps
+        single small lines intact on a local filesystem — and a torn line loads as skipped).
+        """
+        if not event_ids:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            for event_id in event_ids:
+                handle.write(json.dumps({"e": int(event_id), "t": endpoint, "k": kind}) + "\n")
+        self.known(endpoint).update(int(e) for e in event_ids)
+
+    def apply_exclusion(self, conn: Any, endpoint: str) -> None:
+        """Expose `known(endpoint)` to SQL as a TEMP table (per-connection, dies with it).
+
+        The exclusion has to happen INSIDE the candidate query: without it, a store whose
+        first N events are all ledger-known would return N candidates, filter to zero, and
+        never reach the unsent rows behind them. A TEMP table keeps the db FILE untouched —
+        P2-04's schema and forward-only migration guard never see this state.
+        """
+        conn.execute("DROP TABLE IF EXISTS temp.agent_push_ledger")
+        conn.execute("CREATE TEMP TABLE agent_push_ledger (event_id INTEGER NOT NULL PRIMARY KEY)")
+        known = self.known(endpoint)
+        if known:
+            conn.executemany(
+                "INSERT OR IGNORE INTO temp.agent_push_ledger VALUES (?)",
+                ((event_id,) for event_id in sorted(known)),
+            )
+
+
+def _reset_ledger_table(conn: Any) -> None:
+    """Empty ledger table for a connection that has no PushLedger (`queue_new_events` needs
+    the temp table to exist whether or not a poller is the caller)."""
+    conn.execute("DROP TABLE IF EXISTS temp.agent_push_ledger")
+    conn.execute("CREATE TEMP TABLE agent_push_ledger (event_id INTEGER NOT NULL PRIMARY KEY)")
+
+
+def discard_dead_letter(conn: Any, dead_letter_id: int, *, ledger: PushLedger) -> bool:
+    """The owner's `deadletter delete` path, ledger-armed: delete ONE row, remember it gone.
+
+    Why this exists beside `agent_push.delete_dead_letter` (which stays exactly as shipped):
+    deleting a dead letter removes its `dead_letter` exclusion, so the next pass's
+    `queue_new_events` would see the event row — still in the store, now unexcluded — and
+    re-queue and RE-PUSH the very payload the owner just discarded. That would violate §2b
+    from the other side: "deleted only by the owner's command" has to mean gone, not
+    "re-pushed next tick". Recording the id as `gone` in the ledger keeps the exclusion
+    without touching the schema or the pusher.
+    """
+    row = conn.execute(
+        "SELECT event_id, endpoint FROM dead_letter WHERE id = ?", (dead_letter_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    if not agent_push.delete_dead_letter(conn, dead_letter_id):
+        return False
+    ledger.append([row["event_id"]], endpoint=row["endpoint"], kind="gone")
+    return True
+
+
 def queue_new_events(
     conn: Any,
     *,
     endpoint: str,
     now: datetime,
     limit: int = agent_push.DEFAULT_PUSH_BATCH_LIMIT,
+    ledger: PushLedger | None = None,
 ) -> tuple[int, ...]:
     """Queue every stored event that has no send buffer for `endpoint`; return queue ids.
 
@@ -137,7 +262,21 @@ def queue_new_events(
     as shipped. `limit` bounds one pass (P2-04's batch cap): a first-ever pass over a
     year-old store must not build an unbounded queue in one transaction; the rest is still
     there, due, on the next pass.
+
+    Two exclusions, both load-bearing:
+    * `dead_letter` — a dead-lettered row's queue buffer was DELETED *because* the 24 h
+      bound expired; re-queuing it would re-push a poison payload every tick forever, which
+      is the opposite of §2b ("a dead letter leaves the table only through the owner's
+      command");
+    * the ledger's TEMP table — what THIS poller already pushed (see `PushLedger`). Without
+      it, every process restart re-queues and re-pushes the whole store. The exclusion is
+      inside the query (not a post-filter) so a store whose oldest N rows are all known
+      still reaches the unsent rows behind them.
     """
+    if ledger is not None:
+        ledger.apply_exclusion(conn, endpoint)
+    else:
+        _reset_ledger_table(conn)
     rows = conn.execute(
         """
         SELECT e.id AS id
@@ -148,6 +287,9 @@ def queue_new_events(
            AND NOT EXISTS (
                  SELECT 1 FROM dead_letter AS d
                   WHERE d.event_id = e.id AND d.endpoint = ?)
+           AND NOT EXISTS (
+                 SELECT 1 FROM temp.agent_push_ledger AS l
+                  WHERE l.event_id = e.id)
          ORDER BY e.id
          LIMIT ?
         """,
@@ -208,7 +350,14 @@ class SiteTickReport:
 
 @dataclass(frozen=True, slots=True)
 class SiteRunReport:
-    """The whole run: every pass's report plus the counters the operator reads once."""
+    """The whole run: every pass's report plus the counters the operator reads once.
+
+    `parked` and `circuit_open` are what `agent run` maps onto its exit code: a site in either
+    state needs a human (the park exists because of a terminal 401, and the circuit is the
+    transport refusing to present credentials again). A plain tick failure is NOT here — the
+    overlap heals those (P2-03), and exiting on one would turn a transient 503 into a
+    `Restart=always` crash loop against a door controller.
+    """
 
     site: str
     db_path: str
@@ -217,6 +366,24 @@ class SiteRunReport:
     counters: Mapping[str, int] = field(default_factory=dict)
     push_target: str | None = None
     parked: tuple[str, ...] = ()
+    circuit_open: tuple[str, ...] = ()
+    #: An unacked park or an open circuit somewhere on the site: `agent run --once` maps this
+    #: onto exit 3 (a smoke test of a site that needs a human must not report success). The
+    #: continuous unit form never reaches the mapping — `run()` does not return — so a park
+    #: cannot become a `Restart=always` crash loop.
+    needs_human: bool = False
+
+    @property
+    def pushed(self) -> int:
+        return sum(report.pushed for report in self.tick_reports)
+
+    @property
+    def push_failed(self) -> int:
+        return sum(report.push_failed for report in self.tick_reports)
+
+    @property
+    def dead_lettered(self) -> int:
+        return sum(report.dead_lettered for report in self.tick_reports)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -227,6 +394,14 @@ class SiteRunReport:
             "counters": dict(self.counters),
             "push_target": self.push_target,
             "parked": list(self.parked),
+            "circuit_open": list(self.circuit_open),
+            "needs_human": self.needs_human,
+            # Run totals as well as the per-pass detail: `--output json | jq .pushed` is the
+            # operator's one-line question ("did this run push anything"), and answering it
+            # should not require summing an array in the shell.
+            "pushed": self.pushed,
+            "push_failed": self.push_failed,
+            "dead_lettered": self.dead_lettered,
         }
 
 
@@ -253,10 +428,12 @@ class SiteAgent:
         loops: Sequence[DeviceLoop],
         policy: AlertPolicy,
         conn: Any,
+        db_path: str,
         collector: AgentHealthCollector | None = None,
         health_path: Path | None = None,
         push_transport: agent_push.Transport | None = None,
-        now: Callable[[], datetime] = _now,
+        ledger: PushLedger | None = None,
+        now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] | None = None,
         monotonic: Callable[[], float] | None = None,
         warn: Callable[[str], None] | None = None,
@@ -267,14 +444,26 @@ class SiteAgent:
         self.loops = tuple(loops)
         self.policy = policy
         self.conn = conn
+        # The db THIS agent opened (state-root resolved). The watermark reads this exact
+        # file rather than `site.db_path_resolved`: the config value is relative to CWD, and
+        # a relocated store must not have the wrong file stat'd (a stat of a file that is not
+        # ours would silently report "no watermark" for a store that has one).
+        self._db_path = db_path
         self.collector = collector
         self.health_path = health_path
-        self.now = now
+        # None means "read the module-level `_now` at call time" — deliberately NOT a bound
+        # default of `_now`: a late read is what lets a test freeze the agent's clock with one
+        # monkeypatch of `agent_cli._now` (the same trick `cli._now` is for). An injected
+        # callable wins over it and is what `build_site_agent` threads to every seam.
+        self._clock = now
         self._sleep = sleep
         self._monotonic = monotonic if monotonic is not None else time.monotonic
         self._warn = warn if warn is not None else _stderr_warn
         self.push_target = site.push_target
         self._push_transport = push_transport
+        # The poller's sent/gone ledger (class docstring on `PushLedger`). None means "no
+        # ledger" — the pure-API shape tests use when they want the raw P2-04 behaviour.
+        self.ledger = ledger
         if self.push_target is not None and not self.push_target.startswith(PUSH_TARGET_SCHEMES):
             # config validates this too; the second wall exists because SiteAgent is also the
             # seam a test (or a future caller) can hand a target to directly (§3).
@@ -284,6 +473,15 @@ class SiteAgent:
         self._cycle_started = time.monotonic()
 
     # --- one pass -------------------------------------------------------------------------
+
+    def now(self) -> datetime:
+        """The pass's instant, resolved at CALL time through the injected seam.
+
+        Resolving here rather than binding `self.now = _now` is what keeps the module-level
+        indirection useful: a test may freeze `agent_cli._now` after building the agent and
+        still move the whole pass (the same reason `cli._now` is a function).
+        """
+        return self._clock() if self._clock is not None else _now()
 
     def tick(self) -> SiteTickReport:
         """Gate every device, tick the allowed ones, queue, drain, export health.
@@ -357,12 +555,45 @@ class SiteAgent:
             raise
         return SiteRunReport(
             site=self.site.name,
-            db_path=self.site.db_path_resolved,
+            db_path=self._db_path,
             ticks=ticks,
             tick_reports=tuple(reports),
             counters=dict(self.policy.counters),
             push_target=self.push_target,
             parked=self.parked_keys(),
+            circuit_open=self.open_circuits(),
+            needs_human=self.needs_human(),
+        )
+
+    def needs_human(self) -> bool:
+        """Is the site in a state that only an operator can end? (exit-3 input, §2c)
+
+        Two states qualify, both read live from their owners — an UNACKED park (the policy
+        will not let anyone knock until `agent ack`) and an open transport circuit (the
+        client will not present credentials again). An ACKED park waiting for its re-probe
+        slot is deliberately NOT here: the human already acted, and a run that refused the
+        device while correctly waiting out the grid must not read as "needs a human".
+        """
+        if self.open_circuits():
+            return True
+        return any(
+            state is not None and state.acked_at is None
+            for state in (self.policy.parked(self.site.name, key) for key in self.parked_keys())
+        )
+
+    def open_circuits(self) -> tuple[str, ...]:
+        """Device keys whose transport circuit is open right now (the transport's own verdict).
+
+        Read live, never inferred from counters: `IsapiClient.circuit_open()` is the one
+        statement of "this device answered a terminal 401 and credentials must not be presented
+        again", which is also what P2-06 reports as `circuit_open_gauge`.
+        """
+        return tuple(
+            key
+            for key, client in (
+                (loop.device_serial or PENDING_SERIAL, loop.client) for loop in self.loops
+            )
+            if client.circuit_open()
         )
 
     def close(self) -> None:
@@ -407,7 +638,9 @@ class SiteAgent:
                     "ships only the `stub://` ingest and never invents an endpoint "
                     "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at a stub."
                 )
-        report.queued = len(queue_new_events(self.conn, endpoint=target, now=moment))
+        report.queued = len(
+            queue_new_events(self.conn, endpoint=target, now=moment, ledger=self.ledger)
+        )
         result = agent_push.drain(
             self.conn,
             endpoint=target,
@@ -420,6 +653,11 @@ class SiteAgent:
         report.pushed = result.push_ok
         report.push_failed = result.push_failed
         report.dead_lettered = len(result.dead_lettered)
+        # Record what left the building (PushLedger docstring). Only successes need a line:
+        # a row the drain dead-lettered stays excluded through the `dead_letter` arm of the
+        # queue query until the owner's `delete` records it as `gone`.
+        if self.ledger is not None:
+            self.ledger.append(result.sent, endpoint=target, kind="sent")
 
     def _observe_push(self, line: str) -> None:
         """drain's OWN log line, routed to the health collector (its push counters parse it)."""
@@ -429,7 +667,7 @@ class SiteAgent:
     def _observe_watermark(self) -> list[Alert]:
         """§2b's keep-everything watermark: a stat over the db file, not a device request."""
         try:
-            check = check_db_watermark(self.site.db_path_resolved, self.site.db_warn_bytes)
+            check = check_db_watermark(self._db_path, self.site.db_warn_bytes)
         except OSError:  # pragma: no cover - a missing file is the fresh-install case
             return []
         return self.policy.observe_watermark(check)
@@ -437,10 +675,10 @@ class SiteAgent:
     def _write_health(self) -> None:
         """Export the §2e snapshot for a separate reader process (P2-06's sidecar contract).
 
-        Atomic: temp file + `os.replace`, so a concurrent reader never sees a half-written
-        snapshot. Only `OSError` is absorbed — a health export must not be able to stop or
-        crash the poll it reports on, and any other exception is a real bug worth the unit's
-        loud restart.
+        Atomic: temp file + `Path.replace` (agent_alert's park-write precedent) — a
+        concurrent reader never sees a half-written snapshot. Only `OSError` is absorbed —
+        a health export must not be able to stop or crash the poll it reports on, and any
+        other exception is a real bug worth the unit's loud restart.
         """
         if self.collector is None or self.health_path is None:
             return
@@ -451,7 +689,7 @@ class SiteAgent:
             self.health_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.health_path.parent / f"{self.health_path.name}.tmp"
             tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, self.health_path)
+            tmp.replace(self.health_path)  # agent_alert's precedent: Path.replace is atomic
         except OSError as exc:
             self._warn(
                 f"warning: health snapshot not written ({type(exc).__name__}: {exc}) — "
@@ -577,6 +815,20 @@ def build_site_agent(
     collector (module docstring), `warn` is the single stderr funnel the collector also
     observes, and `sink` defaults to P2-05's own journald sink.
     """
+    # Refuse an unwired push target BEFORE anything is opened: an `https://` ref is config-legal
+    # (P2-01 accepts it for the day an owner wires a transport) but this repo ships only the
+    # `stub://` ingest, and an agent that polled all day while silently not pushing is the worst
+    # possible outcome — the store fills, the watermark alerts, and nobody's ingest has a punch.
+    if (
+        site.push_target is not None
+        and push_transport is None
+        and not site.push_target.startswith("stub://")
+    ):
+        raise ConfigError(
+            f"push_target {site.push_target!r} needs a transport the owner wires: this repo "
+            "ships only the `stub://` ingest and never invents an endpoint "
+            "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at a stub."
+        )
     db_path = resolve_db_path(site, state_root)
     root = Path(db_path).parent
     root.mkdir(parents=True, exist_ok=True)
@@ -585,6 +837,10 @@ def build_site_agent(
     base_warn = warn if warn is not None else _stderr_warn
 
     conn = connect(db_path)
+    ledger = PushLedger(
+        root / PUSH_LEDGER_FILE_NAME,
+        warn=warn if warn is not None else _stderr_warn,
+    )
     collector: AgentHealthCollector | None = AgentHealthCollector(
         site=site.name,
         conn=conn,
@@ -639,9 +895,11 @@ def build_site_agent(
         loops=loops,
         policy=policy,
         conn=conn,
+        db_path=db_path,
         collector=collector,
         health_path=(root / HEALTH_DIR_NAME / HEALTH_FILE_NAME if health else None),
         push_transport=push_transport,
+        ledger=ledger,
         now=clock,
         sleep=sleep,
         monotonic=monotonic,
@@ -685,8 +943,8 @@ def credential_file_value(
     device's lockout budget (OBSERVED.md "lockout accounting").
     """
     environ: Mapping[str, str] = os.environ if env is None else env
-    directory = credentials_dir if credentials_dir is not None else environ.get(
-        CREDENTIALS_DIRECTORY_ENV
+    directory = (
+        credentials_dir if credentials_dir is not None else environ.get(CREDENTIALS_DIRECTORY_ENV)
     )
     if not directory:
         raise ConfigError(
@@ -765,9 +1023,7 @@ def _client_for_host(
         keychain=keychain,
     )
     factory = client_factory or (
-        lambda base, user, secret: IsapiClient(
-            base, user, secret, read_timeout=site.timeout_s
-        )
+        lambda base, user, secret: IsapiClient(base, user, secret, read_timeout=site.timeout_s)
     )
     return factory(f"http://{host}:{site.port}", creds.user, creds.password.reveal())
 
