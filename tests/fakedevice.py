@@ -374,6 +374,282 @@ class Served:
     digest: dict[str, str] = field(default_factory=dict)
 
 
+# --- E1 enrollment-read surfaces (card E1-03; truth = docs/OBSERVED.md "E1 enrollment-
+#     read probes", bench A rounds 11-18, 2026-10-21) ------------------------------------
+#
+# These routes enforce the request dialects the DEVICE enforces — a fake more lenient
+# than the device is the false-green machine this repo's history names (naive-window
+# 400, sub-second 400, and now the wrapped/flat cond trap):
+#
+#   * UserInfo/Search + CardInfo/Search demand the WRAPPED cond
+#     ({"UserInfoSearchCond":{...}}); a flat body 400s `badJsonContent
+#     errorMsg=<Wrapper>`, a cond without searchID 400s `MessageParametersLack
+#     searchID` (OBSERVED). `EmployeeNoList:[{employeeNo}]` is HONORED here exactly as
+#     the device honored it (1→1, 99→0 NO MATCH) — per-endpoint truth, never inferred
+#     from AcsEventCond.employeeNo (which is silently ignored; different route).
+#   * FDSearch answers the FLAT dialect (no wrapper); a wrapped body 400s (the
+#     wrapped-dialect mistake OBSERVED records), missing faceLibType/FDID 400s
+#     `MessageParametersLack <field>` — and FDID must exist in the FDLib.
+#   * FingerPrintUpload READS (device→client, misleading device name) and demands the
+#     FingerPrintCond wrapper with employeeNo/fpIndex/dataType=template.
+#   * genuinely-absent endpoints answer the recorded notSupport envelope (HTTP 400 +
+#     statusCode 4 + subStatusCode notSupport, like tests/fixtures/recorded/
+#     site-a-ds-k1t341amf-s/error_total_notsupport.json) — NOT a bare 404:
+#     error_total_notsupport.json is what the device actually sent.
+#   * FDLib/capabilities carries `isSuportFDSearch:false` DESPITE FDSearch working —
+#     the caps-under-claim trap stays armed in the fake so the product's
+#     "availability from the call only" rule has a machine to be tested against.
+_ENROLLMENT_NOTSUPPORT_BODY = {
+    "statusCode": 4,
+    "statusString": "Invalid Operation",
+    "subStatusCode": "notSupport",
+    "errorCode": 1073741825,
+    "errorMsg": "unknow",
+}
+
+#: A knob on `install_enrollment`: "ok" serves the real data, anything else replaces
+#: the answer with the recorded envelope of that class ("notSupport" ->
+#: error_total_notsupport.json, "rejected_shape" -> badJsonContent, "error" ->
+#: statusCode 3 deviceError). This is what lets a test show the probe recording a
+#: verdict DIFFERENT from bench A's — the no-assumption-leak pin (card E1-03).
+VerdictLike = str
+
+#: Masked-by-construction template bytes: recognisably fake (hygiene PLACEHOLDER),
+#: never biometric material — the real bench-A bytes are local-only (OBSERVED.md).
+FAKE_FACE_MODEL = "FAKE-FACE-MODEL-<|mask_privacy|>"
+FAKE_FP_TEMPLATE = "FAKE-FP-TEMPLATE-MASKED-<|mask_privacy|>"
+
+
+def not_support() -> httpx.Response:
+    """The recorded notSupport envelope (error_total_notsupport.json: HTTP 400)."""
+    return httpx.Response(400, json=dict(_ENROLLMENT_NOTSUPPORT_BODY))
+
+
+def message_parameters_lack(field: str) -> httpx.Response:
+    """`MessageParametersLack <field>` — OBSERVED's answer to a missing required key."""
+    return httpx.Response(
+        400,
+        json={
+            "statusCode": 6,
+            "statusString": "Invalid Content",
+            "subStatusCode": "MessageParametersLack",
+            "subStatusCodeDescription": f"{field} string is invalid",
+            "errorMsg": field,
+        },
+    )
+
+
+def _json_error(payload: dict) -> httpx.Response:
+    return httpx.Response(400, json=payload)
+
+
+def _search_envelope(
+    *,
+    search_id: object,
+    envelope_key: str,
+    record_key: str,
+    rows: list[dict],
+    total_override: int | None = None,
+) -> dict:
+    """Search envelope with the OBSERVED empty-shape: NO MATCH + record key ABSENT.
+
+    `total_override` reproduces bench A's paging quirk (FDSearch: numOfMatches=3 on
+    one page while totalMatches=4, status OK) — `totalMatches` counts the whole match
+    set, `numOfMatches` only this page, which is exactly why a walker must keep
+    paging to NO MATCH instead of trusting a single OK page.
+    """
+    if rows:
+        return {
+            envelope_key: {
+                "searchID": search_id or "",
+                "responseStatusStrg": "OK",
+                "numOfMatches": len(rows),
+                "totalMatches": total_override if total_override is not None else len(rows),
+                record_key: rows,
+            }
+        }
+    return {
+        envelope_key: {
+            "searchID": search_id or "",
+            "responseStatusStrg": "NO MATCH",
+            "numOfMatches": 0,
+            "totalMatches": 0,
+        }
+    }
+
+
+#: enrollment path -> which `install_enrollment` answer-knob governs it.
+_ENROLLMENT_KNOBS = {
+    "/ISAPI/AccessControl/UserInfo/Search": "user_info_search",
+    "/ISAPI/Intelligent/FDLib/FDSearch": "fd_search",
+    "/ISAPI/AccessControl/FingerPrintUpload": "finger_print_upload",
+    "/ISAPI/AccessControl/UserInfo/capabilities": "user_info_capabilities",
+}
+
+
+def _enrollment_override(answer: str) -> httpx.Response:
+    """The recorded envelope for a knob value other than "ok" (no-assumption pin)."""
+    if answer == "notSupport":
+        return not_support()
+    if answer == "rejected_shape":
+        return _bad_json("unknown")
+    return httpx.Response(
+        400,
+        json={
+            "statusCode": 3,
+            "statusString": "Device Error",
+            "subStatusCode": "deviceError",
+        },
+    )
+
+
+def _bad_json(field: str) -> httpx.Response:
+    """`Invalid Content`/badJsonContent naming the offending key (OBSERVED shape)."""
+    return httpx.Response(
+        400,
+        json={
+            "statusCode": 6,
+            "statusString": "Invalid Content",
+            "subStatusCode": "badJsonContent",
+            "errorMsg": field,
+        },
+    )
+
+
+def _employee_no_filter(cond: dict) -> set[str] | None:
+    """The wanted employeeNo set from a wrapped cond's EmployeeNoList, or None.
+
+    PROVEN HONORED on bench A (`[{"employeeNo":"1"}]` -> 1/4; `"99"` -> 0 + NO MATCH)
+    — honored HERE, in this route only. `AcsEventCond.employeeNo` (no suffix) is the
+    silently-IGNORED one (OBSERVED); per-endpoint truth, never inferred across routes.
+    """
+    entries = cond.get("EmployeeNoList")
+    if not isinstance(entries, list) or not entries:
+        return None
+    wanted = {
+        str(item.get("employeeNo"))
+        for item in entries
+        if isinstance(item, dict) and item.get("employeeNo") is not None
+    }
+    return wanted or None
+
+
+def _clamp_rows(rows: list[dict], cond: dict) -> list[dict]:
+    """Honor `maxResults` like the box does (caps @max=30 on this family)."""
+    raw = cond.get("maxResults")
+    try:
+        limit = int(raw) if raw is not None else len(rows)
+    except (TypeError, ValueError):
+        limit = len(rows)
+    return rows[: max(0, min(limit, 30))]
+
+
+def _json_body(request: httpx.Request) -> dict:
+    try:
+        parsed = json.loads(request.content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _enrollment_user_records() -> list[dict]:
+    """The A-shape record set: RightPlan[{doorNo,planTemplateNo:"1"}], Valid local,
+    password present-but-empty (OBSERVED: `password:""` on all users — the probe
+    never persists it regardless), E1 with numOfFP=1 numOfFace=1."""
+
+    def record(no: str, *, local_ui: bool) -> dict:
+        return {
+            "employeeNo": no,
+            "name": f"User E{no}",
+            "userType": "normal",
+            "Valid": {
+                "enable": True,
+                "beginTime": "2000-01-01T00:00:00",
+                "endTime": "2037-12-31T23:59:59",
+                "timeType": "local",
+            },
+            "doorRight": "1",
+            "RightPlan": [{"doorNo": 1, "planTemplateNo": "1"}],
+            "localUIRight": local_ui,
+            "maxOpenDoorTime": 0,
+            "openDoorTime": 0,
+            "numOfCard": 0,
+            "numOfFace": 1,
+            "numOfFP": 1 if no == "1" else 0,
+            "password": "",
+            "gender": "unknown",
+        }
+
+    return [record("1", local_ui=True), record("2", local_ui=False), record("3", local_ui=False)]
+
+
+def _caps_user_info_body() -> dict:
+    """A's UserInfo caps (OBSERVED 2026-10-21): timeType @opt "local" ONLY,
+    password @max 8 (PIN length), maxRecordNum 3000 (a BATCH cap, not capacity —
+    the probe records it as a claim and §3's capacity rule stays fail-fast),
+    userType without a writable `admin`, EmployeeNoList maxSize 30."""
+    return {
+        "UserInfoCap": {
+            "maxRecordNum": 3000,
+            "supportFunction": {"@opt": "setUp,faceCapture,fpCapture"},
+            "isSupportNumOfFace": "true",
+            "isSupportNumOfFP": "true",
+            "isSupportNumOfCard": "true",
+            "password": {"@min": 0, "@max": 8},
+            "userType": {"@opt": "normal,visitor,blackList"},
+            "Valid": {
+                "timeType": {"@opt": "local"},
+                "beginTime": {"@min": "2000-01-01T00:00:00"},
+                "endTime": {"@max": "2037-12-31T23:59:59"},
+            },
+            "RightPlan": {
+                "@maxSize": 1,
+                "doorNo": {"@min": 1, "@max": 1},
+                "maxPlanTemplate": 4,
+                "planTemplateNo": {"@min": 1, "@max": 255},
+            },
+            "EmployeeNoList": {"@maxSize": 30},
+        }
+    }
+
+
+def _caps_card_info_body() -> dict:
+    return {
+        "CardInfoCap": {
+            "maxRecordNum": 3000,
+            "supportFunction": {"@opt": "setUp"},
+            "cardNo": {"@min": 1, "@max": 20},
+            "cardType": {"@opt": "normalCard,patrolCard,hijackCard,superCard"},
+        }
+    }
+
+
+def _caps_fd_lib_body() -> dict:
+    """THE caps-under-claim trap, kept armed: `isSuportFDSearch:false` (the device's
+    own typo) on a box where the FDSearch POST demonstrably works. A product that
+    trusted this switch would report faces unavailable on bench A."""
+    return {
+        "FDLibCap": {
+            "FDMaxNum": 2,
+            "FDRecordDataMaxNum": 3000,
+            "modelMaxNum": 1,
+            "isSupportModelData": True,
+            "isSuportFDSearch": False,
+        }
+    }
+
+
+def _enrollment_fd_records() -> list[dict]:
+    return [
+        {
+            "FPID": no,
+            "faceURL": f"http://{FAKE_HOST}/LOCALS/pic/enrlFace/0/dead-{no}.jpg@WEB",
+            "modelData": FAKE_FACE_MODEL,
+        }
+        for no in ("1", "2", "3")
+    ]
+
+
 class FakeDevice:
     """A digest-validating `webs` emulator. One instance per test scenario."""
 
@@ -428,7 +704,34 @@ class FakeDevice:
         self._event_store: list[dict] | None = None
         self.served: list[Served] = []
         self.challenges = 0
+        #: --- E1-03 request budget counters (docs/ENROLLMENT-MIGRATION.md §0.5) ------
+        #: EVERY request the fake received (before auth, including raw-queue hits), and
+        #: the same per path+method; plus the count of requests whose credentials the
+        #: box ACCEPTED. The probe's "exactly one request per probed surface, never
+        #: retry an error" rule (card E1-03) is a test against these numbers, not a
+        #: comment — the same discipline the nonce ledger brought to digest budget.
+        self.requests = 0
+        self.requests_by_path: dict[str, int] = {}
+        self.authorized_by_path: dict[str, int] = {}
+        #: None until `install_enrollment` runs: the E1 enrollment read-axis data
+        #: (users/cards/FDLib/FDSearch/FP templates/caps bodies) the handler serves
+        #: with the device's own dialect strictness.
+        self._enrollment: dict | None = None
         self.transport = httpx.MockTransport(self._handle)
+
+    # -- budget counter helpers (E1-03) -------------------------------------------------
+
+    def requests_to(self, method: str, path: str) -> int:
+        """Requests RECEIVED for `method path?query` (incl. unauthenticated probes)."""
+        return self.requests_by_path.get(_key(method, path), 0)
+
+    def authorized_requests_to(self, method: str, path: str) -> int:
+        """Requests whose credentials the box ACCEPTED (the digest-excluded count)."""
+        return self.authorized_by_path.get(_key(method, path), 0)
+
+    @property
+    def total_authorized(self) -> int:
+        return sum(self.authorized_by_path.values())
 
     def challenge(self, *, nonce: str | None = None, stale: str | None = None) -> httpx.Response:
         """A 401 + WWW-Authenticate exactly like the fixture transcript."""
@@ -613,7 +916,262 @@ class FakeDevice:
             }
         return httpx.Response(200, json={"AcsEvent": envelope})
 
+    # -- E1 enrollment surfaces (card E1-03; see the module block above) -----------------
+
+    def install_enrollment(
+        self,
+        *,
+        users: list[dict] | None = None,
+        cards: list[dict] | None = None,
+        fd_lib: list[dict] | None = None,
+        fd_records: list[dict] | None = None,
+        fp_templates: dict[str, str] | None = None,
+        caps_user_info: dict | None = None,
+        caps_card_info: dict | None = None,
+        caps_fd_lib: dict | None = None,
+        caps_acs_cfg: dict | None = None,
+        answer_search: VerdictLike = "ok",
+        answer_fd_search: VerdictLike = "ok",
+        answer_fp_read: VerdictLike = "ok",
+        answer_user_caps: VerdictLike = "ok",
+    ) -> None:
+        """Seed the enrollment read axis with A's discovered truth (defaults below).
+
+        Everything routes through `_handle_enrollment` (dialect-strict, see the module
+        block): what this method installs is DATA, and the *shape* enforcement lives
+        in the handler exactly where the device puts it — after auth, at handler time.
+
+        The four `answer_*` knobs model "a different firmware answered differently"
+        for the E1-03 no-assumption-leak test: "notSupport"/"rejected_shape"/"error"
+        replace the real answer with the recorded envelope for that route, so a test
+        can prove the probe records what THIS device said rather than inheriting
+        bench A's truth.
+        """
+        self._enrollment = {
+            "users": users if users is not None else _enrollment_user_records(),
+            "cards": cards if cards is not None else [],
+            "fd_lib": fd_lib
+            if fd_lib is not None
+            else [
+                {"FDID": "1", "name": "blackFD", "faceLibType": "blackFD"},
+                {"FDID": "2", "name": "infraredFD", "faceLibType": "infraredFD"},
+            ],
+            "fd_records": fd_records if fd_records is not None else _enrollment_fd_records(),
+            "fp_templates": fp_templates if fp_templates is not None else {"1": FAKE_FP_TEMPLATE},
+            "caps_user_info": caps_user_info
+            if caps_user_info is not None
+            else _caps_user_info_body(),
+            "caps_card_info": caps_card_info
+            if caps_card_info is not None
+            else _caps_card_info_body(),
+            "caps_fd_lib": caps_fd_lib if caps_fd_lib is not None else _caps_fd_lib_body(),
+            "caps_acs_cfg": caps_acs_cfg
+            if caps_acs_cfg is not None
+            else {"AcsCfgCap": {"saveFacePic": "true,false"}},
+            "search_overrides": {
+                "user_info_search": answer_search,
+                "fd_search": answer_fd_search,
+                "finger_print_upload": answer_fp_read,
+                "user_info_capabilities": answer_user_caps,
+            },
+        }
+
     # -- the server --------------------------------------------------------------------
+
+    #: path (no query) -> handler name; the enrollment routes the fake answers when
+    #: `install_enrollment` has run. Absent endpoints answer the recorded notSupport
+    #: envelope; the dialect-strict POSTs are enforced in `_handle_enrollment`.
+    _ENROLLMENT_ROUTES = frozenset(
+        {
+            "/ISAPI/AccessControl/UserInfo/Search",
+            "/ISAPI/AccessControl/CardInfo/Search",
+            "/ISAPI/AccessControl/UserInfoDetail/Search",
+            "/ISAPI/AccessControl/FingerPrint/Search",
+            "/ISAPI/AccessControl/FingerPrintUpload",
+            "/ISAPI/AccessControl/UserInfo/capabilities",
+            "/ISAPI/AccessControl/UserInfo/Search/capabilities",
+            "/ISAPI/AccessControl/UserInfo/SetUp/capabilities",
+            "/ISAPI/AccessControl/CardInfo/capabilities",
+            "/ISAPI/AccessControl/AcsCfg/capabilities",
+            "/ISAPI/AccessControl/FingerPrintDownload/capabilities",
+            "/ISAPI/AccessControl/PlanTemplate1",
+            "/ISAPI/Intelligent/FDLib",
+            "/ISAPI/Intelligent/FDLib/FDSearch",
+            "/ISAPI/Intelligent/FDLib/capabilities",
+        }
+    )
+
+    def _handle_enrollment(self, request: httpx.Request) -> httpx.Response | None:
+        """Serve the enrollment read axis with the DEVICE's dialect strictness.
+
+        None = not an enrollment path (fall through to the classic route replay).
+        Runs AFTER auth and after the nonce-cap check, exactly where the firmware
+        validates a request body — an unauthorized client never sees these answers.
+        """
+        assert self._enrollment is not None  # caller-checked
+        path = request.url.path
+        if path not in self._ENROLLMENT_ROUTES:
+            return None
+        override = self._enrollment["search_overrides"].get(_ENROLLMENT_KNOBS.get(path, ""))
+        if override not in (None, "ok"):
+            return _enrollment_override(override)
+        if path == "/ISAPI/AccessControl/UserInfo/Search":
+            return self._enroll_user_search(request)
+        if path == "/ISAPI/AccessControl/CardInfo/Search":
+            return self._enroll_card_search(request)
+        if path == "/ISAPI/AccessControl/FingerPrintUpload":
+            return self._enroll_fp_read(request)
+        if path == "/ISAPI/Intelligent/FDLib/FDSearch":
+            return self._enroll_fd_search(request)
+        if path == "/ISAPI/Intelligent/FDLib":
+            return httpx.Response(200, json={"FDLibInfoList": self._enrollment["fd_lib"]})
+        if path == "/ISAPI/AccessControl/UserInfo/capabilities":
+            return httpx.Response(200, json=self._enrollment["caps_user_info"])
+        if path == "/ISAPI/AccessControl/CardInfo/capabilities":
+            return httpx.Response(200, json=self._enrollment["caps_card_info"])
+        if path == "/ISAPI/AccessControl/AcsCfg/capabilities":
+            return httpx.Response(200, json=self._enrollment["caps_acs_cfg"])
+        if path == "/ISAPI/Intelligent/FDLib/capabilities":
+            return httpx.Response(200, json=self._enrollment["caps_fd_lib"])
+        # Absent on bench A (OBSERVED.md "E1 enrollment-read probes"): the detail
+        # search, FingerPrint/Search, the three caps documents that 404'd, and
+        # PlanTemplate. Recorded envelope, HTTP 400 + notSupport — like
+        # error_total_notsupport.json, which is exactly how the device said it.
+        return not_support()
+
+    def _enroll_user_search(self, request: httpx.Request) -> httpx.Response:
+        """Wrapped-cond strict (OBSERVED): flat body -> badJsonContent; no searchID
+        -> MessageParametersLack; `EmployeeNoList` filter HONORED (the live A/B)."""
+        body = _json_body(request)
+        cond = body.get("UserInfoSearchCond")
+        if not isinstance(cond, dict):
+            return _bad_json("UserInfoSearchCond")
+        if not str(cond.get("searchID") or ""):
+            return message_parameters_lack("searchID")
+        rows = list(self._enrollment["users"])  # type: ignore[index]
+        wanted = _employee_no_filter(cond)
+        if wanted is not None:
+            rows = [r for r in rows if str(r.get("employeeNo")) in wanted]
+        rows = _clamp_rows(rows, cond)
+        return httpx.Response(
+            200,
+            json=_search_envelope(
+                search_id=cond.get("searchID"),
+                envelope_key="UserInfoSearch",
+                record_key="UserInfo",
+                rows=rows,
+            ),
+        )
+
+    def _enroll_card_search(self, request: httpx.Request) -> httpx.Response:
+        body = _json_body(request)
+        cond = body.get("CardInfoSearchCond")
+        if not isinstance(cond, dict):
+            return _bad_json("CardInfoSearchCond")
+        if not str(cond.get("searchID") or ""):
+            return message_parameters_lack("searchID")
+        rows = _clamp_rows(list(self._enrollment["cards"]), cond)  # type: ignore[index]
+        return httpx.Response(
+            200,
+            json=_search_envelope(
+                search_id=cond.get("searchID"),
+                envelope_key="CardInfoSearch",
+                record_key="CardInfo",
+                rows=rows,
+            ),
+        )
+
+    def _enroll_fp_read(self, request: httpx.Request) -> httpx.Response:
+        """FingerPrintUpload READS (device→client). Wrapper required — OBSERVED: a
+        plain `{searchID,employeeNo}` body answered `MessageParametersLack
+        FingerPrintCond`; inner keys are checked in the order OBSERVED named them."""
+        body = _json_body(request)
+        cond = body.get("FingerPrintCond")
+        if not isinstance(cond, dict):
+            return message_parameters_lack("FingerPrintCond")
+        for required in ("employeeNo", "fpIndex", "dataType"):
+            if required not in cond:
+                return message_parameters_lack(required)
+        if cond["dataType"] != "template":
+            # Only `dataType:"template"` is device-confirmed on this fw (OBSERVED);
+            # anything else is refused rather than invented an answer for.
+            return _json_error(
+                {
+                    "statusCode": 6,
+                    "statusString": "Invalid Content",
+                    "subStatusCode": "badParameters",
+                    "errorCode": 1610612759,
+                    "errorMsg": "dataType",
+                }
+            )
+        entry = self._enrollment["fp_templates"].get(  # type: ignore[index]
+            str(cond["employeeNo"])
+        )
+        if not entry or int(cond["fpIndex"] or 0) != 0:
+            # Not in the recorded corpus; symmetric with the recorded nonempty shape,
+            # list EMPTY rather than key-absent (documented extrapolation).
+            return httpx.Response(200, json={"FingerPrintInfo": {"FingerPrintList": []}})
+        return httpx.Response(
+            200,
+            json={
+                "FingerPrintInfo": {
+                    "FingerPrintList": [
+                        {
+                            "cardReaderNo": 1,
+                            "fingerPrintID": 1,
+                            "fingerType": "normalFP",
+                            "fingerData": entry,
+                            "leaderFP": "false",
+                        }
+                    ]
+                }
+            },
+        )
+
+    def _enroll_fd_search(self, request: httpx.Request) -> httpx.Response:
+        """FLAT dialect only — the working shape the operator confirmed (OBSERVED).
+
+        The wrapped `FDSearchCond` body is what 400'd `MessageParametersLack
+        faceLibType` in the earlier rounds (the wrapper hid the field the device
+        reads at top level), so the fake answers the wrapped form with EXACTLY that
+        rejection. `FDID` must name a real library. Paging quirk reproduced:
+        `numOfMatches` counts THIS page, `totalMatches` counts the whole match set —
+        the "3 of 4 in one page, status OK" behaviour OBSERVED records, which is why
+        a walker must page to NO MATCH instead of trusting one page.
+        """
+        body = _json_body(request)
+        if "FDSearchCond" in body:
+            return message_parameters_lack("faceLibType")
+        for required in ("faceLibType", "FDID"):
+            if not str(body.get(required) or ""):
+                return message_parameters_lack(required)
+        fdid = str(body["FDID"])
+        known = {str(lib.get("FDID")) for lib in self._enrollment["fd_lib"]}  # type: ignore[index]
+        if fdid not in known:
+            return httpx.Response(
+                200,
+                json=_search_envelope(
+                    search_id=body.get("searchID"),
+                    envelope_key="FDSearch",
+                    record_key="Records",
+                    rows=[],
+                ),
+            )
+        matched = list(self._enrollment["fd_records"])  # type: ignore[index]
+        fpid = body.get("FPID")
+        if fpid is not None:
+            matched = [r for r in matched if str(r.get("FPID")) == str(fpid)]
+        rows = _clamp_rows(matched, body)
+        return httpx.Response(
+            200,
+            json=_search_envelope(
+                search_id=body.get("searchID"),
+                envelope_key="FDSearch",
+                record_key="Records",
+                rows=rows,
+                total_override=len(matched),
+            ),
+        )
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.raw_path.decode()
@@ -630,6 +1188,10 @@ class FakeDevice:
                 digest=digest,
             )
         )
+        # E1-03 budget counters: EVERY received request counts here (the auth
+        # handshake's unauthenticated first hop included), per path and total.
+        self.requests += 1
+        self.requests_by_path[key] = self.requests_by_path.get(key, 0) + 1
 
         # Server-initiated scenarios first (stale re-challenge, lockout body, 503,
         # transport errors): these fire regardless of what the client sent, like the
@@ -662,6 +1224,7 @@ class FakeDevice:
         # make a retirement fire on bad credentials and blame the recovery budget.
         if authorized:
             self._authorized_served += 1
+            self.authorized_by_path[key] = self.authorized_by_path.get(key, 0) + 1
         if not authorized:
             self.challenges += 1
             return self.unauthenticated_401()
@@ -698,6 +1261,14 @@ class FakeDevice:
         # With a store installed (filtering mode) the two event POSTs are SERVED —
         # the store is their route — so they must not fall to the 404 below.
         store_answers = self._event_store is not None and cond_key is not None
+        # E1-03: the enrollment read axis answers BEFORE the catch-all 404, and only
+        # when a scenario installed it AND no explicit route was registered for this
+        # path (an explicit `add`/`reset` still wins — a test that wants to override
+        # the enrollment answer for one route can, exactly like the event store).
+        if queue is None and not store_answers and self._enrollment is not None:
+            enrolled = self._handle_enrollment(request)
+            if enrolled is not None:
+                return enrolled
         if queue is None and not store_answers:
             return httpx.Response(
                 404,

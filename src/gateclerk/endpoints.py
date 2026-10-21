@@ -71,7 +71,30 @@ class Endpoint:
 #: card that asks for a callable path is what keeps the allowlist a decision rather than
 #: drift. `AcsEvent/Total` — the name you would guess — is `400 notSupport` on this firmware
 #: and is registered nowhere.
-SEARCH_ENDPOINTS = frozenset({"user_info_search", "acs_event_search", "acs_event_total_num"})
+#:
+#: Five more added by card E1-03 (capability probe, design §1/§3), reviewed as a set.
+#: Four are plain stateless searches (`CardInfo/Search`, `UserInfoDetail/Search`,
+#: `FingerPrint/Search`, `Intelligent/FDLib/FDSearch`). Note `finger_print_upload`:
+#: the name is the DEVICE's, and it is misleading — on this firmware
+#: FingerPrintUpload?format=json with a `FingerPrintCond` body READS a fingerprint
+#: template device→client (OBSERVED.md "E1 enrollment-read probes", live-proven
+#: 2026-10-21); the write-direction sibling `FingerPrintDownload` (client→device) is
+#: deliberately NOT registered and stays uncallable until E1-04's bench capture
+#: clears the §5.0 write gate — registering a POST that mutates is exactly what this
+#: allowlist exists to stop.
+SEARCH_ENDPOINTS = frozenset(
+    {
+        "user_info_search",
+        "acs_event_search",
+        "acs_event_total_num",
+        # --- E1-03 probe surfaces (read-only stateless searches / read-direction POST)
+        "card_info_search",
+        "user_info_detail_search",
+        "fingerprint_search",
+        "fd_search",
+        "finger_print_upload",
+    }
+)
 
 REGISTRY: dict[str, Endpoint] = {
     e.name: e
@@ -127,6 +150,117 @@ REGISTRY: dict[str, Endpoint] = {
             "advisory event count for one window — the `--count` cross-check (p1-08). "
             "Displays a number, never a loop bound (DESIGN.md). The obvious-looking "
             "`AcsEvent/Total` is 400 notSupport on this firmware and is registered nowhere",
+        ),
+        # --- E1 enrollment-probe surfaces (card E1-03, design §1/§3) ------------------
+        # Read-only additions, each justified by a live bench-A read (docs/OBSERVED.md
+        # "E1 enrollment-read probes"). The availability of EACH is probed per device
+        # and recorded; several of these answers are 404 on bench A, and the registry
+        # still carries the path because the probe must be able to ASK (silence is
+        # never data — §0.7). No SetUp/Download/write verb exists below.
+        Endpoint(
+            "user_info_search_capabilities",
+            "/ISAPI/AccessControl/UserInfo/Search/capabilities",
+            HttpMethod.GET,
+            "documented hypothesis for search-shape caps (v3 probe round): 404 on "
+            "bench A — probed per device so the fact is discovered, not inherited",
+        ),
+        Endpoint(
+            "user_info_capabilities",
+            "/ISAPI/AccessControl/UserInfo/capabilities",
+            HttpMethod.GET,
+            "the REAL UserInfo caps document (200 on A): maxRecordNum (batch/page "
+            "cap, NOT device capacity), password @max, Valid.timeType @opt, userType "
+            "@opt, RightPlan bounds, EmployeeNoList maxSize — recorded as device "
+            "CLAIMS, never availability",
+        ),
+        Endpoint(
+            "user_info_setup_capabilities",
+            "/ISAPI/AccessControl/UserInfo/SetUp/capabilities",
+            HttpMethod.GET,
+            "capability DOCUMENT describing the SetUp verb's body — GET of a caps "
+            "document, not a write (404 on A; E1-04's capture will record the shape). "
+            "The SetUp POST itself is registered nowhere",
+        ),
+        Endpoint(
+            "card_info_search",
+            "/ISAPI/AccessControl/CardInfo/Search",
+            HttpMethod.POST,
+            "paged card roster, wrapped CardInfoSearchCond (stateless search; "
+            "bench A answered NO MATCH — 0 cards)",
+        ),
+        Endpoint(
+            "card_info_capabilities",
+            "/ISAPI/AccessControl/CardInfo/capabilities",
+            HttpMethod.GET,
+            "CardInfo caps document (200 on A): cardNo @max, cardType enum, "
+            "maxRecordNum — recorded as a device claim",
+        ),
+        Endpoint(
+            "user_info_detail_search",
+            "/ISAPI/AccessControl/UserInfoDetail/Search",
+            HttpMethod.POST,
+            "per-person detail search the docs promise — notSupport on A; probing it "
+            "per device decides whether B/C have it (door rights live IN UserInfo)",
+        ),
+        Endpoint(
+            "fingerprint_search",
+            "/ISAPI/AccessControl/FingerPrint/Search",
+            HttpMethod.POST,
+            "fingerprint search the docs promise — genuinely notSupport on A; still "
+            "probed per device (§3: never assume a firmware answer)",
+        ),
+        Endpoint(
+            "finger_print_upload",
+            "/ISAPI/AccessControl/FingerPrintUpload",
+            HttpMethod.POST,
+            "the PROVEN fingerprint READ (misleading device name: FingerPrintCond "
+            "POST returns FingerPrintList device→client — OBSERVED.md 2026-10-21). "
+            "Read-direction only; the client→device FingerPrintDownload stays "
+            "unregistered until E1-04's §5.0 capture clears the write gate",
+        ),
+        Endpoint(
+            "finger_print_download_capabilities",
+            "/ISAPI/AccessControl/FingerPrintDownload/capabilities",
+            HttpMethod.GET,
+            "caps document for the fingerprint WRITE verb — GET of a document (404 "
+            "on A). The FingerPrintDownload POST is registered nowhere",
+        ),
+        Endpoint(
+            "fd_lib",
+            "/ISAPI/Intelligent/FDLib",
+            HttpMethod.GET,
+            "face-library inventory (FDID 1 blackFD, FDID 2 infraredFD on A) — the "
+            "FDID values the FDSearch probe must carry to be legal",
+        ),
+        Endpoint(
+            "fd_search",
+            "/ISAPI/Intelligent/FDLib/FDSearch",
+            HttpMethod.POST,
+            "face-record search, FLAT dialect (no cond wrapper — the wrapped shape "
+            "is what 400'd; OBSERVED.md). Returns modelData face TEMPLATES (stateless "
+            "search); availability is decided by THIS call, never by the caps switch",
+        ),
+        Endpoint(
+            "fd_lib_capabilities",
+            "/ISAPI/Intelligent/FDLib/capabilities",
+            HttpMethod.GET,
+            "FDLib caps document (200 on A): FDMaxNum, FDRecordDataMaxNum, "
+            "modelMaxNum, isSupportModelData — and isSuportFDSearch=false DESPITE "
+            "FDSearch working: caps under-claim on this fw; recorded as a claim",
+        ),
+        Endpoint(
+            "acs_cfg_capabilities",
+            "/ISAPI/AccessControl/AcsCfg/capabilities",
+            HttpMethod.GET,
+            "ACS behaviour switches (saveFacePic on A); the §3 capacity-discovery "
+            "attempt — where it does not expose maxima, that absence is recorded",
+        ),
+        Endpoint(
+            "plan_template",
+            "/ISAPI/AccessControl/PlanTemplate1",
+            HttpMethod.GET,
+            "door-plan preset read — notSupport on A; probed per device so the "
+            "templateNo-evidence rule (§3) knows whether richer evidence exists",
         ),
     )
 }

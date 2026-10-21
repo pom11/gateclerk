@@ -664,7 +664,10 @@ def test_every_registry_path_uses_only_get_or_the_advertised_search_posts() -> N
     The POST set is enumerated here as well as in `test_endpoints_registry.py` on purpose:
     this file is the transport's own view, and a registry entry that the client would refuse
     to call (or would call with the wrong verb) is caught from both sides. Three POSTs since
-    card p1-08 added the `AcsEventTotalNum` count probe for `--count`.
+    card p1-08 added the `AcsEventTotalNum` count probe for `--count`; eight since card
+    E1-03 added the five enrollment READ surfaces (the full reviewed rationale for each
+    lives at its REGISTRY entry and in test_endpoints_registry.py — including why
+    FingerPrintUpload is a read and FingerPrintDownload is absent).
     """
     methods = {ep.method.value for ep in REGISTRY.values()}
     assert methods == {"GET", "POST"}
@@ -676,6 +679,11 @@ def test_every_registry_path_uses_only_get_or_the_advertised_search_posts() -> N
             "user_info_search",
             "acs_event_search",
             "acs_event_total_num",
+            "card_info_search",
+            "user_info_detail_search",
+            "fingerprint_search",
+            "fd_search",
+            "finger_print_upload",
         }
     )
 
