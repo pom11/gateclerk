@@ -57,7 +57,13 @@ device truth: docs/OBSERVED.md.)
   sites.toml local + chmod 600 OUTSIDE the repo, creds keychain rung only). Daily
   snapshot job `com.gateclerk.p2-10-snapshot` (07:05 local) reads health/agent.json +
   store, evaluates the four CLEAN criteria, and posts one comment on t_e6cdb2e9 per day
-  (JSONL history in the state dir). Day-7 verdict carded to fire after day 7.
+  (JSONL history in the state dir). Day-7 verdict `com.gateclerk.p2-10-verdict` (07:40,
+  self-waiting until 7 snapshots exist) posts PASS/FAIL with every day quoted and
+  completes/re-blocks the card. Tooling versioned in its own local repo ~/
+  gateclerk (no remote; device host redacted from committed files). Two launchd teething
+  bugs caught + fixed the same evening: first 07:05 run crashed FileNotFoundError
+  'hermes' (launchd PATH is minimal -> absolute path), and the snapshot job now refuses
+  to count a day while the agent job is not loaded (no phantom days during the fix wait).
 - LIVE SMOKE caught what 1465 offline tests could not (FakeDevice accepts any
   startTime string): the agent's `now`-derived window carries microseconds and the
   device 400s them — `badJsonContent errorMsg=startTime` — while the byte-identical
