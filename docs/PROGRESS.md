@@ -585,6 +585,25 @@ device truth: docs/OBSERVED.md.)
 - Tests: 35 new in tests/test_e1_01b_biometric_export.py (byte-stability, opaque
   mutation, "007"≠"7" join, orphan-row abort, empty-honest-zeros, reader tamper
   verify, no-photo-GET pin). Full offline suite 1567 passed / 5 skipped; ruff clean.
-- Stack note for the orchestrator: PR base is `wt/t_bd1faed8` (E1-01, PR #38 — still
-  open); E1-03 (PR #37) touches the same fakedevice region — merge order 38 → this →
-  37 recommended; fake blocks will need a one-line reconcile on #37's side.
+- Stack note resolved by the orchestrator at merge time (see the 2026-10-22 merge-wave
+  entry below): merged after #37/#38 as PR #40 onto main; the biometric store was
+  grafted onto the unified fake rather than reconciled one-line.
+## 2026-10-22 00:25-02:45 — E1 read-axis code wave merged: PR #37/#38/#40/#39 (probe, bundle, faces/FP export, diff engine).
+
+- Operator ping: 4 open PRs. Gated + merged all four in stack order 37 -> 38 -> 40 -> 39
+  (full evidence in scratch/e1-gate-log.md; per-merge gate = fresh worktree full pytest
+  + ruff + >=3 mutation probes + tree-identity proof vs merged sha).
+  * #37 E1-03 probe -> 6dcc06f (1508 suite; freshness/future-stamp/availability mutants red).
+  * #38 E1-01 bundle -> 2436dbc (1561; password-strip/repo-out mutants red; one
+    mutant judged dead-code belt with reasoning recorded).
+  * #40 E1-01b faces+FP export -> aeb8dc7 (1597; biometric-store/paging-quirk/wrapper
+    mutants red). Stack conflict resolved by grafting the biometric store onto main's
+    unified fake (seed_biometric + two store-mode handlers), NOT by clobbering E1-03's axis.
+  * #39 E1-02 diff engine -> d66b922 (1635; UNKNOWN-not-zero, card pair-identity,
+    template-1-carried mutants red).
+- main green at d66b922: 1635 passed / 5 skipped / 1 deselected, ruff clean, 0 open PRs.
+- Next (operator-ordered): ONE-session bench-A capture (§5.0) — export snapshot via
+  merged code, then user/card/FP/face write round-trips + read-backs, restore, fixtures
+  committed -> unblocks E1-04 t_bbddb8f5 (capture-before-fake: no write fake route
+  before its fixture).
+
