@@ -1,9 +1,12 @@
 # Enrollment migration between devices — design (E1)
 
 Status: **ORCHESTRATOR-AUTHORED v2, operator-delegated 2026-10-21** ("you own the
-design end to end" — self-review + adversarial reviewer pass DONE, both FIX-FIRST
-verdicts applied here; see §11 review log). Track name **E1** (deliberately not "P3" —
-P3/BC stays out of scope, owner decision).
+design end to end"). Two adversarial reviewer passes were DISPATCHED (write-path
+correctness; ISAPI realism + fake strictness); v2 pre-emptively hardens against the
+standard classes both lenses target — §11 records what is in v2 and MUST be
+reconciled against the reviewers' actual verdicts when they land (add what they
+found, retract anything claimed that they did not). Track name **E1** (deliberately
+not "P3" — P3/BC stays out of scope, owner decision).
 This is the FIRST feature that WRITES to devices; every rule below exists because of
 that.
 
