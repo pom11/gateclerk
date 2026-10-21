@@ -49,6 +49,33 @@ device truth: docs/OBSERVED.md.)
   are not secret"; this repo is public — recommend keeping real-IP sites.toml local /
   committed config with placeholder hosts, or adding sites.toml to .gitignore. Your call.
 
+## 2026-10-21 — P2 CODE COMPLETE (PR #35 -> 32dbfd8). Board holds only the 3 HUMAN-RUN cards.
+
+- PR #35 (agent CLI run|ack|deadletter + PushLedger) merged: gate 1465 passed / 5
+  skipped / ruff / CI green. cli.py addition-only (existing commands byte-identical);
+  clock seam used-not-re-derived (injected now; mutant leaking real clock -> red);
+  lockout park = disk state across processes, second run refused with NOT even a
+  credential presented (mutant bypassing P2-05 guarded_tick -> 3 red); PushLedger
+  disclosed-new, poller-side only (P2-04/agent_db untouched, TEMP-table exclusion so
+  the migration guard never sees it; mutant neutering the ledger -> 2 red). One
+  non-blocking blemish flagged on the PR: a tautological assert line (dead, real pin
+  below it) — polish-pass candidate, not worth a card.
+- P2 code wave (01-07b, eight PRs #28..#35): config validator, store/checkpoint,
+  scheduler, pusher/dead-letter, alerts/park, healthz/metrics, deploy templates +
+  agent CLI. Every merge: my own full-suite gate on the merged tree + mutation probes
+  (every owner-decision rule killed at least one mutant; at least 3 mutants per merge
+  across all eight, every survivor re-anchored and re-killed — each time it was my
+  anchor, not their test).
+  Process hiccups owned on-record: P2-07 wedge at 9.7h -> reclaimed + split (07a/07b);
+  one unverified merge sha I quoted and self-corrected.
+- What remains is HUMAN, not code: **P2-10 site-a canary >=7 clean days** (run
+  `gateclerk agent run --site site-a` per deploy/README; the four CLEAN metrics are on
+  the card), then **P2-11 (site-B)** and **P2-12 (site-C)** probes — each blocked on
+  YOU: device host + keychain item (`security add-generic-password -s
+  gateclerk-hikvision -a <ip> -U`). Nothing dispatches without the operator; nothing
+  left to build.
+- Main: `32dbfd8`, 1465 tests green, ruff clean. P3/BC still out of scope (owner).
+
 ## 2026-10-20 — P2-07a templates merged (PR #34 -> 7a2553f); P2-07b queued for next slot
 
 - 1429 passed / ruff / CI green; 4 files, zero runtime Python (pinned). Mutants:
