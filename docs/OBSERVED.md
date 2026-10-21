@@ -257,3 +257,57 @@ hour. Do not `str.replace("GMT","")`; map site names (IANA) in config instead.
 - p1-06: site-tz policy + `tz_offset_mismatch` flag; fixture `system_time.xml` + `events_major5_page1.json` are the golden pairs.
 - p1-07: `verify_mode` verbatim `cardOrFaceOrFp`; `attendanceStatus` null → `direction=unknown`; strip `password` key from UserInfo records before storing; employee_no = `employeeNoString` as string.
 - p1-09: fixtures under `tests/fixtures/recorded/site-a-ds-k1t341amf-s/` are the corpus (masked: names→`User E<n>`, serial→`MASKED-SER-1`, mac zeroed, password keys removed, nonce masked). No CI leak-guard — build FakeDevice scenarios on these, nothing hygiene-related.
+
+## E1 enrollment-read probes — bench A, 2026-10-21 (read-only rounds 11-18)
+
+Device DS-K1T341AMF-S fw V3.2.30, same masked conventions as above. These facts fed
+design v4 (docs/ENROLLMENT-MIGRATION.md §1). Biometric BYTES (face modelData, FP
+fingerData) are never committed here or in fixtures — shape/size/hash-prefix only.
+
+- **UserInfo/Search dialect**: body MUST be `{"UserInfoSearchCond":{searchID,
+  searchResultPosition,maxResults,…}}` — flat cond → 400 `badJsonContent
+  errorMsg=UserInfoSearchCond`; missing searchID → 400 `MessageParametersLack
+  searchID`. Response wraps under `UserInfoSearch` (record list `UserInfo`,
+  `responseStatusStrg` OK/MORE/NO MATCH, `numOfMatches`/`totalMatches`).
+  `maxResults` cap 30 (caps @max=30). **Server-side filter HONORED**:
+  `EmployeeNoList:[{"employeeNo":"1"}]` → 1/4 returned, `"99"` → 0 + NO MATCH
+  (contrast AcsEventCond.employeeNo, silently ignored — per-endpoint, never infer).
+  UserInfo record for User E1 carries `numOfFace:1 numOfFP:1 numOfCard:0`,
+  `RightPlan:[{doorNo:1,planTemplateNo:"1"}]` (ALL users use templateNo "1"),
+  `Valid.timeType:"local"`, `password:""` (empty on all users), localUIRight true on
+  E1 only.
+- **FDSearch WORKS — FLAT body** (no cond wrapper; the wrapped dialect is what 400'd
+  in earlier rounds): `{"searchResultPosition":0,"maxResults":30,"faceLibType":
+  "blackFD","FDID":"1"[,"FPID":"<employeeNo>"]}` → rows `{FPID, faceURL, modelData}`.
+  modelData = base64 face TEMPLATE, 272 B, magic `FR500005\x01\x00\x00\x00`, sha256
+  prefixes cb2755c7cfb9 / 4723b080f1c5 / ad7ee907920c for E1/E2/E3 (distinct per
+  person). FPID filter honored (FPID=1 → 1/4). Paging quirk: FDID=1 all-search
+  returned numOfMatches=3 totalMatches=4 in ONE page with status OK — walker must
+  keep paging to NO MATCH, not trust one page. FDID 2 = infraredFD exists.
+  **faceURL photo bytes DEAD**: `http://<device-a>/LOCALS/pic/enrlFace/0/…jpg@WEB…`
+  404s (plain, %-encoded @, fresh-cookie same-session alike). Not retry-spamming:
+  5 GETs total across rounds.
+- **FingerPrint read WORKS** (misleading name, device→client): POST
+  `/ISAPI/AccessControl/FingerPrintUpload?format=json`
+  `{"FingerPrintCond":{"searchID":"…","employeeNo":"1","fpIndex":0,"dataType":"template"}}`
+  → `FingerPrintInfo.FingerPrintList:[{cardReaderNo,fingerPrintID,fingerType:
+  "normalFP",fingerData,leaderFP}]`; E1 fpID 1 = 512 B template, sha256 prefix
+  3b7b3bd273b3 (bytes local-only). Plain `{searchID,employeeNo}` → 400
+  `MessageParametersLack FingerPrintCond` (wrapper required).
+  `FingerPrint/Search` genuinely notSupport; `FingerPrintDownload/capabilities` 404.
+- **Capability GETs**: `UserInfo/capabilities`, `CardInfo/capabilities`,
+  `FDLib/capabilities`, `AcsCfg/capabilities` all 200 JSON. `UserInfo/SetUp/
+  capabilities` and `UserInfo/Search/capabilities` (and FingerPrintDownload caps)
+  404 notSupport. UserInfo caps: supportFunction @opt includes `setUp`;
+  maxRecordNum 3000 (batch/page cap, NOT device capacity); password @max 8 (PIN
+  length — another reason pins are never logged); Valid timeType @opt `"local"` ONLY;
+  Valid range 2000-01-01…2037-12-31; userType @opt `normal,visitor,blackList` (no
+  `admin` writable); RightPlan {maxSize 1, doorNo 1, maxPlanTemplate 4,
+  planTemplateNo 1..255}; EmployeeNoList maxSize 30; isSupportNumOfFace/FP/Card true.
+  CardInfo caps: setUp listed; cardNo @max 20; cardType normalCard/patrolCard/
+  hijackCard/superCard. FDLib caps: FDMaxNum 2, FDRecordDataMaxNum 3000,
+  modelMaxNum 1, **isSuportFDSearch=false while FDSearch demonstrably WORKS** —
+  caps UNDER-claim on this fw; record caps as values, infer availability only from
+  the call itself.
+- Policy reaffirmed: no device re-probes on a settled axis (lockout accounting);
+  the 404-faceURL question is CLOSED as dead-end after the bounded rounds above.
