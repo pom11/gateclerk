@@ -383,6 +383,24 @@ lockout axis clean). Artifacts: `~/gateclerk-data/capture/*.json` + three bundle
   card `PUT CardInfo/Delete?format=json` `{"CardInfoDelCond":{"CardNoList":[…],
   "EmployeeNoList":[…]}}` (verified 0 after — wrapper + DelCond keys from caps).
   UserInfoDetail/DeleteProcess → 404 deviceError (no progress surface).
+- **USER DELETE IS NOT TARGETABLE ON THIS FW (CLOSED, 2026-10-22 second session).**
+  Two accepted shapes, both wiped the WHOLE roster (count→0, faces→0), both returned
+  `statusCode 1 ok`: `{UserInfoDetail:{mode:"delete"}, UserInfoDelCond:{…}}` and
+  `{UserInfoDetail:{mode:"deleteByEmployeeNo"}, UserInfoDelCond:{…}}`. The device
+  accepts the sibling `UserInfoDelCond`, ignores its contents AND the targeted mode
+  value, then deletes everyone. Every list-INSIDE-`UserInfoDetail` shape 400s
+  (`badJsonContent: EmployeeNoList`) — including the documented `deleteByEmployeeNo`
+  + inside-list form. Vocabulary is fully mapped (caps: `UserInfoDelCond`
+  `EmployeeNoList.maxSize=30`); no accepted targeted form exists. **Consequence:**
+  there is NO safe per-person user delete on DS-K1T341AMF-S V3.2.30 → v1 stays
+  no-deletions (already §5 step 8), and undo of a user ADD is impossible via API: the
+  only "undo" is wipe-and-restore-from-bundle, which must NEVER be automatic. Face and
+  card deletes ARE targeted (verified above). Recovery is proven a 3rd time:
+  `site-a-restored-2c-20261022` re-export = 4 users / 4 faces, per-person content
+  hashes + face template bytes identical to baseline; the person-1 FP (512 B,
+  301-family) is archived in the baseline bundle (sha256 9784837e…) but cannot be
+  re-applied on bench A (reader rejects third-party family) — data preserved, device
+  enrollment lost, exactly the accepted-not-applied class.
 - Test-person hygiene: person 90 + card 90000090 were the only writes; both gone
   by session end (90 via the wipe + re-add path: it was NOT re-added after — the
   roster is exactly the original 1,2,3,4).

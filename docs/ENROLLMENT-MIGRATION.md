@@ -293,7 +293,7 @@ trust):
   (restore-before-delete), re-verified by read-back;
 - undo is itself budgeted (§5.3 math), verified by re-read, and gets its own journal.
 
-**§5b rule D-WIPE (capture 2026-10-22; bench A lost every user to this).** A delete
+**§5b rule D-WIPE (capture 2026-10-22; bench A lost every user TWICE to this).** A delete
 request whose target-list is NOT in the slot the device reads is not a no-op — the
 device ignores the unknown slot and deletes ALL. Therefore no delete may be sent
 until its EXACT list-slot shape has been captured on that device class, and every
@@ -304,6 +304,24 @@ any write, always), escalate. The fake enforces the hazard: a delete body whose 
 sits in a slot the captured shape does not name must answer statusCode 1 AND wipe the
 whole store — a delete fake that only ever deletes what it is told teaches nothing.
 Face/card deletes (captured-safe shapes) carry the same count-delta guard.
+
+**§5b.1 — USER DELETE IS BANNED OUTRIGHT (CLOSED on evidence, second session).** The
+axis was driven to exhaustion: both bodies this fw *accepts* (`mode:"delete"` and the
+documented targeted `mode:"deleteByEmployeeNo"`, list in sibling `UserInfoDelCond`)
+each returned `ok` and wiped the ENTIRE roster; every list-inside-`UserInfoDetail`
+body 400s. There is no accepted targeted user-delete shape on DS-K1T341AMF-S
+V3.2.30 (OBSERVED.md "USER DELETE IS NOT TARGETABLE"). So this is not a "verify
+harder" problem — the verb does not exist on this fw. Consequences, binding:
+1. no code path may PUT `UserInfoDetail/Delete` against a real device, ever, not
+   even wrapped — the count-delta guard would only discover the wipe after it;
+2. **undo of a user ADD has no API path**: `restored`/`reverted` for the users phase
+   is REPORT-ONLY ("re-enroll/restore manually from the pre-run bundle") — E1-04's
+   journal still records intent, E1-05 must not fake a user-undo verb;
+3. face and card deletes ARE targeted and capture-proven (list slot verified safe),
+   so card-phase undo may use the card delete with the §5b count-delta wrapper;
+4. the fake reproduces BOTH accepted wipe shapes (any mode value, sibling slot ⇒
+   wipe-all) and 400s every inside-list shape — tests must pin that even a
+   correctly-shaped-by-analogy user delete hits the wipe branch.
 
 ## 6. Read-back verify (never trust the write's status code)
 
