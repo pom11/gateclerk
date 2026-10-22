@@ -75,11 +75,14 @@ filtering mode too — presence still gates the request before arithmetic runs.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import ClassVar
 
 import httpx
 
@@ -667,6 +670,43 @@ def _json_body(request: httpx.Request) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+# --- the captured write vocabulary (card E1-04; bench-A capture PR #43) -----------------
+#
+# §9's capture-before-fake rule, made structural: the write handlers below may answer
+# ONLY with a body that lives in this directory, or raise `EnrollmentProtocolError`.
+# `_capture()` is deliberately a file read, not a dict literal — a test that renames or
+# deletes a capture file must break the fake, because that is the signal "the device
+# truth this route rests on is gone". Two handlers answer a shape the capture set does
+# not contain; both are marked INVENTED at their site and reported in the card.
+
+#: The committed capture directory (PR #43, d34b3a5).
+_CAPTURE_DIR = (
+    Path(__file__).parent / "fixtures" / "recorded" / "site-a-ds-k1t341amf-s" / "enrollment"
+)
+
+#: The captured write verb path (a fake-side constant: the product registry stays
+#: read-only, so the write path never enters `gateclerk.endpoints` — design §5.0 gate).
+USER_SETUP_PATH = "/ISAPI/AccessControl/UserInfo/SetUp"
+
+
+def _capture(name: str) -> dict:
+    """One committed capture body, verbatim (see the block comment above)."""
+    path = _CAPTURE_DIR / name
+    if not path.is_file():
+        raise EnrollmentProtocolError(
+            f"capture fixture {name} is missing from {_CAPTURE_DIR}: this write route "
+            "has no device truth and must not answer (§9 capture-before-fake)"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _json_ok(payload: dict, *, http_status: int = 200) -> httpx.Response:
+    """A captured payload on the wire with the JSON content-type `webs` sends."""
+    return httpx.Response(
+        http_status, json=payload, headers={"Content-Type": 'application/json;charset="UTF-8"'}
+    )
+
+
 def _enrollment_user_records() -> list[dict]:
     """The A-shape record set: RightPlan[{doorNo,planTemplateNo:"1"}], Valid local,
     password present-but-empty (OBSERVED: `password:""` on all users — the probe
@@ -806,8 +846,6 @@ A_FD_ROWS: dict[str, bytes] = {
 A_FP_ROWS: dict[tuple[str, int], bytes] = {
     ("1", 0): _synthetic_template(FP_TEMPLATE_SIZE, FP_TEMPLATE_MAGIC, "fp:1:0"),
 }
-
-
 
 
 def _caps_user_info_body() -> dict:
@@ -955,6 +993,19 @@ class FakeDevice:
         #: (E1-03 default); a dict once `seed_biometric` arms store mode:
         #: {"faces": {employeeNo: bytes}, "fingerprints": {(employeeNo, fpIndex): bytes}}.
         self._biometric_store: dict[str, dict] | None = None
+        #: E1-04: None until `install_write_capture()` runs — the captured WRITE axis
+        #: (see the write block above). Un-armed means an un-armed write verb is a HARD
+        #: failure, which is the §9 capture-before-fake rule enforced by the fake.
+        self._write_axis: dict | None = None
+        #: False = `UserInfo/Search` SILENTLY IGNORES its `EmployeeNoList` filter and
+        #: answers the whole roster (OBSERVED's `AcsEventCond.employeeNo` lesson; bench A
+        #: honored it, §1). E1-04's §6 coverage-proof walker is tested against this.
+        self.honor_employee_filter = True
+        #: Persons the filtered read OMITS even though the store has them — the other
+        #: coverage failure §6 names (a filter honored but incomplete, so a requested
+        #: person looks "missing" when they are not). Kept separate from
+        #: `honor_employee_filter` because the walker's two arms differ.
+        self.filter_omits: set[str] = set()
         #: The recorded FDSearch paging quirk (bench A: one OK page answered 3 of 4
         #: rows). True = reproduce it on the first unfiltered store-mode page.
         self.fd_first_page_short = True
@@ -1350,9 +1401,7 @@ class FakeDevice:
         # honest zero is status "NoFP" with FingerPrintList ABSENT (not empty!).
         store: dict[tuple[str, int], bytes] = (self._biometric_store or {}).get("fingerprints", {})
         employee_no = str(cond["employeeNo"])
-        row_bytes = next(
-            (b for (no, _idx), b in store.items() if no == employee_no), None
-        )
+        row_bytes = next((b for (no, _idx), b in store.items() if no == employee_no), None)
         info: dict[str, object] = {"searchID": cond.get("searchID", "")}
         if row_bytes is not None:
             info["status"] = "OK"
@@ -1419,6 +1468,20 @@ class FakeDevice:
         """
         path = request.url.path
         is_post = request.method == "POST"
+        # A verb this fake has no capture for, on an enrollment path, is a HARD failure —
+        # never the catch-all 404, which an optimistic client could mistake for a
+        # harmless "endpoint absent" (E1-04; §0.7's silence rule pointed at writes).
+        if (
+            request.method not in ("GET", "POST")
+            and not path.startswith("/ISAPI/System/")
+            and self._write_axis is None
+        ):
+            raise EnrollmentProtocolError(
+                f"{request.method} {path}: the fake serves no non-GET/POST verb without "
+                "install_write_capture() arming the bench-A write axis (§9 capture-"
+                "before-fake) — a 404 here would be indistinguishable from success to "
+                "a client that trusts status codes"
+            )
         if is_post and self._enrollment_store is not None and path in _ENROLLMENT_SEARCH_PATHS:
             if path == "/ISAPI/AccessControl/UserInfo/Search":
                 return self._enroll_user_search(request)
@@ -1506,8 +1569,13 @@ class FakeDevice:
             return message_parameters_lack("searchID")
         rows = self._enrollment_rows("users", "UserInfo")
         wanted = _employee_no_filter(cond)
-        if wanted is not None:
-            rows = [r for r in rows if str(r.get("employeeNo")) in wanted]
+        if wanted is not None and self.honor_employee_filter:
+            rows = [
+                r
+                for r in rows
+                if str(r.get("employeeNo")) in wanted
+                and str(r.get("employeeNo")) not in self.filter_omits
+            ]
         return _paged_search_envelope(
             cond=cond, envelope_key="UserInfoSearch", record_key="UserInfo", matched=rows
         )
@@ -1627,6 +1695,221 @@ class FakeDevice:
             ),
         )
 
+    # -- the WRITE axis (card E1-04; bench-A capture PR #43) ------------------------------
+    #
+    # Every answer below is one of the committed capture files in
+    # tests/fixtures/recorded/site-a-ds-k1t341amf-s/enrollment/, and every rejection is
+    # either a captured envelope or a hard `EnrollmentProtocolError` saying "no capture
+    # for this shape". That is the §9 rule made structural: the fake has NO opinion the
+    # bench did not record. The two places where it must answer something the capture
+    # file set does not contain are marked INVENTED below and are documented in the card.
+
+    #: The captured UserInfo/SetUp key set (users_setup_add_request.json).
+    _USER_SETUP_KEYS = frozenset(
+        {
+            "employeeNo",
+            "name",
+            "userType",
+            "Valid",
+            "doorRight",
+            "RightPlan",
+            "localUIRight",
+            "gender",
+            "mode",
+        }
+    )
+    #: The person-read defaults the device adds (users_setup_readback_t90.json): the
+    #: read shape the fake replays after a write, so a test sees the device's own
+    #: defaults rather than an echo of what it sent.
+    _USER_READ_DEFAULTS: ClassVar[dict[str, object]] = {
+        "closeDelayEnabled": False,
+        "belongGroup": "",
+        "password": "",  # captured as an EMPTY string — a PIN never exists here
+        "maxOpenDoorTime": 0,
+        "openDoorTime": 0,
+        "roomNumber": 0,
+        "floorNumber": 0,
+        "numOfCard": 0,
+        "numOfFP": 0,
+        "numOfFace": 0,
+        "PersonInfoExtends": [{"value": ""}],
+    }
+
+    def install_write_capture(
+        self,
+        *,
+        users: list[dict] | None = None,
+        cards: list[dict] | None = None,
+        capacity: int | None = None,
+        honor_employee_filter: bool = True,
+        wipe_hazard: bool = True,
+    ) -> None:
+        """Arm the captured WRITE axis (E1-04). Without this call, no write is servable.
+
+        Seeding the person store is implied (a write has to land somewhere the search can
+        read back). Knobs, each modelling a device behaviour the capture recorded or the
+        design names:
+
+        * ``capacity`` — reject a NEW person past this count with the same
+          `businessError` family the capture's rejections use. INVENTED: no committed
+          capture shows a capacity rejection (§1 records true capacity as unexposed), so
+          this is a shape-stand-in for §5 step 4's fail-fast, not a recorded answer.
+        * ``honor_employee_filter=False`` — the `UserInfo/Search` `EmployeeNoList` filter
+          is SILENTLY IGNORED and the device answers the whole roster. Bench A honored
+          it (§1), but OBSERVED.md's `AcsEventCond.employeeNo` lesson is that this family
+          does exactly this on other filters, and §6's coverage-proof walker exists for
+          it — this knob is what proves the walker is not cargo-culted.
+        * ``wipe_hazard=False`` — disarm rule D-WIPE (see ``_write_user_delete``).
+        """
+        if self._enrollment_store is None:
+            self.seed_enrollment(users=users if users is not None else [], cards=cards or [])
+        self._write_axis = {
+            "capacity": capacity,
+            "wipe_hazard": wipe_hazard,
+        }
+        self.honor_employee_filter = honor_employee_filter
+
+    def _write_user_setup(self, request: httpx.Request) -> httpx.Response:
+        """`PUT UserInfo/SetUp` — replays users_setup_{add,post_method_not_allowed,
+        wrapped_list_400,put_record_405}.json and mutates the person store.
+
+        Rejections in capture order: verb (`POST` → the methodNotAllowed capture, which
+        the fixtures prove twice over), then the SINGULAR-`UserInfo` requirement (a
+        `userInfoList` wrapper → the captured `lack employeeNo` businessError), then the
+        required employeeNo, then a key the capture does not name (INVENTED answer:
+        `badJsonContent` naming the key, the same envelope class the FP capture used for
+        a wrong-typed field), then capacity (INVENTED, see ``install_write_capture``).
+        """
+        assert self._write_axis is not None and self._enrollment_store is not None
+        if request.method != "PUT":
+            return _json_error(_capture("users_setup_post_method_not_allowed.json"))
+        body = _json_body(request)
+        if not body:
+            return _bad_json("UserInfo")
+        if "userInfoList" in body:  # the wrapped form the device 400s (captured)
+            return _json_error(_capture("users_setup_wrapped_list_400.json"))
+        record = body.get("UserInfo")
+        if not isinstance(record, dict):
+            raise EnrollmentProtocolError(
+                "PUT UserInfo/SetUp without a singular 'UserInfo' object has NO bench-A "
+                "capture (users_setup_add_request.json is the only recorded shape); "
+                "refusing to invent an answer for it (§9 capture-before-fake)"
+            )
+        if record.get("mode") != "add":
+            raise EnrollmentProtocolError(
+                f"UserInfo/SetUp mode {record.get('mode')!r} has no bench-A capture — "
+                'only "add" was proven (OBSERVED.md §5.0). v1 never deletes (§5 step 8); '
+                "no modify mode was recorded, so the fake refuses to guess one"
+            )
+        employee_no = record.get("employeeNo")
+        if not isinstance(employee_no, str) or not employee_no:
+            return _json_error(_capture("users_setup_wrapped_list_400.json"))
+        unknown = sorted(set(record) - self._USER_SETUP_KEYS)
+        if unknown:
+            # INVENTED answer (captured envelope class): R2's reason for the allow-list is
+            # that this family 400s or half-merges an unrecorded key. A fake that accepted
+            # an echoed photoURL/counter would hide exactly that bug.
+            return _bad_json(unknown[0])
+        people: list[dict] = self._enrollment_store["UserInfo"]
+        existing = next(
+            (i for i, r in enumerate(people) if str(r.get("employeeNo")) == employee_no), None
+        )
+        if (
+            existing is None
+            and self._write_axis["capacity"] is not None
+            and len(people) >= int(self._write_axis["capacity"])
+        ):
+            # INVENTED (no capture of a capacity rejection — §1: true capacity is
+            # unexposed). Envelope class + vocabulary taken from the captures so the
+            # client's rejection handling is what the test exercises, not the wording.
+            return _json_error(
+                {
+                    "statusCode": 6,
+                    "statusString": "Invalid Content",
+                    "subStatusCode": "businessError",
+                    "errorCode": 1610612761,
+                    "errorMsg": "employeeNo",
+                }
+            )
+        stored = {k: v for k, v in record.items() if k != "mode"}
+        stored.update(
+            {k: copy.deepcopy(v) for k, v in self._USER_READ_DEFAULTS.items() if k not in stored}
+        )
+        if existing is None:
+            people.append(stored)
+        else:
+            # Capture is silent on SetUp-over-existing (R2); the fake keeps the person's
+            # identity stable and replaces the fields the write named, which is the least
+            # inventive reading and is what the tests' "restore" steps rely on.
+            people[existing] = stored
+        return _json_ok(_capture("users_setup_add_response.json"))
+
+    def _write_user_delete(self, request: httpx.Request) -> httpx.Response:
+        """Rule D-WIPE reproduced EXACTLY as captured (userinfo_delete_wipe_*).
+
+        The list sitting in a SIBLING `UserInfoDelCond` instead of inside `UserInfoDetail`
+        answers statusCode 1 and deletes EVERY person (bench A lost its whole roster this
+        way). A delete fake that just obeyed would teach a client nothing about the one
+        hazard that matters, so this handler WIPES — count and faces — and says OK.
+        """
+        assert self._write_axis is not None and self._enrollment_store is not None
+        body = _json_body(request)
+        detail = body.get("UserInfoDetail")
+        if not isinstance(detail, dict) or detail.get("mode") != "delete":
+            raise EnrollmentProtocolError(
+                "a UserInfo delete whose list sits inside UserInfoDetail (the shape the "
+                "orchestrator recorded as safe) has NO committed response fixture, so "
+                "the fake refuses to invent an answer for it; the captured D-WIPE shape "
+                "is the one this route serves (§9 capture-before-fake, §5b)"
+            )
+        if not self._write_axis["wipe_hazard"]:
+            return _json_ok(_capture("userinfo_delete_wipe_response.json"))
+        self._enrollment_store["UserInfo"] = []
+        self._enrollment_store["CardInfo"] = []
+        if self._biometric_store is not None:
+            # The capture cascade-dropped faces with the roster (OBSERVED.md: the wipe
+            # "cascade-dropped all faces"), so the fake does too.
+            self._biometric_store["faces"] = {}
+        return _json_ok(_capture("userinfo_delete_wipe_response.json"))
+
+    def _dispatch_write(self, request: httpx.Request) -> httpx.Response | None:
+        """PUT routing for the captured write axis; hard-fails when it is not armed.
+
+        An un-armed write verb is a HARD failure, never a 404: a 404 is what an absent
+        endpoint says, and a client that mistook one for a successful no-op would then
+        report a write that never happened (§0.7's silence rule, pointed at writes).
+        """
+        path = request.url.path
+        if path == USER_SETUP_PATH:
+            if self._write_axis is None:
+                raise EnrollmentProtocolError(
+                    f"{request.method} {path} has no bench-A write truth armed: call "
+                    "FakeDevice.install_write_capture() (fixtures from PR #43) — a write "
+                    "route that answers without its capture is the false-green machine "
+                    "design §9 names"
+                )
+            return self._write_user_setup(request)
+        if path == "/ISAPI/AccessControl/UserInfoDetail/Delete":
+            if self._write_axis is None:
+                raise EnrollmentProtocolError(
+                    f"PUT {path} (rule D-WIPE) needs install_write_capture() armed; E1-05 "
+                    "owns the delete PATH, and no delete may be sent before its count-"
+                    "delta guard exists (§5b)"
+                )
+            return self._write_user_delete(request)
+        for write_path in (
+            "/ISAPI/AccessControl/CardInfo/SetUp",
+            "/ISAPI/Intelligent/FDLib/FDSetUp",
+            "/ISAPI/AccessControl/FingerPrintDownload",
+        ):
+            if path == write_path:
+                raise EnrollmentProtocolError(
+                    f"{request.method} {write_path} belongs to a LATER card (E1-05 cards, "
+                    "E1-06 faces, E1-06b fingerprints); its capture is committed but its "
+                    "fake route is not written yet, and E1-04 must not pre-build it (§9)"
+                )
+        return None
+
     def _handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.raw_path.decode()
         key = _key(request.method, path)
@@ -1720,6 +2003,14 @@ class FakeDevice:
         # registered for this path (an explicit `add`/`reset` still wins — a test
         # that wants to override one enrollment answer can, exactly like the event
         # store).
+        if queue is None and not store_answers:
+            # E1-04 write axis: the captured write verbs only (PUT). Raises HARD when a
+            # write verb has no capture armed — never a 404 an optimistic client could
+            # read as "fine". An explicit `add`/`reset` route still wins, like the event
+            # store and the enrollment axis.
+            written = self._dispatch_write(request)
+            if written is not None:
+                return written
         if queue is None and not store_answers:
             enrolled = self._dispatch_enrollment(request)
             if enrolled is not None:

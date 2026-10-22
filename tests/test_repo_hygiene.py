@@ -99,9 +99,7 @@ def test_no_env_file_in_the_working_tree() -> None:
 
 # --- enrollment fixtures: identity + biometric bytes are the crown jewels -------------
 
-ENROLLMENT_FIXTURES = (
-    TESTS / "fixtures" / "recorded" / "site-a-ds-k1t341amf-s" / "enrollment"
-)
+ENROLLMENT_FIXTURES = TESTS / "fixtures" / "recorded" / "site-a-ds-k1t341amf-s" / "enrollment"
 #: Recorded names must be the synthetic convention, never a real enrollee name.
 SANITIZED_NAME = re.compile(r"^User (?:E\d+|T90|E\?)$")
 #: A real face/FP template is hundreds of bytes of base64; a recorded placeholder is tiny.
