@@ -1,0 +1,12 @@
+{
+ "FingerPrintStatus": {
+  "StatusList": [
+   {
+    "id": 1,
+    "cardReaderRecvStatus": 5,
+    "errorMsg": "1"
+   }
+  ],
+  "totalStatus": 1
+ }
+}

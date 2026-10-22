@@ -1,0 +1,40 @@
+{
+ "FingerPrintCfg": {
+  "employeeNo": {
+   "@min": 1,
+   "@max": 32
+  },
+  "enableCardReader": {
+   "@min": 1,
+   "@max": 2
+  },
+  "fingerPrintID": {
+   "@min": 1,
+   "@max": 10
+  },
+  "fingerType": {
+   "@opt": "normalFP,hijackFP,patrolFP,superFP"
+  },
+  "leaderFP": {
+   "@min": 1,
+   "@max": 1
+  },
+  "StatusList": {
+   "id": {
+    "@min": 1,
+    "@max": 2
+   },
+   "cardReaderRecvStatus": {
+    "@opt": "0,1,2,3,4,5,6,7,8"
+   },
+   "errorMsg": {
+    "@min": "0",
+    "@max": "32"
+   }
+  },
+  "totalStatus": {
+   "@opt": "0,1"
+  },
+  "isSupportSetUp": "true"
+ }
+}

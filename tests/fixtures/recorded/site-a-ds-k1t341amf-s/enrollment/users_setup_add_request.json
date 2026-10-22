@@ -1,0 +1,23 @@
+{
+ "UserInfo": {
+  "employeeNo": "90",
+  "name": "User T90",
+  "userType": "normal",
+  "Valid": {
+   "enable": true,
+   "beginTime": "2000-01-01T00:00:00",
+   "endTime": "2037-12-31T23:59:59",
+   "timeType": "local"
+  },
+  "doorRight": "1",
+  "RightPlan": [
+   {
+    "doorNo": 1,
+    "planTemplateNo": "1"
+   }
+  ],
+  "localUIRight": false,
+  "gender": "unknown",
+  "mode": "add"
+ }
+}

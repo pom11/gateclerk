@@ -1,0 +1,15 @@
+{
+ "statusCode": 1,
+ "statusString": "OK",
+ "subStatusCode": "ok",
+ "responseStatusStrg": "OK",
+ "numOfMatches": 1,
+ "totalMatches": 1,
+ "MatchList": [
+  {
+   "FPID": "90",
+   "faceURL": "http://<device-a>/LOCALS/pic/enrlFace/0/0000000005.jpg@WEB000000000027",
+   "modelData": "RlI1MDAwMDUBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  }
+ ]
+}

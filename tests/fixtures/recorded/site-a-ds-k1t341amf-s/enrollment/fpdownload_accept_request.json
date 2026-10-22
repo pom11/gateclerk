@@ -1,0 +1,11 @@
+{
+ "FingerPrintCfg": {
+  "enableCardReader": [
+   1
+  ],
+  "employeeNo": "90",
+  "fingerPrintID": 1,
+  "fingerType": "normalFP",
+  "fingerData": "MzAxQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJD"
+ }
+}

@@ -1,0 +1,12 @@
+{
+ "UserInfoDetail": {
+  "mode": "delete"
+ },
+ "UserInfoDelCond": {
+  "EmployeeNoList": [
+   {
+    "employeeNo": "90"
+   }
+  ]
+ }
+}

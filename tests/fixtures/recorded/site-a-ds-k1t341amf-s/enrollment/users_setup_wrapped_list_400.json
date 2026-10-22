@@ -1,0 +1,7 @@
+{
+ "statusCode": 6,
+ "statusString": "Invalid Content",
+ "subStatusCode": "MessageParametersLack",
+ "errorCode": 1610612761,
+ "errorMsg": "employeeNo"
+}

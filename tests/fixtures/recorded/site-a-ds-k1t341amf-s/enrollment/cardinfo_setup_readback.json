@@ -1,0 +1,16 @@
+{
+ "CardInfoSearch": {
+  "searchID": "capc1",
+  "responseStatusStrg": "OK",
+  "numOfMatches": 1,
+  "totalMatches": 1,
+  "CardInfo": [
+   {
+    "employeeNo": "90",
+    "cardNo": "90000090",
+    "leaderCard": "",
+    "cardType": "normalCard"
+   }
+  ]
+ }
+}

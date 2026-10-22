@@ -9,7 +9,9 @@ to ban it, and keeps catching the mistake after the first live smoke run.
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -93,3 +95,51 @@ def test_no_env_file_in_the_working_tree() -> None:
         if p.name.startswith(".env") and p.name != ".env.example"
     ]
     assert not stray, f"credential file present in the working tree: {stray}"
+
+
+# --- enrollment fixtures: identity + biometric bytes are the crown jewels -------------
+
+ENROLLMENT_FIXTURES = (
+    TESTS / "fixtures" / "recorded" / "site-a-ds-k1t341amf-s" / "enrollment"
+)
+#: Recorded names must be the synthetic convention, never a real enrollee name.
+SANITIZED_NAME = re.compile(r"^User (?:E\d+|T90|E\?)$")
+#: A real face/FP template is hundreds of bytes of base64; a recorded placeholder is tiny.
+MAX_RECORDED_TEMPLATE_B64 = 120
+
+
+@pytest.mark.skipif(not ENROLLMENT_FIXTURES.is_dir(), reason="enrollment fixtures not present")
+def test_enrollment_fixtures_have_no_real_names_or_template_bytes() -> None:
+    """The write-path fixtures prove SHAPES, not enrollees.
+
+    A captured person name or a genuine face/fingerprint template must never ship:
+    names collapse to the ``User E<n>``/``User T90`` convention and biometric bytes
+    collapse to a short synthetic placeholder. This is the E1 PII spine — faces are
+    the product, so their raw bytes are the most sensitive thing in the repo.
+    """
+    bad_names: list[str] = []
+    bad_templates: list[str] = []
+    for path in sorted(ENROLLMENT_FIXTURES.glob("*.json")):
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        rel = path.relative_to(REPO_ROOT)
+        for name in _walk_values(blob, "name"):
+            if not isinstance(name, str) or not SANITIZED_NAME.match(name):
+                bad_names.append(f"{rel}: name={name!r}")
+        templates = list(_walk_values(blob, "modelData")) + list(_walk_values(blob, "fingerData"))
+        for tpl in templates:
+            if isinstance(tpl, str) and len(tpl) > MAX_RECORDED_TEMPLATE_B64:
+                bad_templates.append(f"{rel}: {len(tpl)}-byte template")
+    assert not bad_names, "unsanitized enrollee name in fixtures: " + "; ".join(bad_names)
+    assert not bad_templates, "real biometric bytes in fixtures: " + "; ".join(bad_templates)
+
+
+def _walk_values(node: object, key: str) -> Iterator[object]:
+    """Collect every value stored under ``key`` anywhere in a JSON tree."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key:
+                yield v
+            yield from _walk_values(v, key)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_values(item, key)
