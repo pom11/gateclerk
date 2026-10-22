@@ -190,6 +190,20 @@ required on apply targets:
 
 ## 5. Write path (idempotent, ordered, probe-gated)
 
+> **§5.0 RESULTS (capture session 2026-10-22, bench A; OBSERVED.md "E1 §5.0
+> WRITE-PATH CAPTURE"):** users `PUT UserInfo/SetUp` flat-under-wrapper +
+> `mode:"add"` **PROVEN**; cards `PUT CardInfo/SetUp` same dialect **PROVEN**;
+> faces `PUT FDSetUp` FLAT `{faceLibType,FDID,FPID,modelData}` **PROVEN** (R1 —
+> read-back template identical, incl. a full wipe→restore round-trip with
+> matching content hashes); FP write `POST FingerPrintDownload`
+> `{"FingerPrintCfg":{"enableCardReader":[1],…,"fingerData":…}}` **accepted but
+> NEVER APPLIED** — `FingerPrintProgress` shows `cardReaderRecvStatus:5` (bench
+> reader rejects the third-party-family template): E1-06b is report-only on this
+> evidence class, write-fake may only be built to the captured accept/reject
+> shapes. **The capture also found a SILENT-WIPE hazard: `UserInfoDetail/Delete`
+> with `mode:"delete"` and the employee list in the WRONG slot deleted EVERY
+> user.** See §5b rule D-WIPE before any delete code is written.
+
 `apply --bundle B --target T --apply` (without `--apply`: dry-run only — the writing
 flag must be explicit).
 
@@ -278,6 +292,18 @@ trust):
 - for `overwrite`-class entries, undo RESTORES the journal's pre-write record
   (restore-before-delete), re-verified by read-back;
 - undo is itself budgeted (§5.3 math), verified by re-read, and gets its own journal.
+
+**§5b rule D-WIPE (capture 2026-10-22; bench A lost every user to this).** A delete
+request whose target-list is NOT in the slot the device reads is not a no-op — the
+device ignores the unknown slot and deletes ALL. Therefore no delete may be sent
+until its EXACT list-slot shape has been captured on that device class, and every
+delete is wrapped: (a) `UserInfo/Count` before + after, (b) read-back of the named
+employeeNos, (c) if the after-count dropped by MORE than the named list, treat as an
+incident: stop everything, restore from the pre-run bundle (§2 export runs before
+any write, always), escalate. The fake enforces the hazard: a delete body whose list
+sits in a slot the captured shape does not name must answer statusCode 1 AND wipe the
+whole store — a delete fake that only ever deletes what it is told teaches nothing.
+Face/card deletes (captured-safe shapes) carry the same count-delta guard.
 
 ## 6. Read-back verify (never trust the write's status code)
 

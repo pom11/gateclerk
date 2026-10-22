@@ -331,5 +331,60 @@ fingerData) are never committed here or in fixtures — shape/size/hash-prefix o
   modelMaxNum 1, **isSuportFDSearch=false while FDSearch demonstrably WORKS** —
   caps UNDER-claim on this fw; record caps as values, infer availability only from
   the call itself.
+
+## E1 §5.0 WRITE-PATH CAPTURE (bench A, 2026-10-22, orchestrator session)
+
+One session, bounded attempts (the device PARSED every write attempt — zero 401s,
+lockout axis clean). Artifacts: `~/gateclerk-data/capture/*.json` + three bundles
+(pre-capture / post-restore / restored). Test person 90 / card 90000090 only.
+
+- **Users WRITE — PROVEN (R0):** `PUT /ISAPI/AccessControl/UserInfo/SetUp?format=json`
+  body `{"UserInfo":{"employeeNo":…,"name":…,"userType":…,"Valid":{…},"doorRight":…
+  ,"RightPlan":[…],"localUIRight":…,"gender":…,"mode":"add"}}` — fields DIRECT under
+  `UserInfo` (NOT a `userInfoList`), `mode` REQUIRED (capital "Add" 400s, lowercase
+  `add` ok — same dialect lesson as users-search wrapper). POST SetUp →
+  `methodNotAllowed`; POST/PUT `UserInfo/Record` → 400/405. Read-back exact.
+- **Cards WRITE — PROVEN:** `PUT CardInfo/SetUp?format=json`
+  `{"CardInfo":{"employeeNo":"90","cardNo":"90000090","cardType":"normalCard","mode":"add"}}`
+  — flat-under-wrapper + `mode:"add"`, first try. Read-back CardInfo/Search OK 1.
+- **Faces WRITE — PROVEN (R1, the product):** `PUT /ISAPI/Intelligent/FDLib/FDSetUp
+  ?format=json` FLAT body `{"faceLibType":"blackFD","FDID":"1","FPID":"<emp>",
+  "modelData":"<b64>"}` → statusCode 1; FDSearch FPID read-back returned the
+  **identical** template. 4/4 re-added during restore with identical sha12 per
+  person (cef00e3b92d4/ce61e7037d5a/3a494b0ffdc5/5cd40292445e) — face port
+  end-to-end works on the bench.
+- **Fingerprints WRITE — API-ACCEPTED, NEVER APPLIED (bench A).**
+  `POST FingerPrintDownload` `{"FingerPrintCfg":{"enableCardReader":[1],
+  "employeeNo":…,"fingerPrintID":1,"fingerType":"normalFP","fingerData":<b64>}}`
+  answers statusCode 1 (`enableCardReader` = **list of reader numbers**; int/str
+  both `badJsonContent`; caps `FingerPrintCfg/capabilities` works and is the
+  vocabulary source — `FingerPrint/capabilities` and …/Download/capabilities 404).
+  But read-back stays `NoFP`, `numOfFP` stays 0, and the doc-listed progress
+  endpoint `GET FingerPrintProgress?format=json` answers
+  `StatusList:[{id:1,cardReaderRecvStatus:5,errorMsg:"1"}] totalStatus:1` — the
+  **attached reader REJECTS the template** (third-party "301" sensor family, §1;
+  bench A's own enrolled FP came from the device's own capture). E1-06b verdict:
+  port stays same-sensor-family-AND-same-capture-path; on bench A the honest
+  outcome is report-only. `FingerPrintCfg` (GET/POST) and delete-caps: notSupport.
+- **DELETE — THE SILENT-WIPE HAZARD (the session's worst lesson):** the accepted
+  person-delete shape is `PUT UserInfoDetail/Delete?format=json`
+  `{"UserInfoDetail":{"mode":"delete"},"UserInfoDelCond":{"EmployeeNoList":[…]}}`
+  — but bench A **IGNORED the sibling `UserInfoDelCond` and deleted EVERY user**
+  (and cascade-dropped all faces; the just-added 90 was collateral): `UserInfo/
+  Count → 0`, FDSearch → 0 rows. Any `mode:"delete"` shape with the list in the
+  WRONG slot is a wipe, not a no-op. RESTORE: re-added 4 users + 4 face templates
+  from the pre-capture bundle via the captured write shapes; post-restore export
+  has **identical per-person content hashes and faces index digest** (cards were 0
+  pre-session anyway; the one FP never re-applies — bench reader rejects it).
+  10,351 events survived untouched (separate log). RECOVERY PROOF: this is E1's
+  restore path proven on the real box, with the export→verify loop doing the check.
+- **Other delete verbs (captured):** face `PUT FDSearch/Delete?format=json&FDID=1
+  &faceLibType=blackFD` body `{"FPID":[{"value":"90"}]}` (verified NO MATCH after);
+  card `PUT CardInfo/Delete?format=json` `{"CardInfoDelCond":{"CardNoList":[…],
+  "EmployeeNoList":[…]}}` (verified 0 after — wrapper + DelCond keys from caps).
+  UserInfoDetail/DeleteProcess → 404 deviceError (no progress surface).
+- Test-person hygiene: person 90 + card 90000090 were the only writes; both gone
+  by session end (90 via the wipe + re-add path: it was NOT re-added after — the
+  roster is exactly the original 1,2,3,4).
 - Policy reaffirmed: no device re-probes on a settled axis (lockout accounting);
   the 404-faceURL question is CLOSED as dead-end after the bounded rounds above.

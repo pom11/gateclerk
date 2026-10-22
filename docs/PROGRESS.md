@@ -607,3 +607,31 @@ device truth: docs/OBSERVED.md.)
   committed -> unblocks E1-04 t_bbddb8f5 (capture-before-fake: no write fake route
   before its fixture).
 
+
+## 2026-10-22 — E1 §5.0 write-path capture session (orchestrator, bench A)
+
+Operator-ordered session ran AFTER the four-PR stack merged (#37 #38 #40 #39, all
+squash-merged with tree-identity proof; two capture-found reader bugs fixed and
+merged first — PR #41 FDSearch root dialect `MatchList`, PR #42 FingerPrintUpload
+one-shot read; main green at 1640).
+
+- Phase 0: pre-capture bundle via MERGED `export_full_bundle` (4 users / 4 faces /
+  1 FP / 0 cards) — the rollback source. Landed OUTSIDE every git repo (the
+  repo-out guard correctly refused `~/gateclerk/bundles`; root is `~/gateclerk-data`).
+- Captured (details + bodies in OBSERVED.md "E1 §5.0 WRITE-PATH CAPTURE"): users
+  `PUT UserInfo/SetUp` flat+mode:add PROVEN; cards `PUT CardInfo/SetUp` PROVEN;
+  **faces `PUT FDSetUp` flat {faceLibType,FDID,FPID,modelData} PROVEN — R1 works**,
+  read-back template identical; FP write accepted-but-never-applied
+  (`FingerPrintProgress cardReaderRecvStatus:5` — bench reader rejects the
+  third-party-family template): E1-06b = report-only on this class.
+- INCIDENT (honest, in OBSERVED.md + design §5b D-WIPE): the accepted-shape person
+  delete wiped EVERY user (device ignored the wrong-slot EmployeeNoList).
+  RESTORE from the phase-0 bundle via the captured write shapes: post-restore
+  export has identical per-person content hashes + identical faces index digest;
+  person-1's single FP is the only unrecoverable record (bench reader rejects
+  re-applying it — it came from the device's own capture originally). 10,351
+  events untouched (separate log). Zero auth errors all session; no lockout axis
+  touched. E1's own export→restore loop is now PROVEN on the real box.
+- Next: E1-04 t_bbddb8f5 unblocked (fixtures exist) — dispatch with the §5b D-WIPE
+  rule + captured bodies as fixtures; E1-06 report-only-fallback condition NOT
+  triggered (face fixture exists); E1-06b built to accept/reject captured shapes.
