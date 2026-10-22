@@ -635,3 +635,24 @@ one-shot read; main green at 1640).
 - Next: E1-04 t_bbddb8f5 unblocked (fixtures exist) — dispatch with the §5b D-WIPE
   rule + captured bodies as fixtures; E1-06 report-only-fallback condition NOT
   triggered (face fixture exists); E1-06b built to accept/reject captured shapes.
+
+## 2026-10-22 (later) — E1-04 merged; user-delete axis CLOSED; 05/06/06b dispatched
+
+PR #44 (E1-04 write foundation) gated (1720 passed, ruff + format clean; 4/5
+mutation probes killed, the two survivors proven dead-defensive/redundant like #38's
+MutC) and squash-merged as d2086b8. E1-04 done closes the whole foundation chain
+(01/01b/02/03/04).
+
+A bounded second capture session (throwaway person 91) CLOSED the targeted-user-delete
+axis with a second reproduced WIPE: even the documented mode:"deleteByEmployeeNo" with
+the list in the sibling UserInfoDelCond returns ok and deletes EVERY user; the
+list-inside wrapper 400s under every mode. No accepted targeted user-delete exists on
+this fw → design rule §5b.1 (user delete banned outright; users-phase undo is
+report-only; card/face deletes remain targeted+guarded). Bench A restored a third
+time from the pre-capture bundle (re-export: 4 users/4 faces, hashes + face bytes
+identical; person-1 FP archived in the bundle, un-re-applicable on bench A by the
+accepted-not-applied rule). OBSERVED + design committed 1ccc6e6.
+
+Dispatched the three E1-04 children (all parents satisfied, fixtures merged via #43):
+E1-05 cards t_8ed04ad5, E1-06 faces t_d2487aef (critical path), E1-06b fingerprints
+t_c3f04cfe — running. E1-07 CLI wiring follows after those three merge.
