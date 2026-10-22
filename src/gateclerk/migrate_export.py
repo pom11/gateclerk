@@ -24,7 +24,9 @@ E1-01b adds the two biometric READS that are the product (operator, v4):
   bytes: base64 as the device sent it, sha256/length over the decoded form, never
   parsed. `FPID` joins to `employeeNo` by opaque string equality (§1).
 * `export_fingerprints()` reads `FingerPrintUpload` (misleading device name:
-  device->client) per employee, fpIndex by fpIndex, until the device's stop shape.
+  device->client) per employee, ONE read each — bench A's capture (2026-10-22) shows
+  the endpoint IGNORES fpIndex (0/1/2 answered the same template), and a person's
+  zero is the device's own `status: "NoFP"` with the list absent.
   Templates are opaque exactly like faces; the sensor-family NOTE is a label about
   the header bytes, not a parse of them (§1 same-family rule).
 
@@ -116,18 +118,18 @@ FP_ENVELOPE_KEY = "FingerPrintInfo"
 FP_RECORD_KEY = "FingerPrintList"
 FP_DATA_TYPE = "template"
 
-#: Stop label recorded when every employee's fpIndex walk ended on the device's
-#: empty-`FingerPrintList` answer. NOT device vocabulary — the FingerPrintUpload
-#: response was probed WITHOUT a `responseStatusStrg`, so the manifest records an
-#: engine-side label rather than inventing a device word (reviewer question #2 in
-#: the PR body explains why the empty list, not a 404, is the stop shape).
-FP_STOP_LABEL = "OK-EMPTY-LIST"
+#: Walk-completion label: every roster employee got a definitive per-person answer
+#: (a template row or the device's `NoFP`). ONE-SHOT is the captured truth — there
+#: is no fpIndex walk anymore (§5.0 capture 2026-10-22, OBSERVED.md: bench A
+#: IGNORES `fpIndex` on the read — fpIndex 0/1/2 all answered the SAME template with
+#: `fingerPrintID=1` — so a "walk until empty list" reads one person forever and
+#: correctly self-aborts on the old runaway guard; the guard was the premise dying).
+FP_STOP_LABEL = "ONE-SHOT-COMPLETE"
 
-#: Runaway guard for the per-person fpIndex walk: A's UserInfo caps never recorded
-#: a per-person FP capacity, and a device that answers a template for EVERY fpIndex
-#: is misbehaving. Exceeding the guard ABORTS (fail closed) — it is a cap on how
-#: long we knock, never a truncation of the answer.
-MAX_FP_TEMPLATES_PER_PERSON = 10
+#: The device's OWN zero word, captured 2026-10-22 on a person without a
+#: fingerprint: `FingerPrintInfo.status == "NoFP"` with `FingerPrintList` ABSENT.
+#: Anything else that lacks a list is a protocol break, not a zero (§0.7).
+FP_DEVICE_NO_FP = "NoFP"
 
 #: The sensor-family NOTE recorded when a template's first three bytes are the ASCII
 #: `301` bench A's fingerprints carried (OBSERVED.md: "third-party sensor family,
@@ -544,26 +546,25 @@ def export_fingerprints(
     sleep: Callable[[float], None] = time.sleep,
     pacing_clock: Callable[[], float] = time.monotonic,
 ) -> FingerprintWalk:
-    """Read FingerPrintUpload per employeeNo, fpIndex 0..N, until the device's stop shape.
+    """Read FingerPrintUpload ONE time per employeeNo — the captured device truth.
 
-    The endpoint is a one-shot read, not a paged search (no searchID cursor semantics
-    were probed on it), so this is a bounded per-person loop through the same
-    registry-guarded seam. The shapes are the probed ones (§1): the
-    `FingerPrintCond` wrapper is REQUIRED (the plain form 400s
-    `MessageParametersLack FingerPrintCond`), rows arrive under
-    `FingerPrintInfo.FingerPrintList`.
+    The §5.0 capture (bench A, 2026-10-22) killed the fpIndex-walk premise the v4
+    design carried: the endpoint IGNORES `fpIndex` on reads (0, 1 and 2 all answered
+    the SAME 512 B template with `fingerPrintID: 1`), so "read until the empty list"
+    on a real person is a loop that never terminates — which is exactly how the
+    first live export found this, self-aborting on its own runaway guard with no
+    bundle written and no data guessed. One read per person, one definitive answer:
 
-    Stop rule (PR-body reviewer question #2, stated honestly): the probed response
-    carries NO `responseStatusStrg`, so there is no device word for "no more". The
-    stop shape pinned here is a 200 whose `FingerPrintInfo` has an absent-or-empty
-    `FingerPrintList` (`FP_STOP_LABEL` records that as an ENGINE label, not device
-    vocabulary). Everything else continues the fail-closed side: a missing envelope,
-    a non-list record key, a multi-row answer (the probed shape is one row per read)
-    or any transport/`statusCode` error aborts the export naming the person and
-    index — "empty" is only ever the device's own empty list, never our error path.
-
-    `MAX_FP_TEMPLATES_PER_PERSON` caps how long we knock per person; exceeding it
-    aborts (a runaway guard never truncates an answer, same rule as max_pages).
+    * `FingerPrintCond` wrapper REQUIRED (the plain form 400s
+      `MessageParametersLack FingerPrintCond`, §1 — still true post-capture);
+    * a template row => the person's fingerprint (fingerPrintID must be 1, the
+      captured constant; anything else means fpIndex means something on THAT box
+      that we have no evidence for — fail closed rather than port a guess);
+    * the device's OWN zero => `status: "NoFP"` with `FingerPrintList` absent — the
+      ONLY listless answer accepted as "no fingerprint"; any other missing/empty
+      list, missing envelope, multi-row answer, or transport/`statusCode` error
+      aborts the export naming the person. Absence is only ever the device's own
+      word, never our error path (§0.7).
     """
     read = _search_reader(client, "finger_print_upload")
     files: list[tuple[str, int, str]] = []
@@ -571,83 +572,93 @@ def export_fingerprints(
     issued = False
     last_seen = pacing_clock()
     for employee_no in sorted({str(no) for no in employee_nos}):
-        for fp_index in range(MAX_FP_TEMPLATES_PER_PERSON + 1):
-            if issued:
-                # Space request STARTS like the paging engine does (small box,
-                # serial sessions) — including the first read of a new person.
-                wait = inter_request_delay - (pacing_clock() - last_seen)
-                if wait > 0:
-                    sleep(wait)
-            issued = True
-            body = {
-                FP_COND_KEY: {
-                    "searchID": new_search_id(),
-                    "employeeNo": employee_no,
-                    "fpIndex": fp_index,
-                    "dataType": FP_DATA_TYPE,
-                }
+        if issued:
+            # Space request STARTS like the paging engine does (small box,
+            # serial sessions) — including the first read of a new person.
+            wait = inter_request_delay - (pacing_clock() - last_seen)
+            if wait > 0:
+                sleep(wait)
+        issued = True
+        body = {
+            FP_COND_KEY: {
+                "searchID": new_search_id(),
+                "employeeNo": employee_no,
+                "fpIndex": 0,
+                "dataType": FP_DATA_TYPE,
             }
-            last_seen = pacing_clock()
-            try:
-                response = read(body)
-            except GateclerkError as exc:
-                # Includes the 400 MessageParametersLack family: if the wrapper we
-                # send stops being accepted, that is a protocol break, not "no FP".
-                raise _abort(
-                    "finger_print_upload",
-                    f"employeeNo {employee_no!r} fpIndex {fp_index}: {exc}",
-                    cause=exc,
-                ) from exc
-            info = response.get(FP_ENVELOPE_KEY)
-            if not isinstance(info, Mapping):
-                raise _abort(
-                    "finger_print_upload",
-                    f"employeeNo {employee_no!r} fpIndex {fp_index}: response has no "
-                    f"{FP_ENVELOPE_KEY!r} envelope — reading a protocol break as 'no more "
-                    "fingerprints' is the silence §0.7 refuses",
-                )
-            rows = info.get(FP_RECORD_KEY)
-            if rows is None or rows == []:
-                break  # the pinned stop shape: the device's OWN empty list
-            if not isinstance(rows, list) or len(rows) != 1:
-                raise _abort(
-                    "finger_print_upload",
-                    f"employeeNo {employee_no!r} fpIndex {fp_index}: {FP_RECORD_KEY} is "
-                    f"{type(rows).__name__} with {len(rows) if isinstance(rows, list) else '?'} "
-                    "row(s); the probed shape is exactly one (OBSERVED.md) — refusing to "
-                    "guess which row is the person's",
-                )
-            row = rows[0]
-            if not isinstance(row, Mapping):
-                raise _abort(
-                    "finger_print_upload",
-                    f"employeeNo {employee_no!r} fpIndex {fp_index}: row is "
-                    f"{type(row).__name__}, not an object",
-                )
-            raw, digest = _decoded_length(
-                "finger_print_upload", employee_no, row.get("fingerData"), "fingerData"
-            )
-            files.append((employee_no, fp_index, str(row["fingerData"])))
-            entries.append(
-                FingerprintTemplate(
-                    employee_no=employee_no,
-                    fp_index=fp_index,
-                    sha256=digest,
-                    length=len(raw),
-                    sensor_family=_sensor_family_note(raw),
-                )
-            )
-        else:
-            # The inner loop ended WITHOUT the stop shape: the device answered a
-            # template for EVERY fpIndex we asked (0..MAX). That is a runaway, and a
-            # runaway guard must never truncate an answer — abort (same rule as the
-            # paging engine's max_pages cap).
+        }
+        last_seen = pacing_clock()
+        try:
+            response = read(body)
+        except GateclerkError as exc:
+            # Includes the 400 MessageParametersLack family: if the wrapper we
+            # send stops being accepted, that is a protocol break, not "no FP".
             raise _abort(
                 "finger_print_upload",
-                f"employeeNo {employee_no!r} answered a template for every fpIndex up to "
-                f"{MAX_FP_TEMPLATES_PER_PERSON} — a device that never says stop is "
-                "misbehaving; aborting instead of guessing where the list ends",
+                f"employeeNo {employee_no!r}: {exc}",
+                cause=exc,
+            ) from exc
+        info = response.get(FP_ENVELOPE_KEY)
+        if not isinstance(info, Mapping):
+            raise _abort(
+                "finger_print_upload",
+                f"employeeNo {employee_no!r}: response has no {FP_ENVELOPE_KEY!r} "
+                "envelope — reading a protocol break as 'no fingerprints' is the "
+                "silence §0.7 refuses",
             )
+        rows = info.get(FP_RECORD_KEY)
+        status = str(info.get("status") or "")
+        if rows is None or rows == []:
+            # The CAPTURED zero (bench A 2026-10-22): `status: "NoFP"`, list ABSENT.
+            # Any other listless answer is an unknown vocabulary, not a zero.
+            if status == FP_DEVICE_NO_FP:
+                continue
+            raise _abort(
+                "finger_print_upload",
+                f"employeeNo {employee_no!r}: no {FP_RECORD_KEY} and status {status!r} "
+                f"is not the captured zero word {FP_DEVICE_NO_FP!r} — refusing to read "
+                "an unknown answer as 'no fingerprints' (§0.7)",
+            )
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise _abort(
+                "finger_print_upload",
+                f"employeeNo {employee_no!r}: {FP_RECORD_KEY} is {type(rows).__name__} "
+                f"with {len(rows) if isinstance(rows, list) else '?'} row(s); the "
+                "probed shape is exactly one (OBSERVED.md) — refusing to guess which "
+                "row is the person's",
+            )
+        row = rows[0]
+        if not isinstance(row, Mapping):
+            raise _abort(
+                "finger_print_upload",
+                f"employeeNo {employee_no!r}: row is {type(row).__name__}, not an object",
+            )
+        # The capture proved the box IGNORES fpIndex (0/1/2 all answered THIS row,
+        # fingerPrintID 1). A different slot number means fpIndex means something on
+        # that device that it does not mean on bench A — a fact we do not have, so
+        # we stop instead of porting a guess (and instead of claiming one read
+        # covers a multi-finger person).
+        if str(row.get("fingerPrintID")) != "1":
+            raise _abort(
+                "finger_print_upload",
+                f"employeeNo {employee_no!r}: answered fingerPrintID "
+                f"{row.get('fingerPrintID')!r} for an fpIndex=0 read; bench A always "
+                "answers 1 (capture 2026-10-22) — multi-finger reads on this shape "
+                "are UNPROVEN, not silently one-finger",
+            )
+        raw, digest = _decoded_length(
+            "finger_print_upload", employee_no, row.get("fingerData"), "fingerData"
+        )
+        files.append((employee_no, 0, str(row["fingerData"])))
+        entries.append(
+            FingerprintTemplate(
+                employee_no=employee_no,
+                fp_index=0,
+                sha256=digest,
+                length=len(raw),
+                sensor_family=_sensor_family_note(raw),
+            )
+        )
     return FingerprintWalk(files=tuple(files), entries=tuple(entries), termination=FP_STOP_LABEL)
 
 
@@ -719,8 +730,8 @@ def export_full_bundle(
     fp_index = FingerprintIndex(
         state="AVAILABLE",
         reason=(
-            "every roster employee read fpIndex-by-fpIndex to the device's empty-list "
-            f"stop shape ({FP_STOP_LABEL})"
+            "every roster employee got one definitive FingerPrintUpload read "
+            f"(template row or the device's {FP_DEVICE_NO_FP!r}; {FP_STOP_LABEL})"
         ),
         entries=fp_walk.entries,
     )

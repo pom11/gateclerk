@@ -1344,22 +1344,29 @@ class FakeDevice:
         for param in ("searchID", "employeeNo", "fpIndex", "dataType"):
             if cond.get(param) in (None, ""):
                 return message_parameters_lack(param)
+        # CAPTURED TRUTH (bench A §5.0 capture, 2026-10-22): the read IGNORES
+        # fpIndex — the store is keyed by PERSON (first stored index wins, which on
+        # bench A is the only one anyway); positive answers carry status "OK", the
+        # honest zero is status "NoFP" with FingerPrintList ABSENT (not empty!).
         store: dict[tuple[str, int], bytes] = (self._biometric_store or {}).get("fingerprints", {})
-        key = (str(cond["employeeNo"]), int(cond["fpIndex"]))
-        row_bytes = store.get(key)
-        info: dict[str, object] = {}
+        employee_no = str(cond["employeeNo"])
+        row_bytes = next(
+            (b for (no, _idx), b in store.items() if no == employee_no), None
+        )
+        info: dict[str, object] = {"searchID": cond.get("searchID", "")}
         if row_bytes is not None:
+            info["status"] = "OK"
             info["FingerPrintList"] = [
                 {
                     "cardReaderNo": 1,
-                    "fingerPrintID": key[1] + 1,  # recorded: fpIndex 0 -> fingerPrintID 1
+                    "fingerPrintID": 1,  # captured: always 1, whatever fpIndex we send
                     "fingerType": "normalFP",
                     "fingerData": base64.b64encode(row_bytes).decode("ascii"),
-                    "leaderFP": "true" if key[1] == 0 else "false",
+                    "leaderFP": [],  # captured verbatim: an EMPTY LIST, not "true"
                 }
             ]
         else:
-            info["FingerPrintList"] = []  # the device's own empty list: honest zero
+            info["status"] = "NoFP"  # the device's own zero word
         return httpx.Response(200, json={"FingerPrintInfo": info})
 
     # -- the server --------------------------------------------------------------------
@@ -1552,29 +1559,28 @@ class FakeDevice:
                     "errorMsg": "dataType",
                 }
             )
+        # CAPTURED TRUTH (§5.0 capture 2026-10-22): fpIndex is IGNORED on the read
+        # (0/1/2 answered the same row); positive carries status "OK"; the honest
+        # zero is status "NoFP" with FingerPrintList ABSENT (the earlier
+        # empty-list extrapolation is what made a per-fpIndex walk look legal).
         entry = self._enrollment["fp_templates"].get(  # type: ignore[index]
             str(cond["employeeNo"])
         )
-        if not entry or int(cond["fpIndex"] or 0) != 0:
-            # Not in the recorded corpus; symmetric with the recorded nonempty shape,
-            # list EMPTY rather than key-absent (documented extrapolation).
-            return httpx.Response(200, json={"FingerPrintInfo": {"FingerPrintList": []}})
-        return httpx.Response(
-            200,
-            json={
-                "FingerPrintInfo": {
-                    "FingerPrintList": [
-                        {
-                            "cardReaderNo": 1,
-                            "fingerPrintID": 1,
-                            "fingerType": "normalFP",
-                            "fingerData": entry,
-                            "leaderFP": "false",
-                        }
-                    ]
-                }
-            },
-        )
+        info: dict[str, object] = {"searchID": cond.get("searchID", "")}
+        if not entry:
+            info["status"] = "NoFP"
+            return httpx.Response(200, json={"FingerPrintInfo": info})
+        info["status"] = "OK"
+        info["FingerPrintList"] = [
+            {
+                "cardReaderNo": 1,
+                "fingerPrintID": 1,
+                "fingerType": "normalFP",
+                "fingerData": entry,
+                "leaderFP": [],  # captured verbatim (an empty list, not a bool/string)
+            }
+        ]
+        return httpx.Response(200, json={"FingerPrintInfo": info})
 
     def _enroll_fd_search(self, request: httpx.Request) -> httpx.Response:
         """FLAT dialect only — the working shape the operator confirmed (OBSERVED).

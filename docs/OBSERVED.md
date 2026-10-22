@@ -299,6 +299,16 @@ fingerData) are never committed here or in fixtures — shape/size/hash-prefix o
   retired; `paging.fd_search` carries the captured values (`envelope_key=""`).
   FingerPrintUpload zero shape re-confirmed the same day: `FingerPrintInfo:{searchID,
   status:"NoFP"}` with `FingerPrintList` absent (the probed full shape is unchanged).
+- **FingerPrintUpload READ ignores `fpIndex`** (§5.0 capture, 2026-10-22, employeeNo
+  "1"): fpIndex **0, 1 and 2 all answered the IDENTICAL** row — same 512 B template
+  (b64 len 684, sha 91c0878623c2), same `fingerPrintID: 1`, `status: "OK"`. The
+  per-fpIndex "read until empty list" walk is therefore a FALSE PREMISE: for a person
+  WITH a finger it never terminates (bench A never returns the empty list we
+  extrapolated as the stop shape — the real zero word is `status:"NoFP"` with the
+  list ABSENT, and only for people WITHOUT one). Correct model: ONE read per person,
+  `fingerPrintID` is a captured constant 1, `leaderFP` verbatim is an empty list
+  (not a bool). Multi-finger reads on this endpoint shape are UNPROVEN — the export
+  fails closed if any read answers `fingerPrintID != 1` instead of guessing.
 - **FingerPrint read WORKS** (misleading name, device→client): POST
   `/ISAPI/AccessControl/FingerPrintUpload?format=json`
   `{"FingerPrintCond":{"searchID":"…","employeeNo":"1","fpIndex":0,"dataType":"template"}}`

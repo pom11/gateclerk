@@ -440,9 +440,11 @@ class FingerprintIndex:
     """fingerprints/INDEX.json — the same two-state discipline faces use.
 
     UNAVAILABLE says the walk never ran (the E1-01 default); AVAILABLE says every
-    employee was read fpIndex-by-fpIndex to the device's stop signal, with per-file
+    employee got one definitive read (a template row, or the device's captured
+    `status: "NoFP"` zero — §5.0 capture 2026-10-22 shows FingerPrintUpload ignores
+    fpIndex, so it is one read per person, not a walk), with per-file
     sha256/length + the sensor-family note. Zero entries + AVAILABLE = the device
-    answered the not-found shape for every person — an honest zero, not a silence.
+    answered `NoFP` for every person — an honest zero, not a silence.
     """
 
     state: str = "UNAVAILABLE"

@@ -55,7 +55,6 @@ from gateclerk.migrate_bundle import (
     read_bundle,
 )
 from gateclerk.migrate_export import (
-    MAX_FP_TEMPLATES_PER_PERSON,
     export_faces,
     export_fingerprints,
     export_full_bundle,
@@ -202,7 +201,7 @@ def test_manifest_sections_digests_and_report_only_counters(tmp_path: Path) -> N
     assert counters["2"]["numOfFP"] == 0 and counters["2"]["exported_fingerprints"] == 0
     # Audit trail: the FDSearch walk's terminal status + the FP engine stop label.
     assert manifest["termination"]["FDSearch"] == "NOMATCH"
-    assert manifest["termination"]["FingerPrintUpload"] == "OK-EMPTY-LIST"
+    assert manifest["termination"]["FingerPrintUpload"] == "ONE-SHOT-COMPLETE"
 
 
 def test_bundle_modes_and_repo_out_refusal_survive_the_v2_writer(tmp_path: Path) -> None:
@@ -503,44 +502,100 @@ def test_fingerprint_answer_is_the_recorded_shape() -> None:
     assert decoded.startswith(FP_TEMPLATE_MAGIC) and len(decoded) == FP_TEMPLATE_SIZE
 
 
-def test_fp_walk_reads_index_by_index_until_the_empty_list(tmp_path: Path) -> None:
-    """Two stored fingers on user "1": fpIndex 0,1 answered, index 2 hits the empty list."""
-    device = seeded_device()
-    device.seed_biometric(
-        fingerprints={
-            ("1", 0): _synthetic_template(FP_TEMPLATE_SIZE, FP_TEMPLATE_MAGIC, "a"),
-            ("1", 1): _synthetic_template(FP_TEMPLATE_SIZE, FP_TEMPLATE_MAGIC, "b"),
-        }
-    )
+def test_fp_read_is_one_shot_per_person_the_captured_dialect(tmp_path: Path) -> None:
+    """CAPTURED (bench A 2026-10-22): ONE read per employee, no fpIndex walk.
+
+    The device IGNORES fpIndex — fpIndex 0/1/2 answered the identical template with
+    `fingerPrintID: 1` — so a second read per person buys nothing and a walk that
+    "reads until empty" can never terminate for a person WITH a finger (the capture
+    session proved it: the first live export self-aborted on the old runaway guard).
+    The honest zero is the device's own `status: "NoFP"` with the list ABSENT; four
+    roster people, one fingerprint = FOUR requests, no probing the wall.
+    """
+    device = seeded_device()  # A corpus: exactly user "1" has a fingerprint
     walk = export_fingerprints(
         make_client(device),
-        employee_nos=["1"],
+        employee_nos=["1", "2", "3", "4"],
         inter_request_delay=0.0,
         sleep=no_sleep,
         pacing_clock=lambda: 0.0,
     )
-    assert [f[1] for f in walk.files] == [0, 1]  # stopped on the device's own empty list
-    assert walk.termination == "OK-EMPTY-LIST"
-    # One read per stored index + ONE more that returned the stop shape — no skipping.
-    # (`had_auth` filters the digest handshake request, which has no path authority.)
+    assert [(f[0], f[1]) for f in walk.files] == [("1", 0)]  # one definitive answer
+    assert walk.termination == "ONE-SHOT-COMPLETE"
     fp_posts = [
         s for s in device.served if s.path.startswith(FINGER_PRINT_UPLOAD_PATH) and s.had_auth
     ]
-    assert len(fp_posts) == 3
+    assert len(fp_posts) == 4  # exactly one per person — NoFP people cost one read
 
 
-def test_fp_runaway_device_aborts_instead_of_truncating(tmp_path: Path) -> None:
-    """A device that answers EVERY fpIndex never said stop: abort, never truncate."""
+def test_fp_fpindex_ignored_on_the_device_side() -> None:
+    """The capture fact itself, pinned at the fake: fpIndex 0, 1, 2 answer the SAME row."""
+    bodies = []
+    with raw_http(seeded_device()) as client:
+        for idx in (0, 1, 2):
+            bodies.append(
+                client.post(
+                    FP_PATH,
+                    json={
+                        "FingerPrintCond": {
+                            "searchID": f"cap{idx}",
+                            "employeeNo": "1",
+                            "fpIndex": idx,
+                            "dataType": "template",
+                        }
+                    },
+                ).json()
+            )
+    rows = [b["FingerPrintInfo"]["FingerPrintList"][0] for b in bodies]
+    assert {r["fingerData"] for r in rows} == {rows[0]["fingerData"]}
+    assert {r["fingerPrintID"] for r in rows} == {1}
+    assert all(b["FingerPrintInfo"]["status"] == "OK" for b in bodies)
+    # And the captured zero shape for a person WITHOUT a finger:
+    with raw_http(seeded_device()) as client:
+        zero = client.post(
+            FP_PATH,
+            json={
+                "FingerPrintCond": {
+                    "searchID": "capz",
+                    "employeeNo": "2",
+                    "fpIndex": 0,
+                    "dataType": "template",
+                }
+            },
+        ).json()
+    assert zero["FingerPrintInfo"]["status"] == "NoFP"
+    assert "FingerPrintList" not in zero["FingerPrintInfo"]  # absent, NOT empty
+
+
+def test_fp_listless_answer_without_the_nofp_word_aborts(tmp_path: Path) -> None:
+    """`NoFP` is the ONLY accepted absence — any other listless answer is §0.7 silence."""
     device = seeded_device()
-    endless = {
-        ("1", i): _synthetic_template(FP_TEMPLATE_SIZE, FP_TEMPLATE_MAGIC, f"x{i}")
-        for i in range(MAX_FP_TEMPLATES_PER_PERSON + 1)
-    }
-    device.seed_biometric(fingerprints=endless)
+    device.reset_json("POST", FP_PATH, {"FingerPrintInfo": {"searchID": "x"}})
     with pytest.raises(EnrollmentReadAborted) as excinfo:
         export(tmp_path, device)
     assert excinfo.value.endpoint == "finger_print_upload"
-    assert "never says stop" in str(excinfo.value)
+    assert "NoFP" in str(excinfo.value)
+    assert_no_bundle(tmp_path / "bundle")
+
+
+def test_fp_finger_print_id_other_than_one_aborts_unproven(tmp_path: Path) -> None:
+    """Bench A always answers fingerPrintID 1; anything else means multi-finger reads
+    on this shape are UNPROVEN — fail closed instead of claiming one read suffices."""
+    device = seeded_device()
+    row = {
+        "cardReaderNo": 1,
+        "fingerPrintID": 2,
+        "fingerType": "normalFP",
+        "fingerData": base64.b64encode(b"x" * 64).decode("ascii"),
+        "leaderFP": [],
+    }
+    device.reset_json(
+        "POST", FP_PATH, {"FingerPrintInfo": {"status": "OK", "FingerPrintList": [row]}}
+    )
+    with pytest.raises(EnrollmentReadAborted) as excinfo:
+        export(tmp_path, device)
+    assert excinfo.value.endpoint == "finger_print_upload"
+    assert "UNPROVEN" in str(excinfo.value)
     assert_no_bundle(tmp_path / "bundle")
 
 
