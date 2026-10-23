@@ -888,7 +888,18 @@ def test_existing_cli_surface_is_unchanged_and_agent_is_the_only_addition() -> N
     for name, sub in PREVIOUS_SURFACE.items():
         assert name in tree, f"{name} disappeared from the CLI"
         assert tree[name] == sub, f"{name} changed shape: {tree[name]} != {sub}"
-    assert set(tree) - set(PREVIOUS_SURFACE) == {"agent"}, f"unexpected commands: {set(tree)}"
+    # E1-07 (docs/ENROLLMENT-MIGRATION.md §7) added the `migrate` group on top of the
+    # agent card's addition — an enumerated allow-list, so a FIFTH unannounced command
+    # still fails here. The card's binding rule ("nothing existing moves") holds: every
+    # PREVIOUS_SURFACE entry is pinned unchanged above.
+    assert set(tree) - set(PREVIOUS_SURFACE) == {"agent", "migrate"}, (
+        f"unexpected commands: {set(tree)}"
+    )
+
+
+def test_migrate_group_shape_is_the_section7_surface() -> None:
+    """E1-07's §7 commands, and no sixth smuggled in."""
+    assert _tree()["migrate"] == {"probe", "export", "diff", "apply", "undo"}
 
 
 def test_agent_group_shape_is_run_ack_deadletter() -> None:

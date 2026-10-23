@@ -4,15 +4,18 @@ Read-only attendance reader: Hikvision face/card terminals → normalized punch 
 heading to Business Central in a later phase. `gateclerk` = time attendance, read-only.
 
 The contract is [docs/DESIGN.md](docs/DESIGN.md). The phase list is
-[ROADMAP.md](ROADMAP.md). The read commands are live as of card p1-08; there are no
-write commands and there never will be — this tool is read-only by design.
+[ROADMAP.md](ROADMAP.md). The read commands are live as of card p1-08 and remain the
+whole P1 surface: nothing there ever writes. The one exception the roadmap planned is
+the E1 enrollment-migration group (`gateclerk migrate`, [docs/ENROLLMENT-MIGRATION.md](docs/ENROLLMENT-MIGRATION.md)
+§7): probe/export/diff are read-only, and the group writes to a device ONLY under its
+explicitly gated `apply --apply` — every other path is provably zero-byte.
 
 ## Quickstart
 
 ```bash
 uv sync --extra fast            # python 3.12 is fetched by uv, not your system python
 uv run gateclerk --version        # gateclerk 0.1.0
-uv run gateclerk --help           # device | users | events | creds
+uv run gateclerk --help           # device | users | events | creds | agent | migrate
 uv run ruff check . && uv run pytest          # both offline, both must stay green
 ```
 

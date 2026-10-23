@@ -29,7 +29,7 @@ because the card names them as groups (`users list`, `device info`).
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -77,7 +77,11 @@ __all__ = [
 
 app = typer.Typer(
     name="gateclerk",
-    help="Read-only Hikvision attendance reader (P1). Never writes to the device.",
+    help=(
+        "Hikvision attendance connector: read-only P1 surface (never writes), plus the "
+        "E1 enrollment-migration group `gateclerk migrate`, whose writes happen ONLY "
+        "under its explicitly gated `apply --apply` (docs/ENROLLMENT-MIGRATION.md §7)."
+    ),
     no_args_is_help=True,
     add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
@@ -1828,8 +1832,587 @@ def deadletter_delete(
     render([{"id": id_, "removed": True}], fmt=output.value, columns=("id", "removed"))
 
 
+# --- migrate (E1: enrollment migration, card E1-07) ------------------------------------
+#
+# §7's surface, verbatim:
+#
+#     gateclerk migrate probe  --site S                      # capability matrix -> bundles/probes/
+#     gateclerk migrate export --site S [--out DIR]          # snapshot bundle (read-only)
+#     gateclerk migrate diff   --bundle B --target T         # classification table, no writes
+#     gateclerk migrate apply  --bundle B --target T [--apply] [--on-conflict=...]
+#     gateclerk migrate undo   --journal J                   # restore/remove only per §5a
+#
+# Every body is the same three steps — resolve, call the module that owns the decision,
+# render — and nothing here invents policy: the gates (clock skew §5.1a, stale probe §3/§4,
+# freshness re-diff §4) live inside the phase modules, the phase ORDER lives in
+# ``migrate_apply``, and the PII-free rule (§4) is each module's own report shape. The two
+# decisions this file does make: where the private roots are (one call to
+# ``migrate_apply.bundle_root``, so no command can invent a second default), and exit codes.
+
+migrate_app = typer.Typer(
+    name="migrate",
+    help=(
+        "Enrollment migration (docs/ENROLLMENT-MIGRATION.md): probe, export and diff are "
+        "read-only; `apply` performs writes only with --apply, and `undo` removes only "
+        "what a journal proved this run added (§5a)."
+    ),
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(migrate_app)
+
+#: The private root for bundles, probes and run journals. Every module that writes PII
+#: refuses a path inside a git repo (§2), and this group never guesses one per command.
+BundleRootOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--bundles-root",
+        help="Private root for bundles, probes and run journals (default $GATECLERK_BUNDLE_ROOT, "
+        "else ~/gateclerk/bundles). Never inside a git repo — the modules refuse that (§2).",
+    ),
+]
+BundleOpt = Annotated[
+    str,
+    typer.Option("--bundle", help="Snapshot bundle directory to migrate FROM (export's output)."),
+]
+OnConflictOpt = Annotated[
+    str,
+    typer.Option(
+        "--on-conflict",
+        case_sensitive=False,
+        help="What to do with a conflict: skip = report and skip (default), overwrite = "
+        "write where the capture proves it safe, abort = refuse the run before it plans a "
+        "single write. E1-02's own policy enum (§4), no new vocabulary.",
+    ),
+]
+CarryTemplatesOpt = Annotated[
+    bool,
+    typer.Option(
+        "--carry-templates",
+        help="Carry custom plan-template numbers, and only those the target's own probe "
+        "evidence lists (§1a). Off by default: an unlisted number is a write the target "
+        "has never admitted.",
+    ),
+]
+ApplyOpt = Annotated[
+    bool,
+    typer.Option(
+        "--apply",
+        help="Actually perform the phase writes. Without it this is a zero-byte dry run "
+        "that reports which phases WOULD run (§4's default).",
+    ),
+]
+
+
+def _migrate_client(
+    *,
+    host: str | None,
+    site: str | None,
+    port: int,
+    config: str | None,
+    user: str | None,
+    password: str | None,
+    timeout: float,
+    fmt: OutputFormat,
+    verbose: bool = False,
+) -> tuple[cfg.SiteConfig, Any, Callable[[], Any]]:
+    """The read client + a FACTORY for fresh ones, built by the SAME helpers P1 uses.
+
+    §7's "creds: existing resolver unchanged (flag > env > keychain)" is true here by
+    construction: this group adds no second credential path and no second transport.
+    The factory exists because §5.3 wants ONE client per write phase — the command holds
+    one for its registry reads, and each write phase pulls its own from the factory.
+    """
+    site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
+    target = site_config.target()
+    creds = _resolve_creds(target, user=user, password=password, output=fmt)
+    logger = _logger_for(verbose, creds)
+
+    def factory() -> Any:
+        return _client_for(target, creds, timeout=timeout, output=fmt, logger=logger)
+
+    return site_config, factory(), factory
+
+
+def _read_target_state(client: Any) -> Any:
+    """A fresh full target read — §4: the target is never a cached or bundled view."""
+    from gateclerk.migrate_export import collect_enrollment_state
+
+    return collect_enrollment_state(client, inter_page_delay=0.0, sleep=lambda _s: None)
+
+
+def _migrate_seams(client: Any, client_factory: Callable[[], Any], *, writable: bool) -> Any:
+    """The composer's seams: registry reads on the command's client, write verbs per phase.
+
+    Four SEPARATE write factories, each pulling a FRESH client from ``client_factory``:
+    §5.3 is one long-lived digest session AND one 80-call budget per phase, so phases
+    neither share a client nor share a ledger (a phase closing its transport closes only
+    its own client). The write seam classes live in ``migrate_apply`` — they are what a
+    phase's verbs are — so a factory here is a lambda.
+
+    ``writable=False`` hands out factories that RAISE instead of building anything. That
+    is how "diff constructs no write client" (§7) is enforced by the code rather than
+    claimed in a comment: a diff path that tried to write hits that message, not the device.
+    """
+    from gateclerk import migrate_apply as apply_mod
+
+    def _read_only_only() -> Any:
+        raise AssertionError(
+            "this migrate command is a read pass: no write client may be constructed here (§7)"
+        )
+
+    return apply_mod.ApplySeams(
+        read_target_state=lambda: _read_target_state(client),
+        users_transport_factory=(
+            (lambda: apply_mod.UserWriteTransport(client_factory()))
+            if writable
+            else _read_only_only
+        ),
+        cards_transport_factory=(
+            (lambda: apply_mod.CardWriteTransport(client_factory()))
+            if writable
+            else _read_only_only
+        ),
+        fp_transport_factory=(
+            (lambda: apply_mod.FpWriteTransport(client_factory())) if writable else _read_only_only
+        ),
+        faces_transport_factory=(
+            (lambda: apply_mod.FaceWriteTransport(client_factory()))
+            if writable
+            else _read_only_only
+        ),
+        users_reader=apply_mod.reader_for(client, "user_info_search"),
+        cards_reader=apply_mod.reader_for(client, "card_info_search"),
+        fp_reader=lambda body: client.search("finger_print_upload", body),
+        faces_reader=apply_mod.reader_for(client, "fd_search"),
+    )
+
+
+@migrate_app.command("probe")
+def migrate_probe(
+    host: HostArg = None,
+    site: SiteOpt = None,
+    config: ConfigOpt = None,
+    port: PortOpt = DEFAULT_PORT,
+    user: UserOpt = None,
+    password: PasswordOpt = None,
+    timeout: TimeoutOpt = DEFAULT_TIMEOUT,
+    output: OutputOpt = OutputFormat.TABLE,
+    verbose: VerboseOpt = False,
+    bundles_root: BundleRootOpt = None,
+) -> None:
+    """Read the site's whole capability matrix and persist it (§3). Read-only.
+
+    Writes one file under ``<bundles-root>/probes/`` (0700 dir, 0600 file) and nothing
+    else. Every later command is gated on it: ``diff`` and ``apply`` refuse a stale or
+    missing probe (§4), which is why this command exists before them.
+    """
+    from gateclerk import migrate_apply as apply_mod
+    from gateclerk.migrate_probe import probe_device, save_matrix
+
+    fmt = output
+    site_config, client, _client_factory = _migrate_client(
+        host=host,
+        site=site,
+        port=port,
+        config=config,
+        user=user,
+        password=password,
+        timeout=timeout,
+        fmt=fmt,
+        verbose=verbose,
+    )
+    root = apply_mod.bundle_root(bundles_root)
+    with _Guard(fmt), client:
+        matrix = probe_device(
+            client,
+            now=_now(),
+            site=site_config.name,
+            host=site_config.host,
+            site_tz=site_config.iana_tz or DEFAULT_TZ,
+        )
+        path = save_matrix(matrix, root)
+    if fmt is OutputFormat.TABLE:
+        render(
+            [
+                {"surface": "probe", "verdict": "saved", "note": str(path)},
+                *[
+                    {
+                        "surface": row.key,
+                        "verdict": str(row.verdict),
+                        "note": row.note or "",
+                    }
+                    for row in matrix.surfaces
+                ],
+            ],
+            fmt="table",
+            columns=("surface", "verdict", "note"),
+        )
+        return
+    payload = matrix.as_dict()
+    payload["persisted_to"] = str(path)
+    render([payload], fmt=fmt.value)
+
+
+@migrate_app.command("export")
+def migrate_export(
+    host: HostArg = None,
+    site: SiteOpt = None,
+    config: ConfigOpt = None,
+    port: PortOpt = DEFAULT_PORT,
+    user: UserOpt = None,
+    password: PasswordOpt = None,
+    timeout: TimeoutOpt = DEFAULT_TIMEOUT,
+    output: OutputOpt = OutputFormat.TABLE,
+    verbose: VerboseOpt = False,
+    bundles_root: BundleRootOpt = None,
+    out: Annotated[
+        str | None,
+        typer.Option("--out", help="Bundle directory to create (it must not exist yet)."),
+    ] = None,
+) -> None:
+    """Snapshot the site (users, cards, face + FP templates) into a private bundle (§2).
+
+    Read-only, and the export module's own contract is "any read failing leaves no bundle
+    at the final path" — a partial bundle must never read as a rollback source. The bundle
+    is the diff's source AND the pre-run restore point §5b.1 sends people back to, which is
+    why a run with no bundle is not a run.
+    """
+    from gateclerk import migrate_apply as apply_mod
+    from gateclerk.migrate_export import export_full_bundle
+
+    fmt = output
+    site_config, client, _client_factory = _migrate_client(
+        host=host,
+        site=site,
+        port=port,
+        config=config,
+        user=user,
+        password=password,
+        timeout=timeout,
+        fmt=fmt,
+        verbose=verbose,
+    )
+    root = apply_mod.bundle_root(bundles_root)
+    destination = Path(out).expanduser() if out else root / "bundles" / site_config.name
+    with _Guard(fmt), client:
+        result = export_full_bundle(
+            destination,
+            client=client,
+            clock=_now,
+            inter_page_delay=0.0,
+            sleep=lambda _s: None,
+        )
+    if fmt is OutputFormat.TABLE:
+        render(
+            [{"bundle": str(result.bundle_dir), **{k: str(v) for k, v in result.counts.items()}}],
+            fmt="table",
+        )
+        return
+    from gateclerk.migrate_write import person_hash
+
+    def _index(index: Any) -> dict[str, Any]:
+        """An index reduced to §4's identity form: hash prefix + content hashes only."""
+        return {
+            "state": index.state,
+            "reason": index.reason,
+            "entries": [
+                {
+                    "employee": person_hash(entry.employee_no),
+                    "sha256": entry.sha256,
+                    "length": entry.length,
+                }
+                for entry in index.entries
+            ],
+        }
+
+    render(
+        [
+            {
+                "schema": "gateclerk-migrate-export/1",
+                "bundle": str(result.bundle_dir),
+                "counts": result.counts,
+                # §4: identity as content hashes only — the raw employeeNo stays inside
+                # the private bundle, never in machine output.
+                "people": sorted(result.people_hashes.values()),
+                "faces": _index(result.faces),
+                "fingerprints": _index(result.fingerprints),
+                "termination": result.termination,
+            }
+        ],
+        fmt=fmt.value,
+    )
+
+
+@migrate_app.command("diff")
+def migrate_diff(
+    bundle: BundleOpt,
+    host: HostArg = None,
+    site: SiteOpt = None,
+    config: ConfigOpt = None,
+    port: PortOpt = DEFAULT_PORT,
+    user: UserOpt = None,
+    password: PasswordOpt = None,
+    timeout: TimeoutOpt = DEFAULT_TIMEOUT,
+    output: OutputOpt = OutputFormat.TABLE,
+    verbose: VerboseOpt = False,
+    bundles_root: BundleRootOpt = None,
+    on_conflict: OnConflictOpt = "skip",
+    carry_templates: CarryTemplatesOpt = False,
+) -> None:
+    """Classify the bundle against a FRESH target read (§4). No write client is constructed.
+
+    Exit codes are the diff's own (§4): 0 nothing pending, 1 writes pending, 2 conflicts
+    with no writable path. ``--on-conflict=abort`` exits 2 there instead of planning past
+    them. The classification table is reason codes verbatim from E1-02 — a code this tool
+    does not recognise is reported, never folded into a neighbour.
+    """
+    from gateclerk import migrate_apply as apply_mod
+    from gateclerk.migrate_bundle import read_bundle
+    from gateclerk.migrate_probe import load_matrix, require_fresh
+
+    fmt = output
+    site_config, client, _client_factory = _migrate_client(
+        host=host,
+        site=site,
+        port=port,
+        config=config,
+        user=user,
+        password=password,
+        timeout=timeout,
+        fmt=fmt,
+        verbose=verbose,
+    )
+    root = apply_mod.bundle_root(bundles_root)
+    policy = apply_mod.policy_for(
+        on_conflict,
+        carry_templates=carry_templates,
+        site_tz=site_config.iana_tz or DEFAULT_TZ,
+    )
+    with _Guard(fmt), client:
+        bundle_data = read_bundle(Path(bundle))
+        probe = require_fresh(load_matrix(root, site_config.name, site_config.host), _now())
+        seams = _migrate_seams(client, _client_factory, writable=False)
+        planned = apply_mod.migrate_plan(
+            bundle=bundle_data, seams=seams, policy=policy, probe=probe, now=_now()
+        )
+        if fmt is OutputFormat.TABLE:
+            typer.echo(apply_mod.render_diff_report(planned.plan, fmt="table"), nl=False)
+        else:
+            render([_diff_payload(planned.plan)], fmt=fmt.value)
+    raise typer.Exit(code=planned.plan.exit_code)
+
+
+def _diff_payload(plan: Any) -> dict[str, Any]:
+    """The diff's byte-pinned json, wrapped in the group's stable envelope (§4/§7)."""
+    import json as _json
+
+    from gateclerk import migrate_apply as apply_mod
+
+    return {
+        "schema": "gateclerk-migrate-diff-cli/1",
+        "exitCode": plan.exit_code,
+        "diff": _json.loads(apply_mod.render_diff_report(plan, fmt="json")),
+    }
+
+
+@migrate_app.command("apply")
+def migrate_apply(
+    bundle: BundleOpt,
+    host: HostArg = None,
+    site: SiteOpt = None,
+    config: ConfigOpt = None,
+    port: PortOpt = DEFAULT_PORT,
+    user: UserOpt = None,
+    password: PasswordOpt = None,
+    timeout: TimeoutOpt = DEFAULT_TIMEOUT,
+    output: OutputOpt = OutputFormat.TABLE,
+    verbose: VerboseOpt = False,
+    bundles_root: BundleRootOpt = None,
+    on_conflict: OnConflictOpt = "skip",
+    carry_templates: CarryTemplatesOpt = False,
+    apply_writes: ApplyOpt = False,
+    run_dir: Annotated[
+        str | None,
+        typer.Option(
+            "--run-dir",
+            help="Where this run's per-phase journals go (default "
+            "<bundles-root>/runs/<utc-stamp>).",
+        ),
+    ] = None,
+) -> None:
+    """Run §5 step 2's phase order (users → cards → fingerprints → faces) over the bundle.
+
+    Without ``--apply``: a zero-byte dry run — no journal opened, no transport built, no
+    write client constructed, because that is §4's default posture. With it: one journal
+    per phase under the run dir, one budgeted transport per phase (§5.3), and the FIRST
+    abort or disagreeing verify stops the run — no phase after it runs.
+
+    Exit codes (§7): 0 clean, 2 a gate or conflict refusal (stale probe, clock skew,
+    ``--on-conflict=abort`` with conflicts present) — nothing was planned to be written;
+    1 the run stopped part-way. A stopped run still prints the composed report naming
+    which records landed and which phases remain: a partial write must be legible
+    (§5 step 4), never papered over by a nonzero status alone.
+    """
+    from gateclerk import migrate_apply as apply_mod
+    from gateclerk.migrate_bundle import read_bundle
+    from gateclerk.migrate_diff import DiffAbortedError, Plan
+    from gateclerk.migrate_probe import load_matrix, require_fresh
+
+    fmt = output
+    site_config, client, _client_factory = _migrate_client(
+        host=host,
+        site=site,
+        port=port,
+        config=config,
+        user=user,
+        password=password,
+        timeout=timeout,
+        fmt=fmt,
+        verbose=verbose,
+    )
+    root = apply_mod.bundle_root(bundles_root)
+    policy = apply_mod.policy_for(
+        on_conflict,
+        carry_templates=carry_templates,
+        site_tz=site_config.iana_tz or DEFAULT_TZ,
+    )
+    journal_dir = (
+        Path(run_dir).expanduser() if run_dir else apply_mod.default_journal_dir(_now(), root=root)
+    )
+    with _Guard(fmt), client:
+        bundle_data = read_bundle(Path(bundle))
+        probe = require_fresh(load_matrix(root, site_config.name, site_config.host), _now())
+        seams = _migrate_seams(client, _client_factory, writable=apply_writes)
+        try:
+            planned = apply_mod.migrate_plan(
+                bundle=bundle_data, seams=seams, policy=policy, probe=probe, now=_now()
+            )
+        except DiffAbortedError as exc:
+            # `--on-conflict=abort` refused before a single write was planned (§4), so the
+            # exit is the config-class one and the conflicts are still printed — they are
+            # the operator's to-do list, not a stack trace.
+            refused = apply_mod.BundleApplyReport(
+                confirm=False,
+                journal_dir=str(journal_dir),
+                phases=(),
+                would_run=apply_mod.phase_order(),
+                stopped_at="plan",
+                remaining=apply_mod.phase_order(),
+                landed={},
+                plan=Plan(items=tuple(exc.conflicts)),
+                notes=(str(exc),),
+            )
+            _emit_apply(refused, fmt)
+            # The refusal IS the report (conflicts + the abort note) — printing an error
+            # payload on top would put two documents on a json stdout.
+            raise typer.Exit(code=CONFIG_ERROR_EXIT) from exc
+        report = apply_mod.apply_bundle(
+            bundle=bundle_data,
+            bundle_dir=Path(bundle),
+            plan=planned.plan,
+            target=_read_target_state(client),
+            seams=seams,
+            probe=probe,
+            now=_now(),
+            journal_dir=journal_dir,
+            confirm=apply_writes,
+            batch_delay=0.0,
+            sleep=lambda _s: None,
+            recheck=apply_mod.freshness_recheck(bundle_data, seams, policy, probe, _now()),
+        )
+        _emit_apply(report, fmt)
+    raise typer.Exit(code=report.exit_code)
+
+
+def _emit_apply(report: Any, fmt: OutputFormat) -> None:
+    """Print the composed report the way `fmt` asks — on the failure paths too (§5 step 4)."""
+    if fmt is OutputFormat.TABLE:
+        typer.echo(report.render(fmt="table"), nl=False)
+        return
+    render([report.as_dict()], fmt=fmt.value)
+
+
+@migrate_app.command("undo")
+def migrate_undo(
+    journal: Annotated[
+        str,
+        typer.Option("--journal", help="One phase's journal file from a run directory."),
+    ],
+    host: HostArg = None,
+    site: SiteOpt = None,
+    config: ConfigOpt = None,
+    port: PortOpt = DEFAULT_PORT,
+    user: UserOpt = None,
+    password: PasswordOpt = None,
+    timeout: TimeoutOpt = DEFAULT_TIMEOUT,
+    output: OutputOpt = OutputFormat.TABLE,
+    verbose: VerboseOpt = False,
+    undo_journal_dir: Annotated[
+        str | None,
+        typer.Option(
+            "--undo-journal",
+            help="Where the undo's OWN journal goes (default beside the phase journal).",
+        ),
+    ] = None,
+) -> None:
+    """Undo what one journal PROVES this run added, dispatching on the journal's phase (§5a).
+
+    The phase comes from the journal's own lines, never from the file name. Cards and faces
+    have capture-proven targeted deletes and get them, each gated on proof-of-add and
+    wrapped in §5b's count-delta guard by its own module; users and fingerprints have no
+    such verb on this firmware (§5b.1) and get the owning module's report-only wording with
+    zero bytes written — which is why a report-only undo needs no device flags at all.
+
+    The undo journals into its own file: the phase journal stays append-only history (§5a).
+    Exit: 0 clean or report-only (words are the outcome), 1 a refusal or an incident — both
+    need a human.
+    """
+    from gateclerk import migrate_apply as apply_mod
+    from gateclerk.migrate_write import JournalError
+
+    fmt = output
+    # First pass with NO seams: a report-only phase answers fully from the journal alone,
+    # and a phase that does need a verb comes back `refused`. Only then is a client built,
+    # so undoing a users journal never requires a device to be reachable (§5b.1).
+    try:
+        report = apply_mod.undo_journal(
+            journal, undo_journal_dir=undo_journal_dir, sleep=lambda _s: None
+        )
+    except (FileNotFoundError, ValueError, JournalError, OSError) as exc:
+        # A journal that does not exist, cannot be read, or mixes phases is a bad
+        # argument, not a device fault: exit 2 with the module's own refusal words.
+        raise _config_exit(fmt, f"undo refused: {exc}") from exc
+    if report.mode == "refused":
+        _site, client, _client_factory = _migrate_client(
+            host=host,
+            site=site,
+            port=port,
+            config=config,
+            user=user,
+            password=password,
+            timeout=timeout,
+            fmt=fmt,
+            verbose=verbose,
+        )
+        seams = _migrate_seams(client, _client_factory, writable=True)
+        with _Guard(fmt), client:
+            report = apply_mod.undo_journal(
+                journal,
+                cards_transport_factory=seams.cards_transport_factory,
+                cards_reader=seams.cards_reader,
+                faces_transport_factory=seams.faces_transport_factory,
+                undo_journal_dir=undo_journal_dir,
+                sleep=lambda _s: None,
+            )
+    if fmt is OutputFormat.TABLE:
+        typer.echo(apply_mod.render_undo_report(report, fmt="table"), nl=False)
+    else:
+        render([report.as_dict()], fmt=fmt.value)
+    raise typer.Exit(code=report.exit_code)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Console entry point. Returns an exit code instead of calling sys.exit()."""
     try:
         result = app(args=argv, prog_name="gateclerk", standalone_mode=False)
     except typer.Exit as exc:  # raised by --version and by every exit-code path
