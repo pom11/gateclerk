@@ -78,7 +78,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from gateclerk.exceptions import GateclerkError
+from gateclerk.exceptions import ConfigError, GateclerkError
 from gateclerk.migrate_bundle import (
     COMPARE_EXEMPT_FIELDS,
     BundleData,
@@ -110,6 +110,7 @@ __all__ = [
     "BudgetedWriteTransport",
     "JournalEntry",
     "JournalError",
+    "JournalRepoOutError",
     "JournalState",
     "PersonVerdict",
     "RejectKind",
@@ -233,6 +234,27 @@ class JournalError(GateclerkError):
 
     A journal we cannot trust is a run we must not start: an entry that may be lost to
     a crash is not a journal (§5a), so every failure here is fatal rather than logged.
+    """
+
+
+class JournalRepoOutError(JournalError, ConfigError):
+    """A journal was refused for landing inside a git repo — WHERE, not WHAT.
+
+    The hygiene half of `JournalError`'s surface split out (card t_cf2ad3c5): pointing
+    the journal/run root under a repo is the operator's unusable input — the run never
+    touched a device — so it belongs on p1-08's config class (exit 2) and `cli._fail`'s
+    ONE documented mapping converts it there. Before this class the guard raised a bare
+    `JournalError`, and `_fail`'s catch-all `GateclerkError` arm filed it under exit 4
+    ("the box said no") on the `apply --apply` path while `undo`'s own try/except mapped
+    the identical refusal to exit 2 — two commands, one refusal, two exit codes.
+
+    `JournalError` stays in the MRO on purpose: the module-level contract of
+    `WriteJournal.open` is pinned as `pytest.raises(JournalError, match="inside the
+    repository")` by E1-04 and E1-05, and `undo`'s refusal arm catches `JournalError`.
+    Corruption refusals (an unreadable or unknown-schema journal on replay) deliberately
+    keep raising plain `JournalError`: a file this module cannot read is not "fix your
+    input" — it is state a human must adjudicate (§0.7), and moving it would be a lie
+    about who refused.
     """
 
 
@@ -687,7 +709,13 @@ def _guard_record(record: Mapping[str, Any], *, what: str) -> dict[str, Any]:
 
 
 def _refuse_repo_path(path: Path) -> None:
-    """A journal is a PII file: writing one into a public repo is refused (§2)."""
+    """A journal is a PII file: writing one into a public repo is refused (§2).
+
+    Raises the CONFIG-class subclass (card t_cf2ad3c5): pointing `--run-dir` (or the
+    bundles root the run dir derives from) under a repo is unusable operator input —
+    no device was contacted — so `apply --apply` must exit 2 like `undo` already did,
+    not 4 through `_fail`'s bare-GateclerkError arm.
+    """
     resolved = Path(path).resolve()
     root = repo_root(start=resolved.parent if resolved.parent.exists() else None)
     if root is None:
@@ -696,7 +724,7 @@ def _refuse_repo_path(path: Path) -> None:
         resolved.relative_to(root)
     except ValueError:
         return
-    raise JournalError(
+    raise JournalRepoOutError(
         f"refusing to write a journal inside the repository ({resolved} under {root}): "
         "journals hold normalized person records, so they live outside the repo at "
         "0600 like bundles do (design §2)"

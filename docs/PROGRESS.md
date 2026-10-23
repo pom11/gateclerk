@@ -745,6 +745,8 @@ same-class fixtures, and the old-bundle-still-reads digest pin.
 B state after operator runs: emp 1-4 users, faces emp 1 only — operator reruns the
 same A bundle onto B once E1-10 merges (faces carry to 2-4; verify no longer trips
 on picID).
+
+
 ## 2026-10-23 — t_0d635ee2: export's repo-out refusal now exits 2 (was an unhandled traceback)
 
 Found by E1-09: the card body claimed probe must exit 2 "exactly like export does" —
@@ -774,3 +776,40 @@ call-through spy (guard consulted with the `--out` dir), the stub-to-no-op mutat
 probe (a second copy of the rule in the CLI would keep refusing and go red, §5a), and
 the exception contract (ValueError + ConfigError; `_fail` converts instead of
 re-raising). TDD: 6 of the 8 were red against c624e62 before the fix.
+
+
+## 2026-10-23 — t_cf2ad3c5: apply's journal repo-out refusal now exits 2 (was the device class)
+
+The audit half of t_0d635ee2 found the same class of mismatch on the JOURNAL guard and
+carded it here. `_refuse_repo_path` raised a bare `JournalError` (a plain `GateclerkError`):
+`undo`'s own try/except mapped it to exit 2 ("undo refused: …"), but `apply --apply` opens
+its per-phase journals inside the composer under `_Guard`/`_fail`, whose catch-all
+`GateclerkError` arm filed the refusal under exit 4 — "the box said no" for a run that never
+contacted a box. Fix shape, same seam class as the parent card: one new class,
+`JournalRepoOutError(JournalError, ConfigError)`, at the refusal site in migrate_write —
+the ConfigError base puts it on p1-08's exit-2 class through the ONE existing `_fail`
+mapping (zero cli.py change; `_fail`'s "exactly one place to be added" rule honored), and
+the `JournalError` base keeps E1-04's and E1-05's `pytest.raises(JournalError, match=
+"inside the repository")` pins plus undo's `except JournalError` arm valid. The card's
+design decision: hygiene (WHERE the operator pointed the journal) is the config class;
+replay CORRUPTION (unknown schema/state) stays plain `JournalError` — an unreadable journal
+is state a human adjudicates (§0.7), never "fix your input". Guard behavior unchanged: same
+message, same refusal-before-first-mkdir (the composer's `_ensure_private_dir` lands first,
+then the journal guard refuses before the journal file is created).
+
+Pinned by tests/test_t_cf2ad3c5_journal_repo_out_exit2.py (13 FakeDevice-strict offline
+tests on the E1-07 harness): apply exits 2 — never 4 — for `--run-dir` under `git init` in
+both `-o table` and `-o json` (guard's message survives, json names the repo root), and
+same when only `--bundles-root` resolves under a repo (the DEFAULT run dir); zero journal
+bytes anywhere under the repo and zero authenticated write requests on the fake's wire
+(refusal structurally precedes the transport); undo's own seam pass (`--undo-journal`
+inside a repo, the second `_Guard` arm) also exits 2; undo's existing exit-2 refusals
+pinned unchanged (repo-stray journal + mixed-phase neighbour); a private run dir still runs
+to the harness's FP abort with all three phase journals (no over-refusal); the call-through
+spy + stub-to-no-op mutation probe (the SHARED journal guard is the single seam — a CLI-side
+copy of the rule would keep refusing with the guard stubbed and go red, §5a); the exception
+contract (JournalError + ConfigError) and `_fail` converting rather than re-raising. TDD:
+8 of the 13 red against the pre-fix tree (6941378), the 5 green ones pin behavior this card
+must not change; verified by re-running the battery in a detached worktree at the red
+commit (the repo's own false-green guard forces PYTHONPATH there — it caught the editable
+install pointing at the wrong tree before any test ran).

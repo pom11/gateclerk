@@ -479,6 +479,8 @@ Findings (filed on card E1-08, fixes = small cards):
    by tests/test_e1_09_probe_repo_guard.py, incl. the stub-the-guard mutation
    probe proving no second copy of the rule exists in the probe path.**
 **FIXED (t_0d635ee2): the guard now raises `BundleRepoOutError`
+
+   **FIXED (t_0d635ee2): the guard now raises `BundleRepoOutError`
    (ValueError + ConfigError) instead of a bare ValueError — `cli._fail`'s single
    documented mapping converts it onto exit 2, so `export --out` inside a repo
    exits 2 with the guard's own message (both -o table and -o json) instead of
@@ -494,6 +496,20 @@ Findings (filed on card E1-08, fixes = small cards):
    re-trip on it.
 2b. **events `--since/--until` whole-history window is slow** (~10k rows: minutes
     through the CLI paging at maxResults=30) — noted, not a defect.
+2c. **the journal's repo-out refusal disagreed with itself across commands** — found
+    while auditing `t_0d635ee2`'s callers: `migrate_write._refuse_repo_path` raised a
+    bare `JournalError` (a plain `GateclerkError`), so `undo` mapped the refusal to exit 2
+    through its own try/except while `apply --apply` — where journals open inside the
+    composer, under `_Guard`/`_fail` — landed it on exit 4, the DEVICE class ("the box
+    said no") for a run that never contacted a box.
+    **FIXED (t_cf2ad3c5): the hygiene refusal now raises `JournalRepoOutError`
+    (`JournalError` + `ConfigError`) — `_fail`'s single documented mapping converts it
+    onto exit 2 (both -o table and -o json), matching undo; the `JournalError` base
+    keeps the E1-04/E1-05 `pytest.raises(JournalError)` pins and undo's refusal arm
+    valid. Replay CORRUPTION (unknown schema/state) deliberately stays plain
+    `JournalError`: an unreadable journal is state a human adjudicates (§0.7), not
+    "fix your input". Zero cli.py change; guard message and refusal-first order
+    unchanged.**
 
 ## 10. Atomic card plan (DAG; each = one module + tests; workers NEVER touch the
 device — live bench steps are the orchestrator's, per fleet rule)
