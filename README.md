@@ -116,6 +116,11 @@ exactly one block — a leftover `sites.toml` in the current directory must not 
 choose which door controller to talk to. Unknown keys and out-of-range values are refused
 before any request is built.
 
+Bundles, probe files and run journals are PII and live under the private `--bundles-root`
+(`GATECLERK_BUNDLE_ROOT`, default `~/gateclerk/bundles` — e.g. `~/gateclerk-bundles`), **never
+inside a git repo**: `export`/`write_bundle` refuse an `--out` inside one, and so does the
+journal (§2).
+
 ## Read-only, enforced by CI
 
 This tool must never change device state: only `GET`, plus the stateless search `POST`s

@@ -46,10 +46,12 @@ it can be observed.
 |---|---|
 | `attendance_status_events.json` | site-a's terminal is in pure access-control mode, so `attendanceStatus` is absent on every real event (OBSERVED.md). The checkIn/checkOut/breakIn shape only appears if the owner enables attendance mode (DESIGN.md option A). `expected_direction` / `expected_source` are the asserted `EventRecord` values. |
 | `encrypted_person_data.json` | site-a returned plaintext names and has no encryption capability at all (`/ISAPI/Security/encryption/capabilities` → 404), so the base64-blob name cannot be captured here. `expect_encrypted` is the asserted `encrypted_person_data` value; names are always stored verbatim. |
+| `user_search_page_b_dialect.json` | the second terminal's `UserInfo/Search` dialect: every row carries a device-assigned `picID` site-A's rows never had (live A->B, card E1-10). Shape is site-A's recorded page verbatim + `picID`, so the ONE difference is the one `DEVICE_ASSIGNED_FIELDS` must absorb. Authored from the operator's live run record, not a masked capture (no B capture is committed). |
 
-Both are used by `tests/test_model.py` (card p1-07). If a later live probe shows the
-device really does emit one of these shapes, replace the synthetic file with a masked
-recording and say so in `docs/OBSERVED.md`.
+The first two are used by `tests/test_model.py` (card p1-07); the third by
+`tests/test_e1_10_picid_dialect.py`. If a later live probe shows the device really does
+emit one of these shapes, replace the synthetic file with a masked recording and say so in
+`docs/OBSERVED.md`.
 
 ## Scenario corpus — `scenarios/` (card p1-09)
 

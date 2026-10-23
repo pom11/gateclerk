@@ -220,6 +220,28 @@ class IsapiClient:
         """The effective timeouts, so a caller (and a test) can see what was configured."""
         return self._client.timeout
 
+    @property
+    def raw(self) -> httpx.Client:
+        """The one sanctioned escape hatch to the underlying HTTP transport.
+
+        Exists for the E1 migration WRITE seams (``migrate_apply._PhaseWriteTransport``)
+        and nothing else: the read-only registry (``gateclerk.endpoints``) is P1's
+        guarantee and stays exactly as its test pins it, so a captured write verb cannot
+        go through ``get``/``search`` — it goes over this transport with the client's own
+        digest ``auth`` (see the seam docstring). Callers must pass ``auth=client._auth``
+        themselves: this property hands over the transport, not the authorization.
+
+        Why a property instead of reaching into ``_client`` (E1-10, live A->B): a seam
+        that says ``client._client.post(...)`` is assuming what shape the object in front
+        of it happens to have. Under ``--verbose`` the CLI hands seams a
+        ``pipeline.LoggedClient`` whose ``_client`` is the INNER ``IsapiClient``, so that
+        expression asks an ``IsapiClient`` for ``.post`` and dies with
+        ``AttributeError: 'IsapiClient' object has no attribute 'post'`` — before any
+        write is sent. ``raw`` is resolved through ``LoggedClient.__getattr__``, so bare
+        and verbose become ONE code path and the seam never names a private again.
+        """
+        return self._client
+
     def get(self, name: str) -> dict[str, Any]:
         """GET a registered endpoint and return its body parsed (XML or JSON — the
         firmware answers System/* as XML despite `?format=json`, OBSERVED.md)."""

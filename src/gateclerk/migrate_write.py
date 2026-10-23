@@ -80,7 +80,7 @@ from typing import Any, Protocol
 
 from gateclerk.exceptions import GateclerkError
 from gateclerk.migrate_bundle import (
-    VOLATILE_FIELDS,
+    COMPARE_EXEMPT_FIELDS,
     BundleData,
     content_hash,
     normalize_record,
@@ -1455,8 +1455,12 @@ def _compare(
     live_hash = content_hash(live)
     # Volatile counters are already gone (normalize_record), and they are excluded
     # again so a future strip-list change cannot turn a counter into a mismatch.
-    unknown = sorted(set(live) - set(intended) - VOLATILE_FIELDS)
-    lacking = sorted(set(intended) - set(live) - VOLATILE_FIELDS)
+    # COMPARE_EXEMPT_FIELDS adds the device-assigned row handles (live A->B: site-B
+    # answers every UserInfo/Search row with a `picID` site-A never carried) — the
+    # unknown-field rule is fail-closed against a NEW DEVICE DIALECT here, not against
+    # mangled data, and the same constant is what the diff excludes (§5a single source).
+    unknown = sorted(set(live) - set(intended) - COMPARE_EXEMPT_FIELDS)
+    lacking = sorted(set(intended) - set(live) - COMPARE_EXEMPT_FIELDS)
     base: dict[str, Any] = {
         "employee_no": employee_no,
         "employee_hash": person_hash(employee_no),

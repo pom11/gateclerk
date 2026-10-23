@@ -71,6 +71,8 @@ from typing import Any
 __all__ = [
     "BUNDLE_DIRS",
     "BUNDLE_FILES",
+    "COMPARE_EXEMPT_FIELDS",
+    "DEVICE_ASSIGNED_FIELDS",
     "FACES_ABSENT_REASON",
     "FINGERPRINTS_ABSENT_REASON",
     "MANIFEST_NAME",
@@ -85,6 +87,7 @@ __all__ = [
     "FingerprintTemplate",
     "canonical_bytes",
     "canonical_json",
+    "comparable_record",
     "content_hash",
     "frozen_volatile_digest",
     "normalize_record",
@@ -116,6 +119,21 @@ VOLATILE_FIELDS: frozenset[str] = frozenset(
 #: person data, and it differs per box by construction — so the value is dropped
 #: entirely (a bare `/staging/...` path with a foreign host is still per-device).
 VOLATILE_URL_FIELDS: frozenset[str] = frozenset({"photoURL", "faceURL"})
+
+#: Row handles the DEVICE assigns for its own bookkeeping (live A->B, 2026-10-23:
+#: site-B answers every `UserInfo/Search` row with a `picID`, site-A rows carry none).
+#: Like the stripped URLs these are device-local plumbing, never person identity and
+#: never migratable — the captured SetUp write body has no `picID` key, and the face
+#: link is FPID/employeeNo, not picID. So they are excluded from the content hash and
+#: from every field-SET comparison, but kept in the bundle bytes.
+#:
+#: NOT in ``VOLATILE_FIELDS`` — deliberately. That list is FROZEN into every bundle
+#: manifest as ``frozen_volatile_digest()`` and ``read_bundle`` refuses a mismatch, so
+#: widening it would make bundles already exported (the operator's site-a-20261023-1250)
+#: unreadable. picID is excluded at COMPARE/HASH time only; no bundle byte moves.
+#: If a future capture ever ties faces or cards to picID, this exclusion is wrong and
+#: the card that finds it must say so — do not quietly widen the list.
+DEVICE_ASSIGNED_FIELDS: frozenset[str] = frozenset({"picID"})
 
 #: The faces state this card ships (v4 scope note, operator 2026-10-21): face
 #: template export (FDSearch `modelData`) and FP template export moved to E1-01b;
@@ -156,6 +174,25 @@ BUNDLE_DIRS: frozenset[str] = frozenset({_FACES_DIR, _FINGERPRINTS_DIR})
 
 #: The full strip set both sides of every hash must agree on.
 _STRIPPED_KEYS: frozenset[str] = VOLATILE_FIELDS | VOLATILE_URL_FIELDS
+
+#: What every field-SET comparison (verify's unknown/lacking rule) must ignore: the
+#: volatile strip set PLUS the device-assigned row handles. One name, one definition —
+#: verify and the diff both read this, so the two sides can never drift apart.
+COMPARE_EXEMPT_FIELDS: frozenset[str] = _STRIPPED_KEYS | DEVICE_ASSIGNED_FIELDS
+
+
+def comparable_record(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """The shape every migration hash and field-set comparison uses.
+
+    ``normalize_record`` (bundle bytes keep the device-assigned handle — see
+    :data:`DEVICE_ASSIGNED_FIELDS` for why the strip list itself must not move) plus
+    dropping the device-assigned keys. Use this whenever a record from one box is
+    compared against a record from another box.
+    """
+    normalized = normalize_record(raw)
+    if normalized.keys() & DEVICE_ASSIGNED_FIELDS:
+        normalized = {k: v for k, v in normalized.items() if k not in DEVICE_ASSIGNED_FIELDS}
+    return normalized
 
 
 def frozen_volatile_digest() -> str:
@@ -281,13 +318,13 @@ def content_hash(record: Mapping[str, Any]) -> str:
       * a whole BUNDLE FILE (diff/verify integrity checks) — pass the parsed object
         itself; a re-strip there would strip data the diff depends on.
     """
-    normalized = record if _is_normalized(record) else normalize_record(record)
+    normalized = record if _is_comparable(record) else comparable_record(record)
     return hashlib.sha256(canonical_bytes(normalized)).hexdigest()
 
 
-def _is_normalized(record: Mapping[str, Any]) -> bool:
-    """True when `record` already carries none of the volatile keys."""
-    return not (set(record) & (VOLATILE_FIELDS | VOLATILE_URL_FIELDS))
+def _is_comparable(record: Mapping[str, Any]) -> bool:
+    """True when `record` already carries none of the volatile nor device-assigned keys."""
+    return not (set(record) & COMPARE_EXEMPT_FIELDS)
 
 
 # --- manifest + faces index shapes ------------------------------------------------------

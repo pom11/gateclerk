@@ -73,7 +73,7 @@ from enum import StrEnum
 from typing import Any
 
 from gateclerk.exceptions import GateclerkError
-from gateclerk.migrate_bundle import BundleData, content_hash, normalize_record
+from gateclerk.migrate_bundle import BundleData, comparable_record, content_hash
 from gateclerk.migrate_export import EnrollmentState, collect_enrollment_state
 from gateclerk.migrate_probe import CapabilityMatrix, require_fresh
 from gateclerk.tz import DEFAULT_SITE_TZ, TimeResolver
@@ -369,17 +369,22 @@ _MISSING = _Missing()
 def _actionable_field_names(
     source: Mapping[str, Any], target: Mapping[str, Any]
 ) -> tuple[str, ...]:
-    """Sorted NAMES of normalized fields that differ, door fields excluded (§4: only
-    names ever leave this function — values are compared here and discarded)."""
-    src = normalize_record(source)
-    tgt = normalize_record(target)
+    """Sorted NAMES of comparable fields that differ, door fields excluded (§4: only
+    names ever leave this function — values are compared here and discarded).
+
+    ``comparable_record`` = normalize_record minus the device-assigned row handles:
+    site-B answers every UserInfo/Search row with a `picID` site-A rows never carried,
+    and a per-device handle is as little a person's "field that differs" as the stripped
+    URLs are (same exclusion verify uses — one constant, §5a no-duplication)."""
+    src = comparable_record(source)
+    tgt = comparable_record(target)
     differing = {k for k in set(src) | set(tgt) if src.get(k, _MISSING) != tgt.get(k, _MISSING)}
     return tuple(sorted(differing - DOOR_FIELDS))
 
 
 def _door_only_field_names(source: Mapping[str, Any], target: Mapping[str, Any]) -> tuple[str, ...]:
-    src = normalize_record(source)
-    tgt = normalize_record(target)
+    src = comparable_record(source)
+    tgt = comparable_record(target)
     differing = {k for k in set(src) | set(tgt) if src.get(k, _MISSING) != tgt.get(k, _MISSING)}
     return tuple(sorted(differing & DOOR_FIELDS))
 

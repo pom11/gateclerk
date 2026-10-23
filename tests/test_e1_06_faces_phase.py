@@ -1211,7 +1211,10 @@ def test_apply_confirm_true_walks_the_independent_verify(tmp_path: Path) -> None
     report = faces_report(result, journal, verify=verify)
     assert report["phase"] == "faces" and report["verify"]["counts"]["ok"] == 1
     # §4 PII: the report carries hashes and counts — never employee numbers or bytes.
-    flat = json.dumps(report)
+    # The journal PATH is a filesystem location the CALLER chose (here, a pytest tmp dir
+    # whose counter can happen to spell "90"), not device data, so it is out of scope for
+    # the sweep; everything the phase itself produced is still swept.
+    flat = json.dumps({k: v for k, v in report.items() if k != "journal"})
     assert (
         "90" not in flat
         and TPL_B64 not in flat

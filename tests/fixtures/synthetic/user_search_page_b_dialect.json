@@ -1,0 +1,169 @@
+{
+  "_comment": [
+    "Synthetic fixture (NOT a masked capture). Site-B's `UserInfo/Search` answers EVERY",
+    "row with a device-assigned `picID`; site-A's recorded page",
+    "(recorded/site-a-ds-k1t341amf-s/user_search_page1.json) carries none. That single",
+    "extra key is what failed the live A->B run's users verify: §6's fail-closed",
+    "unknown-field rule saw a field the intended record lacked and called a LANDED",
+    "write a MISMATCH (card E1-10, live session run-b-20261023-1300).",
+    "Shape otherwise mirrors site-A's recorded page verbatim - same rows, same key set,",
+    "same 'OK' envelope - plus `picID` on each row, so the ONE dialect difference is the",
+    "one this card must survive. `picID` is a per-device row handle: never migratable,",
+    "never person identity, and never the face link (that is FPID/employeeNo). See",
+    "migrate_bundle.DEVICE_ASSIGNED_FIELDS for the rule and for what would falsify it.",
+    "Masking policy as everywhere: names are the `User E<n>` convention, host is",
+    "<device-b>, no serial, nonce or credential."
+  ],
+  "UserInfoSearch": {
+    "searchID": "b1e000000001",
+    "responseStatusStrg": "OK",
+    "numOfMatches": 4,
+    "totalMatches": 4,
+    "UserInfo": [
+      {
+        "employeeNo": "1",
+        "picID": "1000000001",
+        "name": "User E1",
+        "userType": "normal",
+        "closeDelayEnabled": false,
+        "Valid": {
+          "enable": true,
+          "beginTime": "2000-01-01T00:00:00",
+          "endTime": "2037-12-31T23:59:59",
+          "timeType": "local"
+        },
+        "belongGroup": "",
+        "password": "",
+        "doorRight": "1",
+        "RightPlan": [
+          {
+            "doorNo": 1,
+            "planTemplateNo": "1"
+          }
+        ],
+        "maxOpenDoorTime": 0,
+        "openDoorTime": 0,
+        "roomNumber": 0,
+        "floorNumber": 0,
+        "localUIRight": true,
+        "gender": "unknown",
+        "numOfCard": 0,
+        "numOfFP": 1,
+        "numOfFace": 1,
+        "PersonInfoExtends": [
+          {
+            "value": ""
+          }
+        ]
+      },
+      {
+        "employeeNo": "2",
+        "picID": "1000000002",
+        "name": "User E2",
+        "userType": "normal",
+        "closeDelayEnabled": false,
+        "Valid": {
+          "enable": true,
+          "beginTime": "2000-01-01T00:00:00",
+          "endTime": "2037-12-31T23:59:59",
+          "timeType": "local"
+        },
+        "belongGroup": "",
+        "password": "",
+        "doorRight": "1",
+        "RightPlan": [
+          {
+            "doorNo": 1,
+            "planTemplateNo": "1"
+          }
+        ],
+        "maxOpenDoorTime": 0,
+        "openDoorTime": 0,
+        "roomNumber": 0,
+        "floorNumber": 0,
+        "localUIRight": false,
+        "gender": "unknown",
+        "numOfCard": 0,
+        "numOfFP": 0,
+        "numOfFace": 1,
+        "PersonInfoExtends": [
+          {
+            "value": ""
+          }
+        ]
+      },
+      {
+        "employeeNo": "3",
+        "picID": "1000000003",
+        "name": "User E3",
+        "userType": "normal",
+        "closeDelayEnabled": false,
+        "Valid": {
+          "enable": true,
+          "beginTime": "2000-01-01T00:00:00",
+          "endTime": "2037-12-31T23:59:59",
+          "timeType": "local"
+        },
+        "belongGroup": "",
+        "password": "",
+        "doorRight": "1",
+        "RightPlan": [
+          {
+            "doorNo": 1,
+            "planTemplateNo": "1"
+          }
+        ],
+        "maxOpenDoorTime": 0,
+        "openDoorTime": 0,
+        "roomNumber": 0,
+        "floorNumber": 0,
+        "localUIRight": false,
+        "gender": "unknown",
+        "numOfCard": 0,
+        "numOfFP": 0,
+        "numOfFace": 1,
+        "PersonInfoExtends": [
+          {
+            "value": ""
+          }
+        ]
+      },
+      {
+        "employeeNo": "4",
+        "picID": "1000000004",
+        "name": "User E4",
+        "userType": "normal",
+        "closeDelayEnabled": false,
+        "Valid": {
+          "enable": true,
+          "beginTime": "2000-01-01T00:00:00",
+          "endTime": "2037-12-31T23:59:59",
+          "timeType": "local"
+        },
+        "belongGroup": "",
+        "password": "",
+        "doorRight": "1",
+        "RightPlan": [
+          {
+            "doorNo": 1,
+            "planTemplateNo": "1"
+          }
+        ],
+        "maxOpenDoorTime": 0,
+        "openDoorTime": 0,
+        "roomNumber": 0,
+        "floorNumber": 0,
+        "localUIRight": false,
+        "gender": "unknown",
+        "numOfCard": 0,
+        "numOfFP": 0,
+        "numOfFace": 1,
+        "PersonInfoExtends": [
+          {
+            "value": ""
+          }
+        ]
+      }
+    ]
+  }
+}

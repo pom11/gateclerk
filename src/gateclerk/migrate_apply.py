@@ -1333,6 +1333,15 @@ class _PhaseWriteTransport:
     session — one long-lived session per phase (§5.3), re-bootstrapped by the budget
     rather than retried on failure: **a write is never re-sent** (§0.6), which is why
     none of the read client's busy-retry or circuit machinery is reproduced here.
+
+    The transport is reached through ``client.raw`` — ``IsapiClient``'s one sanctioned
+    escape hatch — never through ``client._client`` (E1-10). That distinction is what
+    makes the seam shape-agnostic: under ``--verbose`` the CLI hands seams a
+    ``pipeline.LoggedClient`` whose ``_client`` is the INNER ``IsapiClient``, so
+    ``client._client.post(...)`` asks an ``IsapiClient`` for an httpx verb and dies with
+    ``AttributeError: 'IsapiClient' object has no attribute 'post'`` before a single byte
+    is written (the operator's live crash, reproduced verbatim). ``LoggedClient``
+    forwards ``raw`` transparently, so the bare and verbose paths are one code path.
     """
 
     #: What the envelope words name in an error line.
@@ -1355,7 +1364,7 @@ class _PhaseWriteTransport:
         who: str = "the phase",
     ) -> dict[str, Any]:
         self.calls += 1
-        response = self.client._client.request(
+        response = self.client.raw.request(
             method,
             path,
             params=dict(params or {"format": "json"}),
@@ -1425,7 +1434,7 @@ class FpWriteTransport(_PhaseWriteTransport):
 
     def get_progress(self, path: str) -> dict[str, Any]:
         self.calls += 1
-        response = self.client._client.get(path, params={"format": "json"}, auth=self.client._auth)
+        response = self.client.raw.get(path, params={"format": "json"}, auth=self.client._auth)
         try:
             return dict(json.loads(response.content))
         except ValueError as exc:
@@ -1443,7 +1452,7 @@ class FaceWriteTransport(_PhaseWriteTransport):
 
     def post_face_search(self, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
         self.calls += 1
-        response = self.client._client.post(
+        response = self.client.raw.post(
             path, params={"format": "json"}, json=dict(body), auth=self.client._auth
         )
         try:
