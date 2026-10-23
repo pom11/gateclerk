@@ -656,3 +656,20 @@ accepted-not-applied rule). OBSERVED + design committed 1ccc6e6.
 Dispatched the three E1-04 children (all parents satisfied, fixtures merged via #43):
 E1-05 cards t_8ed04ad5, E1-06 faces t_d2487aef (critical path), E1-06b fingerprints
 t_c3f04cfe — running. E1-07 CLI wiring follows after those three merge.
+
+## 2026-10-23 — E1-05/06/06b merged; E1-07 (CLI + composer) dispatched
+
+Gated the three write-phase PRs in stack order #45 (fingerprints) → #47 (faces,
+stacked) → #46 (cards): all three FakeDevice-strict, diffs clean of hosts/creds/
+names/real template bytes. Gate caught one real gap — #45's headline confirm gate
+(post-read sha equality) survived a mutation probe because the fake's applies-mode
+stores verbatim; added the pin test (doctored reader: ack + PRESENT + wrong sha
+never confirms) on the branch before merging. #46's fakedevice.py conflict (both
+branches grew the write axis in disjoint regions) resolved by transplanting the
+card delta onto main's canonical fake; the "LATER card" §9 pin becomes the
+un-armed refusal now that all three families route from captures. Merged: #45
+d6c3e08, #47 4748c71, #46 19f0f5e; main verified 1867 passed + ruff + format clean.
+
+Carded E1-07 t_56394a64 (CLI group + the missing §5 phase composer in a new
+migrate_apply.py + PII-free -o json) — running. Last E1 build card; the §5.0
+capture spine is fully paid off (nothing to capture for a CLI over merged seams).
