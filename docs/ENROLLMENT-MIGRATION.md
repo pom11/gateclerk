@@ -436,6 +436,51 @@ orchestrator capture writes (§5 step 0) → mutate one person via A UI-equivale
 diff detects → apply restores → verify passes → undo exercised. B/C: nothing until
 creds + explicit write OK (dry-run + read-only first).
 
+### 9.1 LIVE VALIDATION RESULT — bench A, 2026-10-23 (E1-08, orchestrator-run) ✅
+
+First real use of the product transport against a device. Full session log:
+`~/gateclerk-data/live/*.json` (PII-free CLI report envelopes).
+
+- **probe** → schema-2 document, exit 0 (surfaces, counts, caps, clock).
+- **export B1** → baseline 4 users / 4 faces (272 B each) / 0 cards / 0 FP;
+  termination `OK / NOMATCH / NOMATCH / ONE-SHOT-COMPLETE` — honest zeros.
+- **workload** (captured shapes only, throwaway person 90 + card + face) → export
+  **B2**: 5 / 5 / 1 / 0.
+- **wipe** (deliberate, the one accepted `UserInfoDetail/Delete` shape §5b; B1+B2
+  on disk first) → `userNumber: 0`.
+- **product `migrate apply B2 --apply` onto the empty box** → users 5 landed,
+  cards 1 landed, faces 5 landed, clean, exit 0, journal `runs/20261023T083534Z`.
+  **Verified by fresh product export: people set AND face (employee, sha256) set
+  byte-identical to B2.** The migration product really migrates a real terminal.
+- **undo arms against the same journal**: cards → 1→0 targeted, exit 0; faces →
+  25 delete calls, per-employee count deltas 5→4→3→2→1→0, zero incidents, FDSearch
+  then NOMATCH; users → refused report-only with the §5b.1 note, roster untouched
+  at 5. Exactly the designed behavior of all three modes.
+- **restore**: wipe again + **product `apply B1`** (the product restores its own
+  baseline) → diff vs B1 all-same exit 0; final export people+faces == B1.
+  Events store survived both wipes untouched (earliest serial 27 and newest 5753
+  readable post-wipe; separate storage). Bench A = baseline, person-1 FP absent as
+  before (never re-appliable by design).
+- Dry-run-before-apply held every time (journal dir exists only after `--apply`).
+
+Findings (filed on card E1-08, fixes = small cards):
+1. **probe persistence bypasses the repo-out guard** — `probe` persists to
+   `bundle_root()/probes/` (default `~/gateclerk/bundles`), and `_refuse_repo_out`
+   guards only `export --out`; PII-bearing probe JSON landed *inside* the local
+   ops git repo `~/gateclerk` (device host in the filename, identity hashes inside).
+   Mitigating facts verified during the run: that repo has NO remotes and the file
+   was untracked, so nothing left the machine; it was moved out by hand. Fix card:
+   apply the same refusal in the probe persist path (+ a hygiene test), and add
+   `bundles/` to the ops repo's .gitignore (local ops action, not a product card).
+2. **undo journal path is `<journal>.json` for cards/faces but `<stem>.undo.jsonl`
+   for faces... ** — actually observed: cards `cards.undo.jsonl`, faces
+   `faces.undo.jsonl` — consistent. Correction: no defect; earlier confusion was
+   my report-key assumption (`countBefore/countAfter` exist only in the cards
+   report; faces report uses `deltas`). Recorded here so the next reader doesn't
+   re-trip on it.
+2b. **events `--since/--until` whole-history window is slow** (~10k rows: minutes
+    through the CLI paging at maxResults=30) — noted, not a defect.
+
 ## 10. Atomic card plan (DAG; each = one module + tests; workers NEVER touch the
 device — live bench steps are the orchestrator's, per fleet rule)
 

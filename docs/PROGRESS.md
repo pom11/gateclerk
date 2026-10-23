@@ -673,3 +673,25 @@ d6c3e08, #47 4748c71, #46 19f0f5e; main verified 1867 passed + ruff + format cle
 Carded E1-07 t_56394a64 (CLI group + the missing §5 phase composer in a new
 migrate_apply.py + PII-free -o json) — running. Last E1 build card; the §5.0
 capture spine is fully paid off (nothing to capture for a CLI over merged seams).
+
+## 2026-10-23 — E1-07 merged (PR #48 = 2311aed) + E1-08 LIVE VALIDATION PASSED on bench A
+
+Gate on a fresh worktree: 1891 passed, ruff + format clean, hygiene diff scan 0 hits.
+Mutation probe Mut3 survived on the apply report's forward undo preview (it could show
+`journal` for users while `undo` refuses per §5b.1) — added the pin on the branch
+before merging; report legibility is now tested, and live use confirmed the real
+dispatch (report_only + the §5b.1 note, roster untouched).
+
+E1-08 ran end-to-end as the orchestrator (HUMAN-RUN card; workers never touch the
+device): probe -> export B1 -> workload via captured shapes (person 90 + card + face)
+-> export B2 -> deliberate §5b wipe -> **product `migrate apply B2 --apply` onto the
+empty box** (users 5 / cards 1 / faces 5 landed; fresh export byte-identical to B2) ->
+undo cards 1->0, undo faces 25 calls with per-employee deltas 5..0, undo users refused
+report-only -> wipe + **product apply B1** restored the baseline (diff all-same,
+people+faces == B1). Events store survived both wipes (serial 27 and 5753 readable).
+Dry-run-before-apply held every time. Bench A = baseline; B/C untouched, read-only.
+
+Findings recorded in design §9.1: probe persistence bypasses the repo-out guard
+(PII-bearing probe JSON landed inside the local, remote-less ops repo `~/gateclerk`;
+moved out by hand, ops repo now gitignores `bundles/` and its old `probe/` dump moved
+to ~/gateclerk-data/capture/). Fix carded as a small product card.
