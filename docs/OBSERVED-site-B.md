@@ -89,3 +89,36 @@ Same resolution as site-a; the model's flag stays.
   owner before any `--apply`.
 - Winter acceptance task: after Oct 25 (DST end) confirm the claim flips to +02:00
   and `device time` still says `agrees`; windows follow automatically.
+
+## Face WRITE capture (E1-11 groundwork, orchestrator, 2026-10-23) — the template PORTABILITY wall
+
+Live A->B faces phase (run-b-20261023-2053) stopped at the first upload: B answered
+`400 badJsonContent` to our captured flat FDSetUp body. Bounded discrimination on
+B (one attempt per shape; products of this session were deleted, B back to 4u/1f):
+
+| probe | bytes sent (magic) | body shape | result |
+|---|---|---|---|
+| P1 control (zero state change): B's OWN emp-1 template back to its own FPID 1 | FR702706 (B native) | captured flat `{faceLibType,FDID,FPID,modelData}` | `ok` (read-back unchanged) |
+| E1: B's own template at a NEW FPID 2 | FR702706 | same flat body, no faceURL key | `ok`, read-back sha matches, FDSearch/Delete removed it `ok` |
+| E2: A's emp-2 template at FPID 2 | FR500005 (A V3.2.30 native) | byte-identical shape to E1 | **`400 Invalid Content subStatusCode:badJsonContent errorMsg:"faceURL"`** |
+
+Device truths:
+- **The flat four-key FDSetUp shape is CORRECT on V4.13.0 too** (E1 accepted it at a
+  fresh person; no faceURL key required when modelData parses). The body builder is
+  NOT the defect.
+- **A's `FR500005` face templates are REJECTED by V4.13.0** (B's native magic is
+  `FR702706`). `errorMsg:"faceURL"` is the fallback diagnostic when modelData fails
+  to parse ("then give me a picture URL") — B's photos path is dead the same way
+  site-A's is (FDSearch rows carry faceURL but the GET 404s), and A cannot export
+  picture bytes either, so **the picture-based alternative is impossible from an A
+  bundle**. `isSupportFDSearchDataPackage:false` on B — no import-package route.
+  Consequence: cross-generation face migration A(V3.2.30)->B(V4.13.0) is a FIRMWARE
+  WALL for template bytes. Faces must be re-enrolled on B (the operator's call).
+- FDSearch/Delete (captured shape, PUT with `FDID`+`faceLibType` params) verified on
+  B — the undo leg works on V4.13.0.
+- Caps (V4.13.0): `isSupportModelData:true`, `modelMaxNum:1`, `FDMaxNum:2` (blackFD +
+  infraredFD), `FDRecordDataMaxNum:3000`.
+
+Artifacts (local, PII-free of names): ~/gateclerk-data/live/cap_p1_*, cap_e1_*,
+cap_e2_* + run-b-20261023-2053 journal (seq1 planned->rejected deviceSubStatus
+badJsonContent). B snapshots: site-b-20261023-2053 (operator), site-b-20261023-2120.
