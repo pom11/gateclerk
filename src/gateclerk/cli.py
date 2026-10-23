@@ -2031,7 +2031,16 @@ def migrate_probe(
             host=site_config.host,
             site_tz=site_config.iana_tz or DEFAULT_TZ,
         )
-        path = save_matrix(matrix, root)
+        try:
+            path = save_matrix(matrix, root)
+        except ValueError as exc:
+            # §9.1 finding 1: the persist seam refuses a root under a git repo through
+            # migrate_bundle's shared `_refuse_repo_out` — the SAME guard `export --out`
+            # refuses with (§2), reused not re-expressed (§5a). A repo-out root is a
+            # value the operator pointed at, so it lands on the config class (exit 2)
+            # with the guard's own message naming the repo root, and NO probe file
+            # exists anywhere under the repo: the refusal precedes the first mkdir.
+            raise _config_exit(fmt, str(exc)) from exc
     if fmt is OutputFormat.TABLE:
         render(
             [

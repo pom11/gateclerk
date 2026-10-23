@@ -472,6 +472,12 @@ Findings (filed on card E1-08, fixes = small cards):
    was untracked, so nothing left the machine; it was moved out by hand. Fix card:
    apply the same refusal in the probe persist path (+ a hygiene test), and add
    `bundles/` to the ops repo's .gitignore (local ops action, not a product card).
+   **FIXED (E1-09): `save_matrix` now runs the target dir through the shared
+   `migrate_bundle._refuse_repo_out` before the first mkdir — the same guard
+   `export --out` refuses with, reused not re-expressed (§5a); the CLI surfaces
+   the refusal as exit 2 with the guard's message naming the repo root. Pinned
+   by tests/test_e1_09_probe_repo_guard.py, incl. the stub-the-guard mutation
+   probe proving no second copy of the rule exists in the probe path.**
 2. **undo journal path is `<journal>.json` for cards/faces but `<stem>.undo.jsonl`
    for faces... ** — actually observed: cards `cards.undo.jsonl`, faces
    `faces.undo.jsonl` — consistent. Correction: no defect; earlier confusion was

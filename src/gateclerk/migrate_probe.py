@@ -70,6 +70,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from gateclerk import migrate_bundle
 from gateclerk.capabilities import CapabilityCache, DeviceCapabilities, discover
 from gateclerk.exceptions import (
     IsapiAuthError,
@@ -1054,8 +1055,21 @@ def probes_dir(root: str | os.PathLike[str]) -> Path:
 
 
 def save_matrix(matrix: CapabilityMatrix, root: str | os.PathLike[str]) -> Path:
-    """Persist under `<root>/probes/<site>-<host>.json`, dir 0700 / file 0600 (§2 hygiene)."""
+    """Persist under `<root>/probes/<site>-<host>.json`, dir 0700 / file 0600 (§2 hygiene).
+
+    §9.1 finding 1 (E1-08, live-validated): the probe document is PII-adjacent — the
+    device host rides in the FILENAME and identity evidence rides inside — and the
+    default root resolves under `~/gateclerk`, which on the ops box is a git repo. So the
+    persist passes through `migrate_bundle`'s repo-out guard, the SAME shared seam
+    `export --out` refuses through (§2 "REFUSE an --out inside the repo"). Reused, not
+    re-expressed (§5a no-duplication): the call goes through the module attribute, so
+    one guard governs every persist seam and stubbing it stubs this one too. Journals
+    keep their own `_refuse_repo_path` (migrate_write) — untouched here.
+    """
     directory = probes_dir(root)
+    # The dir, not the final file: `_slug` keeps the name inside probes/, so refusing
+    # the dir refuses every file this function can write — BEFORE the first mkdir.
+    migrate_bundle._refuse_repo_out(directory)
     directory.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):  # exotic filesystems; content still written
         directory.chmod(0o700)

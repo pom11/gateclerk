@@ -696,6 +696,26 @@ Findings recorded in design §9.1: probe persistence bypasses the repo-out guard
 moved out by hand, ops repo now gitignores `bundles/` and its old `probe/` dump moved
 to ~/gateclerk-data/capture/). Fix carded as a small product card.
 
+## 2026-10-23 — E1-09: probe persist now honors the repo-out guard (§9.1 finding 1)
+
+One-seam fix: `migrate_probe.save_matrix` runs the target dir through the SHARED
+`migrate_bundle._refuse_repo_out` before the first mkdir — the same guard `export
+--out` refuses with (§2), reused not re-expressed (§5a; the call goes through the
+module attribute, so stubbing the shared guard stubs this seam too). The CLI maps
+the refusal onto the config class: exit 2 + the guard's own message naming the repo
+root, and no file appears anywhere under the repo tree (the refusal precedes the
+first mkdir). Journals' own `_refuse_repo_path` untouched (non-goal).
+
+Pinned by tests/test_e1_09_probe_repo_guard.py (8 tests, FakeDevice-strict offline,
+reusing the E1-07 harness): refusals through the module (checkout + linked-worktree
+`.git` spellings), the reuse spy (guard consulted with the probes/ DIR, real guard
+still running), the stub-to-no-op mutation probe (duplication would keep refusing
+and go red), CLI exit-2 for both `--bundles-root` and the `GATECLERK_BUNDLE_ROOT`
+default rung (the incident path, without touching real home), zero writes under the
+repo, and the outside-a-repo happy path unchanged (0700/0600 + round-trip).
+Self-ran the guard-removal mutation too: exactly the 4 refusal tests went red.
+Full offline suite 1900 passed / 5 skipped; ruff check + format clean.
+
 ## 2026-10-23 — first LIVE cross-device migration A->B (operator-run) -> E1-10 t_4ede732f
 
 Operator ran the product CLI on efc91a2 against real hardware: export A (4u/4f) +
