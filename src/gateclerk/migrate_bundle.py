@@ -68,6 +68,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from gateclerk.exceptions import BundleRepoOutError
+
 __all__ = [
     "BUNDLE_DIRS",
     "BUNDLE_FILES",
@@ -644,7 +646,7 @@ def repo_root(start: Path | None = None) -> Path | None:
 def _refuse_repo_out(out: Path) -> None:
     root = repo_root(out)
     if root is not None:
-        raise ValueError(
+        raise BundleRepoOutError(
             f"refusing to write an enrollment bundle inside a git repo: out={out} is "
             f"under {root}. Bundles carry personal data (names, cards, hashes); a "
             "public repo must never contain one (design §2 'REFUSE an --out inside "
@@ -656,7 +658,9 @@ def _refuse_repo_out(out: Path) -> None:
     lowered = str(out).lower()
     for marker in ("/.worktrees/", "/worktrees/"):
         if marker in lowered:
-            raise ValueError(f"refusing to write an enrollment bundle under a worktree path: {out}")
+            raise BundleRepoOutError(
+                f"refusing to write an enrollment bundle under a worktree path: {out}"
+            )
 
 
 # --- file hygiene -----------------------------------------------------------------------

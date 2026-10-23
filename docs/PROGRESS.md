@@ -745,3 +745,32 @@ same-class fixtures, and the old-bundle-still-reads digest pin.
 B state after operator runs: emp 1-4 users, faces emp 1 only — operator reruns the
 same A bundle onto B once E1-10 merges (faces carry to 2-4; verify no longer trips
 on picID).
+## 2026-10-23 — t_0d635ee2: export's repo-out refusal now exits 2 (was an unhandled traceback)
+
+Found by E1-09: the card body claimed probe must exit 2 "exactly like export does" —
+verified false. `_refuse_repo_out` raised a bare `ValueError`, which escapes
+`_Guard`/`_fail` (unknown class -> re-raise) and crashed `migrate export --out <repo>`
+as a traceback with exit 1. Fix shape: one new class, `BundleRepoOutError(ValueError,
+ConfigError)`, in the shared exception vocabulary — the ConfigError base puts the
+refusal on p1-08's documented exit-2 class through the ONE existing `_fail` mapping
+(no cli.py change; `_fail`'s docstring rule: "a new exception class has exactly one
+place to be added"), and the ValueError base keeps the module-level contract pinned by
+E1-01/E1-01b intact plus E1-09's probe `except ValueError` seam when that branch
+merges. No behavior change to the guard (same message, still refuses before the first
+mkdir).
+
+Audited the other write_bundle/journal seams while here: `migrate export` is the only
+CLI path that reaches `_refuse_repo_out`; journals go through `migrate_write.
+_refuse_repo_path`/`JournalError`, which is mapped consistently by `undo` (exit 2) but
+lands on exit 4 via `_Guard`/`_fail` on the `apply` path — same class of mismatch,
+different guard, deliberately left to its own card rather than scope-crept here.
+
+Pinned by tests/test_t_0d635ee2_export_repo_out_exit2.py (8 FakeDevice-strict offline
+tests on the E1-07 harness): CLI exit 2 for `--out` under `git init` in both
+`-o table` and `-o json`, the json error names the repo root and carries exit_code 2,
+no bundle/partial/manifest anywhere under the repo (the refusal still precedes the
+first mkdir; the read pass still ran), outside-a-repo export still exits 0, the
+call-through spy (guard consulted with the `--out` dir), the stub-to-no-op mutation
+probe (a second copy of the rule in the CLI would keep refusing and go red, §5a), and
+the exception contract (ValueError + ConfigError; `_fail` converts instead of
+re-raising). TDD: 6 of the 8 were red against c624e62 before the fix.

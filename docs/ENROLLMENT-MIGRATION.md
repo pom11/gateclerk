@@ -478,6 +478,14 @@ Findings (filed on card E1-08, fixes = small cards):
    the refusal as exit 2 with the guard's message naming the repo root. Pinned
    by tests/test_e1_09_probe_repo_guard.py, incl. the stub-the-guard mutation
    probe proving no second copy of the rule exists in the probe path.**
+**FIXED (t_0d635ee2): the guard now raises `BundleRepoOutError`
+   (ValueError + ConfigError) instead of a bare ValueError — `cli._fail`'s single
+   documented mapping converts it onto exit 2, so `export --out` inside a repo
+   exits 2 with the guard's own message (both -o table and -o json) instead of
+   crashing as an unhandled traceback (exit 1, verified live; the E1-09 card's
+   "exactly like export does" premise was false until this). The ValueError base
+   keeps every module-level pin (E1-01, E1-01b) and E1-09's probe `except
+   ValueError` seam valid; no behavior change to the guard itself.**
 2. **undo journal path is `<journal>.json` for cards/faces but `<stem>.undo.jsonl`
    for faces... ** — actually observed: cards `cards.undo.jsonl`, faces
    `faces.undo.jsonl` — consistent. Correction: no defect; earlier confusion was

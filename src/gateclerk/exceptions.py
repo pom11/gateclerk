@@ -22,6 +22,7 @@ import re
 from typing import Any
 
 __all__ = [
+    "BundleRepoOutError",
     "ConfigError",
     "CredentialUnavailable",
     "EnrollmentReadAborted",
@@ -83,6 +84,23 @@ class CredentialUnavailable(ConfigError):
     The message always names the source that was tried and the command or variable that
     would satisfy it (docs/OBSERVED.md + card p1-02), so the fix is a copy-paste away —
     never a guess. Never contains the secret itself.
+    """
+
+
+class BundleRepoOutError(ValueError, ConfigError):
+    """A PII-bearing write (bundle, probe document) was refused for landing in a git repo.
+
+    Design §2 ("REFUSE an --out inside the repo") makes this a refusal of WHERE the
+    operator pointed the command, not a device fault and not a bug — so it belongs on
+    p1-08's config class (exit 2), and `cli._fail` — the single documented mapping —
+    converts it there. Before this class existed the guard raised a bare `ValueError`,
+    which `_fail` re-raises (unknown class), and the refusal escaped `migrate export`
+    as an unhandled traceback with exit 1 (found by E1-09; card t_0d635ee2).
+
+    The `ValueError` base is load-bearing, not decoration: the module-level contract of
+    `write_bundle` / `save_matrix` is pinned as `pytest.raises(ValueError)` by E1-01 and
+    E1-01b, and E1-09's probe CLI maps `except ValueError` — both keep working against
+    the subclass, so the guard's own behavior needed no change.
     """
 
 
