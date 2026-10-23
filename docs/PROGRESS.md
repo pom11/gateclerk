@@ -695,3 +695,33 @@ Findings recorded in design §9.1: probe persistence bypasses the repo-out guard
 (PII-bearing probe JSON landed inside the local, remote-less ops repo `~/gateclerk`;
 moved out by hand, ops repo now gitignores `bundles/` and its old `probe/` dump moved
 to ~/gateclerk-data/capture/). Fix carded as a small product card.
+
+## 2026-10-23 — first LIVE cross-device migration A->B (operator-run) -> E1-10 t_4ede732f
+
+Operator ran the product CLI on efc91a2 against real hardware: export A (4u/4f) +
+B snapshot (site-b-20261023-1250) under ~/gateclerk-bundles (OUTSIDE the repo —
+export's repo-out guard is why; README line folded into E1-10 acceptance). Diff
+add=3 conflict=1 (emp 1 on B with own face + localUIRight -> skipped, correct).
+Run 1250: users LANDED 3 (emp 2-4) then "verify disagreed" — only differing field
+was `picID`, a device-assigned row handle site-B answers on every UserInfo/Search
+row and site-A never sends -> §6 unknown-field rule fail-closes a LANDED write.
+Run 1300: users OK; faces aborted BEFORE any write: AttributeError 'IsapiClient'
+object has no attribute 'post' — FaceWriteTransport.post_face_search reaches
+`client._client.post(...)`; bare IsapiClient works (inner httpx.Client) but the
+--verbose path hands seams a LoggedClient whose ._client is the INNER IsapiClient,
+which has no .post — orchestrator reproduced the operator's EXACT error string with
+httpx.MockTransport. _request/.request has the same latent shape bug for every
+write verb. FakeDevice-strict structurally cannot see either (duck-typed fakes).
+
+E1-10 (t_4ede732f, spawned): one atomic fix — (1) IsapiClient.raw property, seams
+go through it (LoggedClient forwards; bare+verbose one path; registry untouched),
+(2) DEVICE_ASSIGNED_FIELDS={"picID"} excluded at COMPARE time in BOTH verify
+_compare and E1-02 diff (NOT VOLATILE_FIELDS — that set is frozen into bundle
+manifest digests; touching it would refuse the operator's existing bundles,
+including the rerun bundle). Acceptance includes the faces phase driven over the
+REAL IsapiClient class + MockTransport (bare + LoggedClient-wrapped), picID
+same-class fixtures, and the old-bundle-still-reads digest pin.
+
+B state after operator runs: emp 1-4 users, faces emp 1 only — operator reruns the
+same A bundle onto B once E1-10 merges (faces carry to 2-4; verify no longer trips
+on picID).
