@@ -1316,11 +1316,25 @@ class FakeDevice:
         """
         if empty:
             self._biometric_store = {"faces": {}, "fingerprints": {}}
+            self._resync_face_store()
             return
         self._biometric_store = {
             "faces": dict(A_FD_ROWS if faces is None else faces),
             "fingerprints": dict(A_FP_ROWS if fingerprints is None else fingerprints),
         }
+        self._resync_face_store()
+
+    def _resync_face_store(self) -> None:
+        """Point an already-armed write axis at the freshly seeded face dict.
+
+        The face WRITE store and the face READ store are ONE dict while the write axis is
+        armed (``_face_rows``), because the capture pair `facesetup_add` +
+        `facesetup_readback_fpid90` records the write and the read sharing one truth.
+        Seeding after arming therefore re-points the axis instead of leaving a stale copy
+        behind; arming after seeding copies the store (see ``install_write_capture``).
+        """
+        if self._write_axis is not None and self._biometric_store is not None:
+            self._write_axis["face_store"] = self._biometric_store["faces"]
 
     def _biometric_fd_search(self, request: httpx.Request) -> httpx.Response:
         """Store-mode FDSearch — FLAT dialect or 400 (the §9 dialect split).
@@ -1343,7 +1357,7 @@ class FakeDevice:
                 return message_parameters_lack(param)
         position = body.get("searchResultPosition", 0) or 0
         max_results = body.get("maxResults", 0) or 0
-        faces: dict[str, bytes] = (self._biometric_store or {}).get("faces", {})
+        faces: dict[str, bytes] = self._face_rows()
         fpid = body.get("FPID")
         people = sorted(faces) if fpid is None else ([str(fpid)] if str(fpid) in faces else [])
         total = len(people)
@@ -1763,9 +1777,11 @@ class FakeDevice:
         honor_employee_filter: bool = True,
         wipe_hazard: bool = True,
         fp_applies: bool = False,
+        faces_applies: bool = True,
+        faces_capacity: int | None = None,
     ) -> None:
-        """Arm the captured WRITE axis (E1-04 users/cards delete; E1-06b fingerprints).
-        Without this call, no write is servable.
+        """Arm the captured WRITE axis (E1-04 users/cards delete; E1-06b fingerprints;
+        E1-06 faces). Without this call, no write is servable.
 
         Seeding the person store is implied (a write has to land somewhere the search can
         read back). Knobs, each modelling a device behaviour the capture recorded or the
@@ -1789,6 +1805,19 @@ class FakeDevice:
           stored under (employeeNo, fingerPrintID) and the one-shot read returns it.
           With False the write stores NOTHING and the progress route arms itself to
           answer the captured reader-rejection body.
+        * ``faces_applies`` — the E1-06 APPLIES knob for `FDLib/FDSetUp`, and its
+          DEFAULT is True because the face capture recorded the OPPOSITE of the FP one:
+          `facesetup_readback_fpid90.json` is the SAME FPID read back after the accepted
+          upload with `modelData` byte-identical (OBSERVED.md: face write PROVEN, R1).
+          ``faces_applies=False`` is the counterfactual the client must survive anyway —
+          an ack that lands nothing — so a test can pin that `confirmed` comes from the
+          read-back and never from `statusCode 1`.
+        * ``faces_capacity`` — reject a NEW face past this count. INVENTED shape-stand-in
+          exactly like ``capacity`` (no committed capture shows a face capacity rejection;
+          §1: FDMaxNum/FDRecordDataMaxNum are probe facts, true capacity is unexposed),
+          answering a CLEARLY-LABELED synthetic subcode so a test pins that a
+          capacity-class rejection classifies OTHER (unmapped vocabulary is reported
+          verbatim, never coerced) and aborts the phase fail-fast (§5 step 4).
         """
         if self._enrollment_store is None:
             self.seed_enrollment(users=users if users is not None else [], cards=cards or [])
@@ -1802,6 +1831,17 @@ class FakeDevice:
             "fp_applies": fp_applies,
             "fp_store": {},
             "fp_progress_armed": False,
+            # E1-06 FACE state: {employeeNo: face-template bytes}. When a face READ store
+            # was seeded this is that SAME dict (not a copy), so an accepted FDSetUp
+            # mutates what FDSearch answers — the linkage the capture pair
+            # facesetup_add_request.json + facesetup_readback_fpid90.json records (see
+            # _write_face_setup). faces_applies=False is the counterfactual knob.
+            # face_delete_audit is the card's targeting proof: every served delete
+            # records the named FPID and the store's keys before/after.
+            "faces_applies": faces_applies,
+            "faces_capacity": faces_capacity,
+            "face_store": (self._biometric_store or {}).get("faces", {}),
+            "face_delete_audit": [],
         }
         self.honor_employee_filter = honor_employee_filter
 
@@ -2024,6 +2064,195 @@ class FakeDevice:
             )
         return _json_ok(_capture("fpdownload_progress_reader_reject.json"))
 
+    # -- the face WRITE arm (card E1-06; captures facesetup_* + fdsearch_delete_*) ---------
+
+    #: The captured FDSetUp key set (facesetup_add_request.json) — flat, four keys, and
+    #: NO `mode` key: the capture has none, so an invented one is refused (v3's "8
+    #: rejected shapes" mistake class, design §11 v4 delta 1).
+    _FACE_SETUP_KEYS = frozenset({"faceLibType", "FDID", "FPID", "modelData"})
+    #: The captured FDSearch/Delete body key set (fdsearch_delete_request.json).
+    _FACE_DELETE_KEYS = frozenset({"FPID"})
+    FACE_SETUP_PATH = "/ISAPI/Intelligent/FDLib/FDSetUp"
+    FACE_DELETE_PATH = "/ISAPI/Intelligent/FDLib/FDSearch/Delete"
+
+    def _face_rows(self) -> dict[str, bytes]:
+        """The live face store: the WRITE-axis one when armed, else the read-axis seed.
+
+        One dict, one truth. Installing the write axis copies the read store into it
+        (and `seed_biometric` re-syncs it afterwards), so an accepted `FDSetUp` changes
+        what `FDSearch` answers — which is the linkage `facesetup_add_request.json` +
+        `facesetup_readback_fpid90.json` record as a PAIR on bench A.
+        """
+        if self._write_axis is not None:
+            store: dict[str, bytes] = self._write_axis["face_store"]
+            return store
+        return (self._biometric_store or {}).get("faces", {})
+
+    def _write_face_setup(self, request: httpx.Request) -> httpx.Response:
+        """`PUT FDLib/FDSetUp` — replays facesetup_{add_request,add_response}.json.
+
+        The capture is one flat four-key body answering `statusCode 1`, and the read-back
+        capture proves the accepted template is what FDSearch then returns (byte-identical
+        `modelData`). Rejections, in the order the capture vocabulary forces them:
+
+        * wrong verb (POST/GET/anything but PUT) -> the captured `methodNotAllowed`
+          envelope (design §1 records exactly that answer for a GET on this path;
+          `users_setup_post_method_not_allowed.json` is the same envelope class —
+          INVENTED placement, captured body, the E1-06b FP-route precedent);
+        * a WRAPPED body (any nested object where the capture is flat) -> HARD
+          `EnrollmentProtocolError`: no capture exists for a wrapped FDSetUp and the
+          dialect split on this firmware is per-endpoint (the FDSearch wrapper is what
+          400'd `MessageParametersLack`, §1), so the fake refuses to guess which side
+          this verb sits on (§9);
+        * an unrecorded key or a missing required key -> the captured `badJsonContent`
+          envelope NAMING that key (INVENTED instance, captured class — the FP capture
+          established that this family answers a wrong key that way);
+        * an un-decodable `modelData` -> the same envelope naming it: bytes we cannot
+          decode cannot be hashed, so the device's own answer is unknown.
+
+        A valid body answers `facesetup_add_response.json` in BOTH modes; what differs is
+        what happens AFTER (see ``faces_applies``). An overwrite of an existing FPID
+        replaces the bytes: the capture is silent about SetUp-over-existing (the same R2
+        reading the UserInfo route documents), and the client-side phase never sends one
+        without a human (a different-hash target row is a conflict it reports, §5 step 6).
+        """
+        assert self._write_axis is not None
+        if request.method != "PUT":
+            return _json_error(_capture("users_setup_post_method_not_allowed.json"))
+        body = _json_body(request)
+        if any(isinstance(value, (dict, list)) for value in body.values()):
+            raise EnrollmentProtocolError(
+                f"PUT {self.FACE_SETUP_PATH} with a nested/wrapped value has NO bench-A "
+                "capture (facesetup_add_request.json is FLAT — four top-level scalars); "
+                "the dialect split on this fw is per-endpoint, so the fake refuses to "
+                "invent an answer for the wrapped side (§9 capture-before-fake)"
+            )
+        unknown = sorted(set(body) - self._FACE_SETUP_KEYS)
+        if unknown:
+            return _bad_json(unknown[0])
+        missing = sorted(self._FACE_SETUP_KEYS - set(body))
+        if missing:
+            return _bad_json(missing[0])
+        for param in ("faceLibType", "FDID", "FPID"):
+            if not isinstance(body[param], str) or not body[param]:
+                return message_parameters_lack(param)
+        if body["FDID"] != "1" or body["faceLibType"] != "blackFD":
+            # FDLib capture proves FDID 2 (infraredFD) EXISTS, but no capture shows
+            # FDSetUp ever accepting a library other than the ACS-bound FDID 1/blackFD:
+            # the portable library is what unlocks a door (§1), and the fake has no
+            # device truth for the other one (§9) — so this is a hard refusal.
+            raise EnrollmentProtocolError(
+                f"FDSetUp for FDID {body['FDID']!r}/faceLibType {body['faceLibType']!r} "
+                "has NO bench-A capture (facesetup_add_request.json is FDID '1' blackFD "
+                "only); the fake will not model the infrared library the bench never "
+                "wrote to (§9 capture-before-fake)"
+            )
+        fpid = str(body["FPID"])
+        if (
+            self._write_axis["faces_capacity"] is not None
+            and fpid not in self._write_axis["face_store"]
+            and len(self._write_axis["face_store"]) >= int(self._write_axis["faces_capacity"])
+        ):
+            # INVENTED (no capacity rejection was ever captured — §1 records true face
+            # capacity as unexposed; modelMaxNum/FDMaxNum are probe facts, NOT limits to
+            # infer). The subStatusCode is CLEARLY-LABELED synthetic so a phase test pins
+            # the honest handling: unmapped vocabulary classifies OTHER, rides verbatim,
+            # and aborts the phase fail-fast (§5 step 4) — never coerced into a category.
+            return _json_error(
+                {
+                    "statusCode": 6,
+                    "statusString": "Invalid Content",
+                    "subStatusCode": "syntheticFaceCapacityFull",
+                    "errorCode": 1610612761,
+                    "errorMsg": "employeeNo",
+                }
+            )
+        try:
+            raw = base64.b64decode("".join(str(body["modelData"]).split()), validate=True)
+        except Exception:
+            return _bad_json("modelData")
+        if not raw:
+            return _bad_json("modelData")
+        if self._write_axis["faces_applies"]:
+            self._write_axis["face_store"][fpid] = raw
+        # Captured ACCEPT either way — the ack's only proven content is `statusCode 1`.
+        return _json_ok(_capture("facesetup_add_response.json"))
+
+    def _write_face_delete(self, request: httpx.Request) -> httpx.Response:
+        """`PUT FDSearch/Delete?format=json&FDID=1&faceLibType=blackFD` — targeted delete.
+
+        The capture (fdsearch_delete_{request,response,verified_nomatch}.json) is a
+        ONE-value `{"FPID":[{"value":"90"}]}` body with the library identity in the URL
+        QUERY, answering `statusCode 1` and reading back `NO MATCH` with other people's
+        faces untouched. That last clause is why face undo exists at all (design §5b.1:
+        the face delete is the shape this fw proved targeted, unlike the user delete).
+        Everything outside the captured shape is a hard refusal, never a guess:
+
+        * wrong verb -> the captured `methodNotAllowed` envelope (INVENTED placement,
+          captured class — the FP/FDSetUp precedent);
+        * a URL without `FDID`+`faceLibType` -> HARD: the identity is part of the
+          captured request, and a fake that served an unqualified delete would be
+          inventing the library the device deletes from (§9);
+        * a body that is not exactly one `{"value": ...}` entry -> HARD. A multi-value
+          list is the R2 extrapolation the capture cannot answer: the bench recorded one
+          value, and the D-WIPE lesson is that this family answers `ok` while deleting
+          what the request did not name (§5b).
+        """
+        assert self._write_axis is not None
+        if request.method != "PUT":
+            return _json_error(_capture("users_setup_post_method_not_allowed.json"))
+        query = dict(request.url.params.items())
+        for param in ("FDID", "faceLibType"):
+            if not query.get(param):
+                raise EnrollmentProtocolError(
+                    f"PUT {self.FACE_DELETE_PATH} without {param} in the QUERY has no "
+                    "bench-A capture: fdsearch_delete_request.json carries the body only "
+                    "because the library identity rides the URL (OBSERVED.md), and the "
+                    "fake will not guess which library an unqualified delete empties (§9)"
+                )
+        body = _json_body(request)
+        unknown = sorted(set(body) - self._FACE_DELETE_KEYS)
+        if unknown:
+            # The D-WIPE-shaped request: a list the device's slot may not be reading.
+            # Unlike UserInfoDetail/Delete this verb was captured TARGETED, so the fake
+            # refuses the uncaptured shape outright rather than acting out a hazard the
+            # bench never recorded for it (§5b, §9).
+            raise EnrollmentProtocolError(
+                f"FDSearch/Delete carrying {unknown} has NO bench-A capture — the "
+                "captured body is exactly {'FPID': [{'value': <one employeeNo>}]}; an "
+                "unknown slot is exactly the D-WIPE class the design bans a request for "
+                "until it is captured on the device (§5b)"
+            )
+        if "FPID" not in body:
+            raise EnrollmentProtocolError(
+                "FDSearch/Delete with no 'FPID' list has no bench-A capture; the fake "
+                "will not answer a delete that names nobody (§9)"
+            )
+        entries = body["FPID"]
+        if (
+            not isinstance(entries, list)
+            or len(entries) != 1
+            or not isinstance(entries[0], dict)
+            or not isinstance(entries[0].get("value"), str)
+            or not entries[0]["value"]
+        ):
+            raise EnrollmentProtocolError(
+                "FDSearch/Delete captured EXACTLY one {'value': employeeNo} entry "
+                "(fdsearch_delete_request.json); a 0-, 2- or malformed-value list has no "
+                "device truth and no automatic delete may invent one (§5b/§9)"
+            )
+        fpid = str(entries[0]["value"])
+        store = self._face_rows()
+        before = sorted(store)
+        store.pop(fpid, None)
+        # The card's targeting proof: every served delete is audited with the named FPID
+        # and the exact keys before/after, so a test can show WHICH rows were touched
+        # (the D-WIPE lesson is that a delete's ack never tells you what it removed).
+        self._write_axis["face_delete_audit"].append(
+            {"fpid": fpid, "before": before, "after": sorted(store)}
+        )
+        return _json_ok(_capture("fdsearch_delete_response.json"))
+
     def _dispatch_write(self, request: httpx.Request) -> httpx.Response | None:
         """Routing for the captured write axis; hard-fails when it is not armed.
 
@@ -2065,6 +2294,23 @@ class FakeDevice:
                     "fake has no answer for an un-armed poll (§9)"
                 )
             return self._fp_progress(request)
+        if path == self.FACE_SETUP_PATH:
+            if self._write_axis is None:
+                raise EnrollmentProtocolError(
+                    f"{request.method} {path} has no bench-A write truth armed: call "
+                    "FakeDevice.install_write_capture() — the face capture (facesetup_*) "
+                    "arms the faces route (E1-06), §9 capture-before-fake"
+                )
+            return self._write_face_setup(request)
+        if path == self.FACE_DELETE_PATH:
+            if self._write_axis is None:
+                raise EnrollmentProtocolError(
+                    f"{request.method} {path} needs install_write_capture() armed: the "
+                    "captured targeted face delete (fdsearch_delete_*) belongs to the "
+                    "faces write axis (E1-06) and the fake has no answer for an un-armed "
+                    "delete (§9)"
+                )
+            return self._write_face_delete(request)
         if (
             request.method not in ("GET", "POST")
             and path.startswith("/ISAPI/AccessControl/FingerPrint")
@@ -2081,14 +2327,11 @@ class FakeDevice:
                 "(§5b.1) and the fake will not invent an answer for a shape the "
                 "capture set proves does not exist (§9)"
             )
-        for write_path in (
-            "/ISAPI/AccessControl/CardInfo/SetUp",
-            "/ISAPI/Intelligent/FDLib/FDSetUp",
-        ):
+        for write_path in ("/ISAPI/AccessControl/CardInfo/SetUp",):
             if path == write_path:
                 raise EnrollmentProtocolError(
-                    f"{request.method} {write_path} belongs to a LATER card (E1-05 cards, "
-                    "E1-06 faces); its capture is committed but its "
+                    f"{request.method} {write_path} belongs to a LATER card (E1-05 cards); "
+                    "its capture is committed but its "
                     "fake route is not written yet, and E1-04 must not pre-build it (§9)"
                 )
         return None
