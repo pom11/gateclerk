@@ -899,7 +899,16 @@ class WriteTransport(Protocol):
     """The injected device seam (module docstring: this module cannot reach a socket).
 
     Implementations raise :class:`WriteRejectedError` for a non-OK envelope; a transport-level
-    failure raises its own client vocabulary and aborts the phase unchanged.
+    failure raises its own client vocabulary and aborts the phase.
+
+    The users phase needs one verb; the phases that follow (§5 step 2's ordering: cards,
+    fingerprints, faces) need their own captured verbs on their own captured paths.
+    Rather than fork the budget machinery once per phase — the fork is exactly where a
+    second, drifting 80-call counter gets invented — :class:`BudgetedWriteTransport`
+    carries ANY named seam method through :meth:`BudgetedWriteTransport.call`, and a
+    transport implements the verbs its phase owns (``put_setup`` here;
+    ``post_download``/``get_progress`` in E1-06b). One client, one counter, one
+    re-bootstrap rule for the whole apply (§5.3).
     """
 
     def put_setup(self, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -915,7 +924,7 @@ class BudgetedWriteTransport:
     """Counts authed calls on one client and re-bootstraps it at 80 (§5.3, §0.5).
 
     The counter is this module's own ledger of the calls IT issued; a test pins it
-    against the fake's nonce ledger so the two cannot disagree about what a request
+    against the fake's OWN nonce ledger so the two cannot disagree about what a request
     cost. Re-bootstrap is the P1 recovery arm (fresh digest state = a fresh nonce
     budget) and is the ONLY reason a client is replaced mid-phase: no refused write is
     ever re-sent (§0.6), so a re-send through a new client is structurally impossible.
@@ -940,15 +949,34 @@ class BudgetedWriteTransport:
     # -- the seam the phase uses ----------------------------------------------------
 
     def put_setup(self, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.call("put_setup", path, body)
+
+    def call(self, verb: str, *args: Any) -> dict[str, Any]:
+        """Invoke ONE seam method on the phase's client, counted against the budget.
+
+        Every request a phase issues — write verb or verify read — goes through here, so
+        "one long-lived client per phase, re-bootstrap before exhaustion" (§0.5/§5.3) is
+        a single implementation with a single counter. ``verb`` is a method NAME on the
+        injected transport, never a path or a string the device sees; a name the
+        transport does not implement is a programming error and raises
+        :class:`TypeError` rather than silently doing nothing.
+        """
         if self._closed:
             raise TransportClosedError("this phase's transport was closed; nothing was sent")
         if self._current is None or self._calls >= self._limit:
             self._rotate()
         if self._current is None:  # _rotate always sets one; belt against refactors
             raise TransportClosedError("transport rotation produced no client")
+        method = getattr(self._current, verb, None)
+        if not callable(method):
+            raise TypeError(
+                f"the injected transport implements no {verb!r} seam method; the "
+                f"phase's budget cannot be spent on a verb that does not exist (§5.3)"
+            )
         self._calls += 1
         self.total_calls += 1
-        return self._current.put_setup(path, body)
+        result = method(*args)
+        return dict(result)
 
     def close(self) -> None:
         if self._closed:

@@ -581,12 +581,16 @@ def test_an_unproven_mode_is_a_protocol_error_never_a_guessed_answer() -> None:
 
 
 def test_later_cards_write_verbs_are_hard_refused_here() -> None:
-    """E1-05/06/06b own those routes; E1-04 must not pre-build them (§9)."""
+    """E1-05/06 own those routes; E1-04 must not pre-build them (§9).
+
+    E1-06b (fingerprints) shipped its FingerPrintDownload route, so that verb is no
+    longer on this list — the fingerprint family now has real capture-backed routing
+    (fpdownload_* fixtures + the applies knob).
+    """
     device = write_device()
     for path in (
         "/ISAPI/AccessControl/CardInfo/SetUp",
         "/ISAPI/Intelligent/FDLib/FDSetUp",
-        "/ISAPI/AccessControl/FingerPrintDownload",
     ):
         with pytest.raises(EnrollmentProtocolError, match="LATER card"):
             raw_request(device, "PUT", path, json_body={})

@@ -1631,9 +1631,12 @@ class FakeDevice:
         # (0/1/2 answered the same row); positive carries status "OK"; the honest
         # zero is status "NoFP" with FingerPrintList ABSENT (the earlier
         # empty-list extrapolation is what made a per-fpIndex walk look legal).
-        entry = self._enrollment["fp_templates"].get(  # type: ignore[index]
-            str(cond["employeeNo"])
-        )
+        # E1-06b: a template the WRITE axis APPLIED (fp_applies=True target) is the
+        # row — a written-then-read person reads back what was written, so a test
+        # sees the post-write truth rather than the pre-write seed.
+        entry = self._fp_written_row(str(cond["employeeNo"])) or self._enrollment[  # type: ignore[index]
+            "fp_templates"
+        ].get(str(cond["employeeNo"]))
         info: dict[str, object] = {"searchID": cond.get("searchID", "")}
         if not entry:
             info["status"] = "NoFP"
@@ -1718,6 +1721,22 @@ class FakeDevice:
             "mode",
         }
     )
+    #: The captured FingerPrintDownload key set (fpdownload_accept_request.json).
+    _FP_DOWNLOAD_KEYS = frozenset(
+        {
+            "enableCardReader",
+            "employeeNo",
+            "fingerPrintID",
+            "fingerType",
+            "fingerData",
+        }
+    )
+    #: `fpcfg_capabilities.json`: fingerPrintID @min 1 @max 10 (vocabulary bound).
+    _FP_SLOT_MIN, _FP_SLOT_MAX = 1, 10
+    #: `fpcfg_capabilities.json`: fingerType @opt (the captured vocabulary).
+    _FP_FINGER_TYPES = frozenset({"normalFP", "hijackFP", "patrolFP", "superFP"})
+    FP_DOWNLOAD_PATH = "/ISAPI/AccessControl/FingerPrintDownload"
+    FP_PROGRESS_PATH = "/ISAPI/AccessControl/FingerPrintProgress"
     #: The person-read defaults the device adds (users_setup_readback_t90.json): the
     #: read shape the fake replays after a write, so a test sees the device's own
     #: defaults rather than an echo of what it sent.
@@ -1743,8 +1762,10 @@ class FakeDevice:
         capacity: int | None = None,
         honor_employee_filter: bool = True,
         wipe_hazard: bool = True,
+        fp_applies: bool = False,
     ) -> None:
-        """Arm the captured WRITE axis (E1-04). Without this call, no write is servable.
+        """Arm the captured WRITE axis (E1-04 users/cards delete; E1-06b fingerprints).
+        Without this call, no write is servable.
 
         Seeding the person store is implied (a write has to land somewhere the search can
         read back). Knobs, each modelling a device behaviour the capture recorded or the
@@ -1760,12 +1781,27 @@ class FakeDevice:
           does exactly this on other filters, and §6's coverage-proof walker exists for
           it — this knob is what proves the walker is not cargo-culted.
         * ``wipe_hazard=False`` — disarm rule D-WIPE (see ``_write_user_delete``).
+        * ``fp_applies`` — the E1-06b APPLIES knob for `FingerPrintDownload`. The
+          capture's ONLY recorded outcome is accept-without-apply (statusCode 1, then
+          read-back `NoFP` and progress `cardReaderRecvStatus:5`), so the DEFAULT is
+          False: bench A's reality. ``fp_applies=True`` models the same-sensor-family
+          target §1 leaves open (a hypothetical, never observed): the template is then
+          stored under (employeeNo, fingerPrintID) and the one-shot read returns it.
+          With False the write stores NOTHING and the progress route arms itself to
+          answer the captured reader-rejection body.
         """
         if self._enrollment_store is None:
             self.seed_enrollment(users=users if users is not None else [], cards=cards or [])
         self._write_axis = {
             "capacity": capacity,
             "wipe_hazard": wipe_hazard,
+            # E1-06b FP state: {(employeeNo, fingerPrintID): fingerData-b64} — only
+            # populated under fp_applies=True (see the knob doc). progress_armed flips
+            # when an accepted write did NOT apply, which is the ONLY situation with a
+            # captured FingerPrintProgress answer.
+            "fp_applies": fp_applies,
+            "fp_store": {},
+            "fp_progress_armed": False,
         }
         self.honor_employee_filter = honor_employee_filter
 
@@ -1872,8 +1908,124 @@ class FakeDevice:
             self._biometric_store["faces"] = {}
         return _json_ok(_capture("userinfo_delete_wipe_response.json"))
 
+    # -- the fingerprint WRITE arm (card E1-06b; captures fpdownload_*.json) --------------
+
+    def _fp_written_row(self, employee_no: str) -> str | None:
+        """The b64 the FP WRITE axis stored for this person, or None.
+
+        Only ``fp_applies=True`` (the hypothetical same-family target) ever populates
+        this store; on bench-A reality it stays empty and the reads keep answering
+        `NoFP` after an accept — which is the finding, replayed by construction.
+        """
+        if self._write_axis is None:
+            return None
+        store: dict[tuple[str, int], str] = self._write_axis["fp_store"]
+        for (no, _slot), b64 in store.items():
+            if no == employee_no:
+                return b64
+        return None
+
+    def _write_fp_download(self, request: httpx.Request) -> httpx.Response:
+        """`POST FingerPrintDownload` — replays the fpdownload_* captures EXACTLY.
+
+        The capture set records one happy path (accept) and one failure (scalar
+        `enableCardReader` -> badJsonContent naming the key), and OBSERVED.md records
+        the acceptance's REAL outcome: nothing applied. Rejections, in the order the
+        capture vocabulary forces them:
+
+        * wrong verb (PUT/anything but POST) -> the captured methodNotAllowed body
+          (`users_setup_put_record_405.json` — the same envelope the SetUp route
+          answers for a wrong verb; this verb's own wrong-verb answer was never
+          captured, and the envelope class is; INVENTED placement, captured body);
+        * no `FingerPrintCfg` wrapper -> HARD `EnrollmentProtocolError` (no capture);
+        * an unrecorded key (``fpIndex`` in place of ``fingerPrintID`` is the pinned
+          one) or a missing required key -> the captured badJsonContent envelope
+          NAMING that key (the captured instance names `enableCardReader`);
+        * scalar `enableCardReader` -> byte-for-byte
+          `fpdownload_badjson_scalar_enable_400.json`;
+        * a slot outside the caps range or a fingerType outside the caps @opt -> the
+          captured envelope class naming the field (INVENTED instance, captured class;
+          `fpcfg_capabilities.json` is the vocabulary source).
+
+        A valid body answers `fpdownload_accept_response.json` (statusCode 1) in BOTH
+        modes — acceptance is captured; what differs is what happens AFTER:
+        ``fp_applies=True`` stores the template (the read then returns it), the default
+        False stores NOTHING and arms the progress route with its captured
+        reader-rejection answer. That asymmetry IS the card: ack != applied.
+        """
+        assert self._write_axis is not None
+        if request.method != "POST":
+            return _json_error(_capture("users_setup_put_record_405.json"))
+        body = _json_body(request)
+        cfg = body.get("FingerPrintCfg")
+        if not isinstance(cfg, dict):
+            raise EnrollmentProtocolError(
+                "FingerPrintDownload without a 'FingerPrintCfg' object has NO bench-A "
+                "capture (fpdownload_accept_request.json is the only recorded shape); "
+                "refusing to invent an answer for it (§9 capture-before-fake)"
+            )
+        if "enableCardReader" in cfg and not isinstance(cfg["enableCardReader"], list):
+            # The ONE rejection captured VERBATIM for this verb.
+            return _json_error(_capture("fpdownload_badjson_scalar_enable_400.json"))
+        unknown = sorted(set(cfg) - self._FP_DOWNLOAD_KEYS)
+        if unknown:
+            # `fpIndex` instead of `fingerPrintID` lands here: the capture made
+            # fingerPrintID the slot key, and an unrecorded key is the R2 risk.
+            return _bad_json(unknown[0])
+        missing = sorted(self._FP_DOWNLOAD_KEYS - set(cfg))
+        if missing:
+            return _bad_json(missing[0])
+        slot = cfg["fingerPrintID"]
+        if (
+            isinstance(slot, bool)
+            or not isinstance(slot, int)
+            or not (self._FP_SLOT_MIN <= slot <= self._FP_SLOT_MAX)
+        ):
+            # Vocabulary bound from fpcfg_capabilities.json (@min 1 @max 10); captured
+            # envelope class naming the field (INVENTED instance — §1 caps as vocab).
+            return _bad_json("fingerPrintID")
+        finger_type = cfg["fingerType"]
+        if finger_type not in self._FP_FINGER_TYPES:
+            return _bad_json("fingerType")
+        employee_no = cfg["employeeNo"]
+        if not isinstance(employee_no, str) or not employee_no:
+            return _bad_json("employeeNo")
+        finger_data = cfg["fingerData"]
+        if not isinstance(finger_data, str) or not finger_data.strip():
+            return _bad_json("fingerData")
+        # Captured ACCEPT in both modes — the ack is worth exactly what it is worth.
+        if self._write_axis["fp_applies"]:
+            self._write_axis["fp_store"][(employee_no, int(slot))] = finger_data
+        else:
+            # Bench-A reality: accepted, stored NOWHERE, and the progress surface now
+            # has its one captured answer to give (GET FingerPrintProgress).
+            self._write_axis["fp_progress_armed"] = True
+        return _json_ok(_capture("fpdownload_accept_response.json"))
+
+    def _fp_progress(self, request: httpx.Request) -> httpx.Response:
+        """`GET FingerPrintProgress` — ONE captured answer, and only when earned.
+
+        The capture recorded this endpoint exactly once: after the accept that never
+        applied, answering `cardReaderRecvStatus:5` (`FingerPrintProgress` was never
+        polled in any other state). A poll OUTSIDE that state has no device truth, so
+        it is a hard protocol error — the same §9 rule that stops the fake inventing
+        write answers stops it inventing a telemetry answer, and it pins the phase's
+        "progress is pulled on write-failure paths only" budget rule from the other
+        side.
+        """
+        del request  # query/format handling: the route answers the same body bench A did
+        assert self._write_axis is not None
+        if not self._write_axis["fp_progress_armed"]:
+            raise EnrollmentProtocolError(
+                "GET FingerPrintProgress has a bench-A capture ONLY after an accepted-"
+                "but-not-applied FingerPrintDownload; polling it any other time is an "
+                "uncaptured request the fake refuses to answer (§9, and the phase's "
+                "1-call progress budget)"
+            )
+        return _json_ok(_capture("fpdownload_progress_reader_reject.json"))
+
     def _dispatch_write(self, request: httpx.Request) -> httpx.Response | None:
-        """PUT routing for the captured write axis; hard-fails when it is not armed.
+        """Routing for the captured write axis; hard-fails when it is not armed.
 
         An un-armed write verb is a HARD failure, never a 404: a 404 is what an absent
         endpoint says, and a client that mistook one for a successful no-op would then
@@ -1897,15 +2049,46 @@ class FakeDevice:
                     "delta guard exists (§5b)"
                 )
             return self._write_user_delete(request)
+        if path == self.FP_DOWNLOAD_PATH:
+            if self._write_axis is None:
+                raise EnrollmentProtocolError(
+                    f"{request.method} {path} has no bench-A write truth armed: call "
+                    "FakeDevice.install_write_capture() — the FP capture (fpdownload_*) "
+                    "arms the fingerprints route (E1-06b), §9 capture-before-fake"
+                )
+            return self._write_fp_download(request)
+        if path == self.FP_PROGRESS_PATH:
+            if self._write_axis is None:
+                raise EnrollmentProtocolError(
+                    f"GET {path} needs install_write_capture() armed: the progress "
+                    "capture belongs to the fingerprints write axis (E1-06b) and the "
+                    "fake has no answer for an un-armed poll (§9)"
+                )
+            return self._fp_progress(request)
+        if (
+            request.method not in ("GET", "POST")
+            and path.startswith("/ISAPI/AccessControl/FingerPrint")
+            and path != self.FP_DOWNLOAD_PATH
+        ):
+            # The card's §9 pin from the device side: DELETE (or any other verb) on the
+            # fingerprint family was NEVER captured — FingerPrintCfg GET/POST and the
+            # delete caps are notSupport (OBSERVED.md) — so FP undo is REPORT-ONLY
+            # (§5b.1) and this fake structurally cannot answer a delete attempt.
+            raise EnrollmentProtocolError(
+                f"{request.method} {path}: NO fingerprint delete/modify verb exists in "
+                "any bench-A capture (OBSERVED.md: FingerPrintCfg GET/POST and the "
+                "delete caps are notSupport) — FP removal is MANUAL AT THE DEVICE "
+                "(§5b.1) and the fake will not invent an answer for a shape the "
+                "capture set proves does not exist (§9)"
+            )
         for write_path in (
             "/ISAPI/AccessControl/CardInfo/SetUp",
             "/ISAPI/Intelligent/FDLib/FDSetUp",
-            "/ISAPI/AccessControl/FingerPrintDownload",
         ):
             if path == write_path:
                 raise EnrollmentProtocolError(
                     f"{request.method} {write_path} belongs to a LATER card (E1-05 cards, "
-                    "E1-06 faces, E1-06b fingerprints); its capture is committed but its "
+                    "E1-06 faces); its capture is committed but its "
                     "fake route is not written yet, and E1-04 must not pre-build it (§9)"
                 )
         return None
