@@ -813,3 +813,27 @@ contract (JournalError + ConfigError) and `_fail` converting rather than re-rais
 must not change; verified by re-running the battery in a detached worktree at the red
 commit (the repo's own false-green guard forces PYTHONPATH there — it caught the editable
 install pointing at the wrong tree before any test ran).
+
+## 2026-10-23 — E1-11 groundwork: face-write capture on site-B — PORTABILITY WALL, not body shape
+
+Operator rerun (main dbeeefb): dry run matched (users 0, faces 3, conflict 1 = emp 1),
+snapshot site-b-20261023-2053, --apply -> users/cards/fps clean (no-ops), faces STOP
+at first upload: 400 badJsonContent, 0 of 3 landed, journal'd (run-b-20261023-2053).
+Orchestrator sanctioned capture (snapshot site-b-20261023-2120 first, then ONE
+product attempt -v journal'd run-b-20261023-2135 seq1 planned->rejected; then one-
+attempt-per-shape curl discrimination; probe FPID 2 created+deleted; B restored):
+P1 B's own FR702706 template -> own FPID 1, captured flat body: ok (zero state change).
+E1 B's own template -> NEW FPID 2, same body, no faceURL: ok + read-back sha match +
+captured FDSearch/Delete ok. E2 A's FR500005 emp-2 template -> FPID 2, byte-identical
+body SHAPE: 400 {"subStatusCode":"badJsonContent","errorMsg":"faceURL"} (statusCode 6,
+Invalid Content). => Body builder VERIFIED CORRECT on V4.13.0; the wall is TEMPLATE
+GENERATION (V3.2.30 FR500005 rejected by V4.13.0, B native FR702706). Picture route
+dead both ends (A faceURL JPEG export 404; B isSupportFDSearchDataPackage:false).
+Cross-generation face carry = firmware wall -> faces need re-enrollment on B (operator
+decision). Truth in docs/OBSERVED-site-B.md (0a2c6a9, pushed). E1-11 carded: capture-
+backed template_rejected class + pre-apply facePortability warning (report-only) +
+real-client tests; NO body-builder change (provably right), NO new device shapes
+without operator-sanctioned capture (lockout budget). Separate observability gap
+noted (NOT in this card): --verbose does not log write-seam requests (seams use
+client.raw -> bypasses LoggedClient) — journal carries the intent, CLI -v shows reads
+only; card if operator wants -v completeness for writes.
