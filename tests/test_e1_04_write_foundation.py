@@ -40,6 +40,8 @@ import pytest
 
 from fakedevice import (
     BASE_URL,
+    CARD_DELETE_PATH,
+    CARD_SETUP_PATH,
     FAKE_PIN,
     USER_SETUP_PATH,
     EnrollmentProtocolError,
@@ -581,15 +583,20 @@ def test_an_unproven_mode_is_a_protocol_error_never_a_guessed_answer() -> None:
 
 
 def test_later_cards_write_verbs_are_hard_refused_here() -> None:
-    """E1-05 owns that route; E1-04 must not pre-build it (§9).
+    """Every captured write family now has its route — so what must STILL die loudly
+    is any of them answering UN-ARMED (§9: a route serving captures nobody armed is
+    the false green).
 
-    E1-06b (fingerprints) shipped its FingerPrintDownload route and E1-06 shipped the
-    face routes (FDSetUp + FDSearch/Delete), so those verbs are no longer on this list —
-    each family now has real capture-backed routing (its fixtures + its knobs).
+    History of this pin: E1-04 first refused the card/face/FP routes as "LATER card";
+    each later card (05, 06, 06b) replaced its own arm with real capture-backed
+    routing, and this test's remaining arm is the un-armed refusal — E1-04's
+    `write_device()` arms users only, so the card routes must refuse here and answer
+    only in tests/test_e1_05_cards_phase.py.
     """
     device = write_device()
-    for path in ("/ISAPI/AccessControl/CardInfo/SetUp",):
-        with pytest.raises(EnrollmentProtocolError, match="LATER card"):
+    # The card routes, un-armed for cards, die loudly rather than answering.
+    for path in (CARD_SETUP_PATH, CARD_DELETE_PATH):
+        with pytest.raises(EnrollmentProtocolError, match="E1-05 card write axis"):
             raw_request(device, "PUT", path, json_body={})
 
 

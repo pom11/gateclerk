@@ -290,11 +290,15 @@ class RejectKind(StrEnum):
 class WriteAbortedError(GateclerkError):
     """A write phase aborted: nothing further may be written until a human reads why.
 
-    Carries the :class:`UsersPhaseResult` so the caller can still print which records
-    landed (§5 step 4: never a silent partial write).
+    Carries the phase's result object so the caller can still print which records
+    landed (§5 step 4: never a silent partial write). ``result`` is typed loosely on
+    purpose: E1-04 raises it with a :class:`UsersPhaseResult` and E1-05's card phase
+    (``gateclerk.migrate_write_cards``) raises the SAME class with a
+    ``CardsPhaseResult``. One abort event, one handler — forking the exception would
+    fork the safety rule it carries (§0.6/§5 step 4).
     """
 
-    def __init__(self, message: str, result: UsersPhaseResult) -> None:
+    def __init__(self, message: str, result: Any) -> None:
         self.result = result
         super().__init__(message)
 
@@ -336,6 +340,12 @@ class JournalState(StrEnum):
     #: We sent it and the device refused: unknown state, never undone (§5a —
     #: "planned/applied without confirmed are never deleted (unknown state = human)").
     REJECTED = "rejected"
+    #: §5a's undo terminal: this run proved the add landed (`confirmed` + a live
+    #: re-read still matching the post-write hash), removed it through the
+    #: capture-proven targeted card delete, and the count-delta wrapper agreed. E1-04
+    #: never reaches this state (v1 has no user removal path, §5b.1); only
+    #: ``gateclerk.migrate_write_cards`` writes it.
+    REVERTED = "reverted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +367,12 @@ class JournalEntry:
     #: matching, exactly like the bundle's own key.
     employee_hash: str
     classification: str
+    #: The card number for a CARD-phase entry (E1-05, ``op="card_setup"``/
+    #: ``"card_delete"``) — the second half of the pair identity §5 step 5 pins
+    #: (``(cardNo, employeeNo)``, never cardNo-presence). ``None`` on a user row, which
+    #: is why the fold stays person-keyed for E1-04. Like the employeeNo above it is a
+    #: matching key, never a printable identity: §4 renders cards as ``card_hash``.
+    card_no: str | None = None
     #: content hash of the pre-write record (from the pre-write snapshot), if any.
     pre_write_hash: str | None = None
     #: content hash of the record we intend the person to LOOK LIKE on the target
@@ -426,11 +442,15 @@ class WriteJournal:
         pre_write_record: Mapping[str, Any] | None,
         intended_record: Mapping[str, Any],
         op: str = "user_setup",
+        card_no: str | None = None,
     ) -> JournalEntry:
         """Append ``planned`` and fsync it — the caller may send the request only after.
 
         §5a is explicit that the append happens BEFORE the request: a write we cannot
-        account for after a crash is a write nobody can undo.
+        account for after a crash is a write nobody can undo. ``card_no`` belongs to the
+        CARD phase (E1-05): the pair ``(cardNo, employeeNo)`` is the identity §5 step 5
+        writes under, so the journal must be able to say WHICH of a person's cards an
+        entry means — a fold keyed on the person alone would silently collapse two.
         """
         intended = _guard_record(intended_record, what="intended record")
         pre = (
@@ -447,6 +467,7 @@ class WriteJournal:
                 employee_no=employee_no,
                 employee_hash=person_hash(employee_no),
                 classification=classification,
+                card_no=card_no,
                 pre_write_hash=None if pre is None else content_hash(pre),
                 intended_hash=content_hash(intended),
                 intended_record=intended,
@@ -468,6 +489,18 @@ class WriteJournal:
             _transition(entry, JournalState.CONFIRMED, post_write_hash=post_write_hash)
         )
 
+    def reverted(self, entry: JournalEntry) -> JournalEntry:
+        """Append ``reverted`` — §5a's undo terminal, for a card add this run proved.
+
+        Only :func:`gateclerk.migrate_write_cards.undo_card_adds` may call this, and only
+        after proof-of-add (the live re-read still hashed to ``post_write_hash``) AND
+        the §5b count-delta wrapper agreed. It is a transition, not an edit: the
+        earlier lines stay in the file, so an auditor can still see what was added and
+        then removed. The users phase never reaches it — a person has no targeted
+        delete on this firmware (§5b.1).
+        """
+        return self._append(_transition(entry, JournalState.REVERTED))
+
     # -- reading -------------------------------------------------------------------
 
     def by_employee(self, employee_no: str) -> JournalEntry | None:
@@ -477,10 +510,15 @@ class WriteJournal:
         return None
 
     def latest(self, *, state: JournalState | None = None) -> tuple[JournalEntry, ...]:
-        """One entry per person (their newest), optionally filtered by state."""
-        out: dict[str, JournalEntry] = {}
+        """One entry per record (its newest), optionally filtered by state.
+
+        "Record" is :func:`_fold_key`'s answer — the person for a user row, the
+        ``(person, card)`` pair for a card row — so a person holding two cards keeps
+        both verdicts instead of having one silently overwritten (§5 step 5).
+        """
+        out: dict[tuple[str, str | None], JournalEntry] = {}
         for entry in self.entries:
-            out[entry.employee_no] = entry
+            out[_fold_key(entry)] = entry
         if state is not None:
             return tuple(e for e in out.values() if e.state is state)
         return tuple(out.values())
@@ -527,6 +565,18 @@ def _transition(entry: JournalEntry, state: JournalState, **changes: Any) -> Jou
     return replace(entry, state=state, **changes)
 
 
+def _fold_key(entry: JournalEntry) -> tuple[str, str | None]:
+    """What one "record" means when the journal is replayed (§5a's fold key).
+
+    A user row is keyed by the person (E1-04's behaviour, unchanged: ``card_no`` is
+    ``None`` there). A CARD row is keyed by the PAIR — ``(employeeNo, cardNo)`` — because
+    §5 step 5 makes the pair the identity and a person may hold several cards: folding
+    a person's two cards onto one key would silently erase one of them and let undo
+    delete a card this run never added.
+    """
+    return (entry.employee_no, entry.card_no)
+
+
 def _entry_payload(entry: JournalEntry) -> dict[str, Any]:
     return {
         "schema": JOURNAL_SCHEMA,
@@ -537,6 +587,7 @@ def _entry_payload(entry: JournalEntry) -> dict[str, Any]:
         "employeeNo": entry.employee_no,
         "employeeHash": entry.employee_hash,
         "classification": entry.classification,
+        "cardNo": entry.card_no,
         "preWriteHash": entry.pre_write_hash,
         "intendedHash": entry.intended_hash,
         "postWriteHash": entry.post_write_hash,
@@ -547,8 +598,12 @@ def _entry_payload(entry: JournalEntry) -> dict[str, Any]:
 
 
 def _replay(path: Path, *, phase: str) -> WriteJournal:
-    """Fold the JSONL back into one entry per person, newest line winning."""
-    latest: dict[str, JournalEntry] = {}
+    """Fold the JSONL back into one entry per record, newest line winning.
+
+    "One record" is :func:`_fold_key`'s answer: the person for a user row, the
+    ``(person, card)`` pair for a card row.
+    """
+    latest: dict[tuple[str, str | None], JournalEntry] = {}
     truncated: list[str] = []
     try:
         text = path.read_text(encoding="utf-8")
@@ -575,7 +630,7 @@ def _replay(path: Path, *, phase: str) -> WriteJournal:
                 "refused, not half-read (§0.7 fail closed)"
             )
         entry = _entry_from_payload(raw, line_no=line_no, path=path)
-        latest[entry.employee_no] = entry
+        latest[_fold_key(entry)] = entry
     return WriteJournal(
         path=path, phase=phase, entries=tuple(latest.values()), truncated=tuple(truncated)
     )
@@ -596,6 +651,7 @@ def _entry_from_payload(raw: Mapping[str, Any], *, line_no: int, path: Path) -> 
         employee_no=str(raw.get("employeeNo") or ""),
         employee_hash=str(raw.get("employeeHash") or ""),
         classification=str(raw.get("classification") or ""),
+        card_no=_opt_str(raw.get("cardNo")),
         pre_write_hash=_opt_str(raw.get("preWriteHash")),
         intended_hash=_opt_str(raw.get("intendedHash")),
         post_write_hash=_opt_str(raw.get("postWriteHash")),
@@ -977,6 +1033,23 @@ class BudgetedWriteTransport:
         self.total_calls += 1
         result = method(*args)
         return dict(result)
+
+    def charge_authed_calls(self, count: int = 1) -> None:
+        """Book authed calls this phase caused WITHOUT a write of its own (§5.3).
+
+        Why this exists: §5.3's per-person budget counts reads as well as writes ("1
+        card write + 1 verify read per card"), but a verify read goes through the READ
+        client, not the write seam. If the ledger never saw it, the 80-call re-bootstrap
+        would under-count a phase that is supposed to stop before the ~190 cap — and the
+        cap is what protects the device's digest session (§0.5). So the composed phase
+        charges its own reads here. This spends NO request: it moves a counter on a
+        client this phase still owns, so the next write rotates to a fresh session
+        earlier, never later.
+        """
+        if count < 1:
+            raise ValueError(f"charge_authed_calls needs a positive count, got {count}")
+        self._calls += count
+        self.total_calls += count
 
     def close(self) -> None:
         if self._closed:
@@ -1478,21 +1551,30 @@ def _paged(
     inter_page_delay: float,
     clock: Callable[[], float],
     search_prefix: str,
+    cond_key: str = "UserInfoSearchCond",
+    envelope_key: str = "UserInfoSearch",
+    record_key: str = "UserInfo",
 ) -> tuple[tuple[Mapping[str, Any], ...], str]:
-    """Walk the WRAPPED UserInfo/Search dialect to the end of the answer set.
+    """Walk a WRAPPED-dialect search to the end of the answer set.
 
     The same cursor rules as ``paging.PagedSearch`` (one searchID per logical search,
     advance by ``numOfMatches``, terminate on non-MORE / zero rows), because verify must
     not disagree with export about what a complete read means. Inlined rather than
     reusing the engine so the walker can be driven by a bare reader callable and can
     report ``error`` without an exception escaping a generator (§0.7).
+
+    The three key names are parameters, with the users dialect as the default: the
+    card roster (§6 verify, E1-05) is the SAME wrapped dialect with different names —
+    ``CardInfoSearchCond`` / ``CardInfoSearch`` / ``CardInfo`` (captured:
+    cardinfo_setup_readback.json) — and a second walker implementation is how the two
+    sides get to disagree about what "the whole answer" means.
     """
     from gateclerk.paging import DEFAULT_SEARCH_ID_LEN, new_search_id
 
-    # Prefix marks WHICH verify attempt this is (f = filtered, x = full-paging fallback)
-    # — the fake keys its cursor cache on the id, so the two attempts must not share one.
-    # The whole id stays inside the advertised cap, and `new_search_id` keeps its own
-    # >=12-char collision floor (paging.MIN_SEARCH_ID_LEN).
+    # Prefix marks WHICH verify attempt this is (f = filtered, x = full-paging fallback,
+    # c = card roster) — the fake keys its cursor cache on the id, so two attempts must
+    # not share one. The whole id stays inside the advertised cap, and `new_search_id`
+    # keeps its own >=12-char collision floor (paging.MIN_SEARCH_ID_LEN).
     search_id = f"{search_prefix}{new_search_id()}"[:DEFAULT_SEARCH_ID_LEN]
     rows: list[Mapping[str, Any]] = []
     position = 0
@@ -1506,7 +1588,7 @@ def _paged(
             if wait > 0:
                 sleep(wait)
         body = {
-            "UserInfoSearchCond": {
+            cond_key: {
                 "searchID": search_id,
                 "searchResultPosition": position,
                 "maxResults": page_size,
@@ -1519,10 +1601,10 @@ def _paged(
         except Exception:  # any read failure is an ERROR, never "empty" (§0.7)
             return tuple(rows), "error"
         pages += 1
-        envelope = answer.get("UserInfoSearch")
+        envelope = answer.get(envelope_key)
         if not isinstance(envelope, Mapping):
             return tuple(rows), "error"
-        batch = envelope.get("UserInfo")
+        batch = envelope.get(record_key)
         if not isinstance(batch, list):
             batch = []
         rows.extend(r for r in batch if isinstance(r, Mapping))

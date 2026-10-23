@@ -687,6 +687,16 @@ _CAPTURE_DIR = (
 #: The captured write verb path (a fake-side constant: the product registry stays
 #: read-only, so the write path never enters `gateclerk.endpoints` — design §5.0 gate).
 USER_SETUP_PATH = "/ISAPI/AccessControl/UserInfo/SetUp"
+#: E1-05 card write verbs (OBSERVED.md "E1 §5.0 WRITE-PATH CAPTURE"; served ONLY
+#: from the cardinfo_* fixtures once install_write_capture(cards=...) arms them).
+CARD_SETUP_PATH = "/ISAPI/AccessControl/CardInfo/SetUp"
+CARD_DELETE_PATH = "/ISAPI/AccessControl/CardInfo/Delete"
+
+#: The fake's card-CAPACITY answer (E1-05). NO committed capture shows a capacity
+#: rejection (§1: true device capacity is unexposed), so this word is clearly labelled
+#: SYNTHETIC — it exists to exercise the client's fail-fast + UNKNOWN-classification
+#: path, never to pose as a device vocabulary fact (§9).
+CARD_CAPACITY_SUBSTATUS = "SYNTHETIC-NO-CAPTURE-cardRosterFull"
 
 
 def _capture(name: str) -> dict:
@@ -1001,6 +1011,11 @@ class FakeDevice:
         #: answers the whole roster (OBSERVED's `AcsEventCond.employeeNo` lesson; bench A
         #: honored it, §1). E1-04's §6 coverage-proof walker is tested against this.
         self.honor_employee_filter = True
+        #: E1-05 card-capacity knob (plain attribute, like `fd_first_page_short`):
+        #: when set, a CardInfo/SetUp for a NEW (cardNo, employeeNo) pair is refused
+        #: once the card store already holds this many rows, with the clearly-labelled
+        #: SYNTHETIC subcode `CARD_CAPACITY_SUBSTATUS` (§9: INVENTED on purpose).
+        self.card_capacity: int | None = None
         #: Persons the filtered read OMITS even though the store has them — the other
         #: coverage failure §6 names (a filter honored but incomplete, so a requested
         #: person looks "missing" when they are not). Kept separate from
@@ -1797,6 +1812,13 @@ class FakeDevice:
           does exactly this on other filters, and §6's coverage-proof walker exists for
           it — this knob is what proves the walker is not cargo-culted.
         * ``wipe_hazard=False`` — disarm rule D-WIPE (see ``_write_user_delete``).
+
+        E1-05 (cards phase) extends the same arming to the CARD write routes: passing
+        ``cards=`` arms ``_write_card_setup`` / ``_write_card_delete``, which replay the
+        ``cardinfo_*`` captures verbatim and mutate the same enrollment store the card
+        search reads back. ``card_capacity`` (a plain attribute knob) is read there.
+        The USER delete route stays exactly as E1-04 left it — §5b.1's ban is not a
+        seam this card reopens.
         * ``fp_applies`` — the E1-06b APPLIES knob for `FingerPrintDownload`. The
           capture's ONLY recorded outcome is accept-without-apply (statusCode 1, then
           read-back `NoFP` and progress `cardReaderRecvStatus:5`), so the DEFAULT is
@@ -1824,6 +1846,7 @@ class FakeDevice:
         self._write_axis = {
             "capacity": capacity,
             "wipe_hazard": wipe_hazard,
+            "cards_armed": cards is not None,
             # E1-06b FP state: {(employeeNo, fingerPrintID): fingerData-b64} — only
             # populated under fp_applies=True (see the knob doc). progress_armed flips
             # when an accepted write did NOT apply, which is the ONLY situation with a
@@ -1947,6 +1970,138 @@ class FakeDevice:
             # "cascade-dropped all faces"), so the fake does too.
             self._biometric_store["faces"] = {}
         return _json_ok(_capture("userinfo_delete_wipe_response.json"))
+
+    _CARD_SETUP_KEYS = frozenset({"employeeNo", "cardNo", "cardType", "mode"})
+
+    def _write_card_setup(self, request: httpx.Request) -> httpx.Response:
+        """`PUT CardInfo/SetUp` — replays cardinfo_setup_{add_request,add_response}.json
+        semantics and mutates the card store (E1-05).
+
+        Rejection order mirrors the users route where the capture class is shared and
+        stays capture-only where the card family proved its own shape: verb (no
+        card-specific 405 was recorded; the users capture of the SAME
+        `methodNotAllowed` class answers — the test asserts the WORD), wrapped
+        `cardInfoList` (the users `lack employeeNo` capture of this class is replayed
+        verbatim), missing singular `CardInfo` or an unproven `mode` (NO capture →
+        `EnrollmentProtocolError`, never a guessed envelope), an unknown key (captured
+        `badJsonContent` envelope class naming the key), then capacity (INVENTED,
+        clearly-labelled synthetic word — see `CARD_CAPACITY_SUBSTATUS`).
+
+        Pair semantics (§5 step 5): the idempotency identity is the
+        ``(cardNo, employeeNo)`` pair. A re-add of an EXACT pair answers OK and
+        duplicates nothing. A cardNo already bound to a DIFFERENT employeeNo has NO
+        captured device answer on bench A, so the fake raises loudly — the client must
+        never be trained to expect some invented ownership-rejection wording (§9).
+        """
+        assert self._write_axis is not None and self._enrollment_store is not None
+        if request.method != "PUT":
+            return _json_error(_capture("users_setup_post_method_not_allowed.json"))
+        body = _json_body(request)
+        if not body:
+            return _bad_json("CardInfo")
+        if "cardInfoList" in body:  # the wrapped form the same family 400s (users capture)
+            return _json_error(_capture("users_setup_wrapped_list_400.json"))
+        record = body.get("CardInfo")
+        if not isinstance(record, dict):
+            raise EnrollmentProtocolError(
+                "PUT CardInfo/SetUp without a singular 'CardInfo' object has NO bench-A "
+                "capture (cardinfo_setup_add_request.json is the only recorded shape); "
+                "refusing to invent an answer for it (§9 capture-before-fake)"
+            )
+        if record.get("mode") != "add":
+            raise EnrollmentProtocolError(
+                f"CardInfo/SetUp mode {record.get('mode')!r} has no bench-A capture — "
+                'only "add" was proven (OBSERVED.md §5.0). A card is REMOVED through '
+                "the capture-proven targeted delete, never a SetUp mode; no modify "
+                "mode was recorded, so the fake refuses to guess one"
+            )
+        employee_no = record.get("employeeNo")
+        if not isinstance(employee_no, str) or not employee_no:
+            return _json_error(_capture("users_setup_wrapped_list_400.json"))
+        card_no = record.get("cardNo")
+        if not isinstance(card_no, str) or not card_no or not record.get("cardType"):
+            raise EnrollmentProtocolError(
+                "a CardInfo add missing cardNo/cardType has NO captured device answer "
+                "(cardinfo_setup_add_request.json carries every key non-empty); the "
+                "fake refuses to invent thin-body behaviour (§9)"
+            )
+        unknown = sorted(set(record) - self._CARD_SETUP_KEYS)
+        if unknown:
+            # INVENTED answer (captured envelope class), same reasoning as the users
+            # route: an unrecorded key 400s or half-merges on this family.
+            return _bad_json(unknown[0])
+        cards: list[dict] = self._enrollment_store["CardInfo"]
+        bound = next((r for r in cards if str(r.get("cardNo")) == card_no), None)
+        if bound is not None and str(bound.get("employeeNo")) != employee_no:
+            raise EnrollmentProtocolError(
+                f"CardInfo/SetUp would re-bind cardNo to employeeNo {employee_no!r} "
+                f"while bench A has NEVER captured an ownership-conflict answer for it "
+                "(the §4 blocker is a CLIENT-side classification — plan/verify refuse "
+                "it before any write); the fake will not invent the device's word (§9)"
+            )
+        if (
+            bound is None
+            and self.card_capacity is not None
+            and len(cards) >= int(self.card_capacity)
+        ):
+            # INVENTED (no capture of a capacity rejection — §1: true capacity is
+            # unexposed). Envelope class rides the captures; the subcode is the
+            # clearly-labelled SYNTHETIC word so the client must classify it UNKNOWN.
+            return _json_error(
+                {
+                    "statusCode": 6,
+                    "statusString": "Invalid Content",
+                    "subStatusCode": CARD_CAPACITY_SUBSTATUS,
+                    "errorCode": 1610612761,
+                    "errorMsg": "cardNo",
+                }
+            )
+        stored = {k: v for k, v in record.items() if k != "mode"}
+        if bound is None:
+            cards.append(stored)
+        else:
+            # Capture is silent on SetUp-over-existing AND on any modify mode (§5 step
+            # 8: v1 never modifies). The least inventive device reading of a re-issued
+            # ``add`` is the captured ack WITHOUT an unproven mutation: an identical
+            # pair re-run changes nothing (§5 step 5 pair-idempotency) and a SAME-PAIR
+            # row with DIFFERENT values is likewise left alone — a fake that silently
+            # merged unproven field changes would teach the client that SetUp can
+            # modify, which no capture says. §6 verify then finds the intended state
+            # unreached and makes the drift terminal (§0.6: never "fixed" by a write).
+            del stored
+        return _json_ok(_capture("cardinfo_setup_add_response.json"))
+
+    def _write_card_delete(self, request: httpx.Request) -> httpx.Response:
+        """`PUT CardInfo/Delete` — the capture-PROVEN targeted removal (§5b.1 point 3).
+
+        Unlike the user delete (whose every accepted shape wipes everything and whose
+        fake therefore WIPES — D-WIPE), the card delete's captured body keeps its list
+        INSIDE ``CardInfoDelCond.CardNoList`` and the capture session verified the
+        roster empty afterwards (`cardinfo_delete_verified_empty.json`). The fake
+        obeys ONLY that captured slot shape: a body whose list sits anywhere else has
+        no capture, and inventing an answer for the exact slot-swap that cost bench A
+        its users would be teaching the wrong lesson to the wrong verb (§9).
+        """
+        assert self._write_axis is not None and self._enrollment_store is not None
+        body = _json_body(request)
+        cond = body.get("CardInfoDelCond")
+        if not isinstance(cond, dict) or not isinstance(cond.get("CardNoList"), list):
+            raise EnrollmentProtocolError(
+                "a CardInfo delete whose list does not sit inside "
+                "CardInfoDelCond.CardNoList has NO committed capture — on this family "
+                "the analogous slot-swap on the USER delete answered ok and removed "
+                "EVERYONE (§5b D-WIPE); the fake serves only the capture-proven shape"
+            )
+        named = {
+            str(entry["cardNo"])
+            for entry in cond["CardNoList"]
+            if isinstance(entry, dict) and isinstance(entry.get("cardNo"), str)
+        }
+        store = self._enrollment_store["CardInfo"]
+        self._enrollment_store["CardInfo"] = [
+            row for row in store if str(row.get("cardNo")) not in named
+        ]
+        return _json_ok(_capture("cardinfo_delete_response.json"))
 
     # -- the fingerprint WRITE arm (card E1-06b; captures fpdownload_*.json) --------------
 
@@ -2270,6 +2425,16 @@ class FakeDevice:
                     "design §9 names"
                 )
             return self._write_user_setup(request)
+        if path in (CARD_SETUP_PATH, CARD_DELETE_PATH):
+            if self._write_axis is None or not self._write_axis.get("cards_armed"):
+                raise EnrollmentProtocolError(
+                    f"{request.method} {path} belongs to the E1-05 card write axis and "
+                    "needs install_write_capture(cards=...) arming (fixtures from "
+                    "PR #43); a card route answering un-armed is the §9 false green"
+                )
+            if path == CARD_SETUP_PATH:
+                return self._write_card_setup(request)
+            return self._write_card_delete(request)
         if path == "/ISAPI/AccessControl/UserInfoDetail/Delete":
             if self._write_axis is None:
                 raise EnrollmentProtocolError(
@@ -2327,13 +2492,6 @@ class FakeDevice:
                 "(§5b.1) and the fake will not invent an answer for a shape the "
                 "capture set proves does not exist (§9)"
             )
-        for write_path in ("/ISAPI/AccessControl/CardInfo/SetUp",):
-            if path == write_path:
-                raise EnrollmentProtocolError(
-                    f"{request.method} {write_path} belongs to a LATER card (E1-05 cards); "
-                    "its capture is committed but its "
-                    "fake route is not written yet, and E1-04 must not pre-build it (§9)"
-                )
         return None
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
