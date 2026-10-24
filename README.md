@@ -8,7 +8,12 @@ The contract is [docs/DESIGN.md](docs/DESIGN.md). The phase list is
 whole P1 surface: nothing there ever writes. The one exception the roadmap planned is
 the E1 enrollment-migration group (`gateclerk migrate`, [docs/ENROLLMENT-MIGRATION.md](docs/ENROLLMENT-MIGRATION.md)
 §7): probe/export/diff are read-only, and the group writes to a device ONLY under its
-explicitly gated `apply --apply` — every other path is provably zero-byte.
+explicitly gated `apply --apply` — every other path is provably zero-byte. One device
+wall is documented truth, not a bug (E1-11, docs/OBSERVED-site-B.md): face *templates*
+are firmware-generation-bound (`FR500005` templates are rejected by V4.13.0 firmware
+with `badJsonContent`/`errorMsg: faceURL`), so cross-generation face carry needs
+re-enrollment on the target — `migrate diff` says so up front as a report-only
+`facePortability` warning, and the faces phase journals the rejection by class.
 
 ## Quickstart
 

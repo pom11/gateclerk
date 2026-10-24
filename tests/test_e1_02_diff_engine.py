@@ -783,6 +783,7 @@ def test_json_report_is_the_pinned_stable_schema() -> None:
     assert payload["would_write"] == 1
     assert payload["reasons"] == {"normalization_collision": 1}
     assert set(payload) == {
+        "facePortability",
         "people",
         "reasons",
         "schema",
@@ -791,9 +792,14 @@ def test_json_report_is_the_pinned_stable_schema() -> None:
         "totals",
         "would_write",
     }
-    # byte-stability + sorted-key formatting are part of the pin
+    # E1-11: facePortability rides the schema ALWAYS (empty when nothing is
+    # warnable — this plan has no face rows at all) and is report-only: it never
+    # touches totals/would_write/reasons above.
+    assert payload["facePortability"] == []
+    # byte-stability + sorted-key formatting are part of the pin (E1-11: the sorted
+    # first key is now facePortability, which always rides the payload)
     assert rendered == render_report(p, fmt="json")
-    assert rendered.startswith('{\n  "people"')
+    assert rendered.startswith('{\n  "facePortability"')
     assert rendered.endswith("\n")
     rows = {row["employee"]: row for row in payload["people"]}
     assert rows[employee_hash("007")]["reasons"] == ["normalization_collision"]

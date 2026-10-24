@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -81,6 +82,7 @@ from gateclerk.tz import DEFAULT_SITE_TZ, TimeResolver
 __all__ = [
     "DEFAULT_CARRIED_TEMPLATE_NO",
     "DOOR_FIELDS",
+    "FACE_PORTABILITY_NOTE_PREFIX",
     "REPORT_SCHEMA",
     "Classification",
     "ConflictPolicy",
@@ -93,6 +95,7 @@ __all__ = [
     "TemplateRef",
     "classify",
     "employee_hash",
+    "face_portability_notes",
     "plan",
     "plan_still_valid",
     "read_target_state",
@@ -200,12 +203,27 @@ class TemplateRef:
 class TargetBiometrics:
     """What the TARGET device really has per person, from the proven v4 reads
     (FDSearch rows / FingerPrintUpload-Cond). None on either axis means the READ
-    FAILED — UNKNOWN, never empty (§9: "a count is not a set")."""
+    FAILED — UNKNOWN, never empty (§9: "a count is not a set").
+
+    ``target_face_magics`` (E1-11) is the face axis's REPORT-ONLY template-family
+    view: the readable ``FR\\d{6}`` markers (deduped, sorted) across EVERY present
+    target face row, from :func:`template_magic` riding the decode the row hash
+    already required — "the target's native magic where the target has ≥1 face"
+    the site-B capture recorded (V4.13.0 -> FR702706). Defaulted
+    (never ``None``) so every existing constructor — and the freshness re-diff,
+    which rebuilds the same shape from a fresh read — keeps working; the empty tuple
+    is honestly "no readable family anywhere" (an empty library, or every head
+    unreadable), which :func:`face_portability_notes` answers
+    with SILENCE (§0.7: never a guess, never an abort). Report-only by construction:
+    the notes it feeds are ``notes``, never ``reasons``, and ``plan_still_valid``
+    compares classification + reasons only.
+    """
 
     faces: Mapping[str, tuple[TemplateRef, ...]] | None = None
     faces_error: str | None = None
     fingerprints: Mapping[str, tuple[TemplateRef, ...]] | None = None
     fingerprints_error: str | None = None
+    target_face_magics: tuple[str, ...] = ()
 
     @classmethod
     def both_unknown(cls, faces_error: str, fingerprints_error: str) -> TargetBiometrics:
@@ -221,6 +239,90 @@ class TargetBiometrics:
 def employee_hash(employee_no: str, *, prefix_len: int = 12) -> str:
     """The report identity: stable sha256 PREFIX of the opaque employeeNo (§4)."""
     return hashlib.sha256(employee_no.encode("utf-8")).hexdigest()[:prefix_len]
+
+
+# --- E1-11: the face template FAMILY vocabulary (shared by diff + faces) --------------------
+#
+# Lives here, not in migrate_faces, for one structural reason: the import spine is
+# faces -> migrate_write -> migrate_diff (both already committed edges), so diff is
+# the lowest module both consumers already load — defining the vocabulary HERE keeps
+# the DAG acyclic (faces -> diff would close faces -> write -> diff -> faces if diff
+# reached back into faces). The site-B capture (docs/OBSERVED-site-B.md "Face WRITE
+# capture") recorded each firmware's face-template family marker: site-A (V3.2.30)
+# writes `FR500005`, site-B (V4.13.0) writes `FR702706`, and B rejects A's family
+# with the captured `badJsonContent`/`errorMsg:faceURL` pair. These three symbols are
+# the REPORT-ONLY half of that truth (the phase-side classifier for the exact
+# rejection envelope lives with the phase, in migrate_faces).
+
+
+#: E1-11 pre-apply warning: the face-template family marker this firmware family
+#: puts at the head of every modelData. First 8 bytes, ASCII-checked ``FR\\d{6}`` —
+#: NOTHING clever: no parsing, no structure, no interpretation (the template stays
+#: opaque, §2). A magic we can name is data for a REPORT-ONLY warning; it is never a
+#: write gate.
+_MAGIC_RE = re.compile(rb"^FR\d{6}")
+
+#: The report-only note family E1-11 writes into the diff (§4's ``notes`` stay
+#: report-only — names/tokens, never values; §7's legibility rule). Spelled once
+#: here because BOTH the diff engine and any report reader must agree on it.
+FACE_PORTABILITY_NOTE_PREFIX = "facePortability:"
+
+
+def template_magic(raw: bytes) -> str | None:
+    """The template family marker (first 8 bytes, ``FR\\d{6}``) or None — never a parse.
+
+    Reads AT MOST 8 bytes and only to answer "which firmware family wrote these
+    bytes" (site-A V3.2.30: ``FR500005``; site-B V4.13.0: ``FR702706`` — the captured
+    magics). Anything that does not match ``FR\\d{6}`` at the head returns None:
+    "unknown family" is an honest fact, and §0.7 forbids guessing one. The bytes are
+    never interpreted further, and the magic never gates a write — its only consumers
+    are the report-only ``facePortability`` warning (diff/plan) and the bundle-side
+    source read (faces), both of which report rather than decide.
+    """
+    head = bytes(raw[:8])
+    if _MAGIC_RE.match(head):
+        return head.decode("ascii")
+    return None
+
+
+def face_portability_notes(
+    source_magics: Sequence[str], target_magics: Sequence[str]
+) -> tuple[str, ...]:
+    """The report-only per-person warnings, or empty. NEVER an abort, NEVER a guess.
+
+    One note per SOURCE family that the TARGET has never been seen accepting: the
+    comparison the capture gives a truth for (FR500005 source vs FR702706-only target
+    is exactly capture E2 — the same box, same body shape, template swap). The inputs
+    are the readable ``FR\\d{6}`` families of each side (empty sequence = no readable
+    magic there):
+
+    * source empty or target empty — the target has NO face rows to compare against,
+      or this family is unreadable — the answer is SILENCE (§0.7: "unknown" is never
+      dressed as a warning, and a target with no faces has never rejected anything);
+    * a source family that appears anywhere in the target set — this box demonstrably
+      holds that family, no note;
+    * every other source family gets its own note.
+
+    Report-only all the way down: no exit code, no plan change, no abort — §5 step
+    4's aborts stay device-answer-driven. The shared formatter for the diff's per-
+    person ``notes`` AND the ``-o json`` ``facePortability`` field: one computation,
+    both renderings, so the table and the json can never disagree (§7).
+    """
+    if not source_magics or not target_magics:
+        return ()
+    known_target = {m for m in target_magics if m}
+    if not known_target:  # every target family unreadable == no target families (§0.7)
+        return ()
+    notes: list[str] = []
+    for source in sorted(set(source_magics)):
+        if not source or source in known_target:
+            continue
+        notes.append(
+            f"{FACE_PORTABILITY_NOTE_PREFIX}source={source} vs "
+            f"target={','.join(sorted(known_target))} — device-rejected class "
+            "(captured badJsonContent/faceURL); re-enroll on target"
+        )
+    return tuple(notes)
 
 
 # --- the classification record --------------------------------------------------------------
@@ -509,6 +611,7 @@ def classify(
     bundle_faces: Mapping[str, Sequence[TemplateRef]] | None = None,
     bundle_fingerprints: Mapping[str, Sequence[TemplateRef]] | None = None,
     biometrics: TargetBiometrics | None = None,
+    bundle_face_magics: Mapping[str, Sequence[str]] | None = None,
 ) -> list[Classification]:
     """Classify every employeeNo across bundle and target — PURE (no I/O, no clock).
 
@@ -525,6 +628,14 @@ def classify(
     RECORDED UNAVAILABLE, which means "the bundle carries none", a fact not a
     silence). `biometrics`: the target's face/FP sets, or None per axis = read
     failed = UNKNOWN (§9).
+
+    `bundle_face_magics` (E1-11): each bundle person's readable template families
+    (``FR\\d{6}`` markers read off the bundle's ``faces/*.b64`` — see
+    :func:`gateclerk.migrate_faces.bundle_face_magics`). Compared against
+    ``biometrics.target_face_magics`` ONLY to append the report-only
+    ``facePortability`` note — never a reason, never a class change, never an exit
+    move (§0.7: silence, not a guess, when either side is unknown). Absent/None
+    simply means "no source family was readable", which also yields silence.
 
     `policy.on_conflict=abort` does NOT raise here — classify is the pure verdict
     table; `plan()` raises `DiffAbortedError` and builds the write ledger.
@@ -554,6 +665,13 @@ def classify(
     for no in sorted(set(source) | set(target)):
         src_records = source.get(no, [])
         tgt_records = target.get(no, [])
+        # E1-11 report-only leg: this person's readable SOURCE families vs the target's
+        # readable families (device-wide union, from the plan pass's face walk). The
+        # helper answers unknown-either-side with silence (§0.7) — this append can
+        # never rename a class, add a reason, or move an exit code; it rides `notes`.
+        portability = face_portability_notes(
+            (bundle_face_magics or {}).get(no, ()), biometrics.target_face_magics
+        )
         if src_records and not tgt_records:
             twins = [t for t in target_norm.get(_normalization_key(no), []) if t != no]
             if twins:
@@ -584,6 +702,7 @@ def classify(
                     bundle_fingerprints=bundle_fingerprints,
                     biometrics=biometrics,
                     probe_note=probe_note,
+                    portability_notes=portability,
                 )
             )
         elif tgt_records and not src_records:
@@ -614,6 +733,7 @@ def classify(
                     bundle_fingerprints=bundle_fingerprints,
                     biometrics=biometrics,
                     probe_note=probe_note,
+                    portability_notes=portability,
                 )
             )
     return results
@@ -649,9 +769,11 @@ def _classify_add(
     bundle_fingerprints: Mapping[str, Sequence[TemplateRef]] | None,
     biometrics: TargetBiometrics,
     probe_note: str | None,
+    portability_notes: Sequence[str] = (),
 ) -> Classification:
     """Source-only person: the `add` class plus its own conflict gates."""
     notes: list[str] = [probe_note] if probe_note else []
+    notes.extend(portability_notes)  # E1-11: report-only, never a reason (§0.7)
     reasons: list[Reason] = []
 
     validity = _validity_problem(record, policy.site_tz)
@@ -732,9 +854,11 @@ def _classify_both(
     bundle_fingerprints: Mapping[str, Sequence[TemplateRef]] | None,
     biometrics: TargetBiometrics,
     probe_note: str | None,
+    portability_notes: Sequence[str] = (),
 ) -> Classification:
     """Person on BOTH sides: update / same / conflict (§4)."""
     notes: list[str] = [probe_note] if probe_note else []
+    notes.extend(portability_notes)  # E1-11: report-only, never a reason (§0.7)
     reasons: list[Reason] = []
 
     fields = _actionable_field_names(src, tgt)
@@ -898,6 +1022,7 @@ def plan(
     biometrics: TargetBiometrics | None = None,
     bundle_faces: Mapping[str, Sequence[TemplateRef]] | None = None,
     bundle_fingerprints: Mapping[str, Sequence[TemplateRef]] | None = None,
+    bundle_face_magics: Mapping[str, Sequence[str]] | None = None,
 ) -> Plan:
     """The dry-run plan: fresh target read -> classify -> policy -> ledger (§4).
 
@@ -928,6 +1053,7 @@ def plan(
         bundle_faces=bundle_faces,
         bundle_fingerprints=bundle_fingerprints,
         biometrics=biometrics,
+        bundle_face_magics=bundle_face_magics,
     )
     if policy.on_conflict is ConflictPolicy.ABORT:
         conflicts = [i for i in items if i.classification is DiffClass.CONFLICT]
@@ -1011,6 +1137,20 @@ def _payload(plan: Plan) -> dict[str, Any]:
                 "would_write": i.would_write,
             }
             for i in plan.items
+        ],
+        # E1-11 (§7 legibility): the facePortability warnings, lifted out of `notes`
+        # into their own field so `-o json` consumers see the wall without parsing
+        # note text. DERIVED from the same Classification objects the table renders —
+        # one computation, two views (the note text is byte-identical in both places).
+        # Report-only by construction: this field never affects `totals`,
+        # `would_write`, or the exit code (they read only classes/reasons/writes).
+        "facePortability": [
+            {
+                "employee": i.employee_hash,
+                "warnings": [n for n in i.notes if n.startswith(FACE_PORTABILITY_NOTE_PREFIX)],
+            }
+            for i in plan.items
+            if any(n.startswith(FACE_PORTABILITY_NOTE_PREFIX) for n in i.notes)
         ],
         "reasons": reasons,
         "schema": REPORT_SCHEMA,

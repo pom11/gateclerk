@@ -307,6 +307,17 @@ class RejectKind(StrEnum):
     #: The device said no for a reason it named itself (capacity, busy-exhausted, a
     #: per-record refusal). §5 step 4: the first of these aborts the phase.
     OTHER = "other_rejected"
+    #: E1-11 (site-B capture, V4.13.0): the request SHAPE was accepted — our own flat
+    #: FDSetUp body with the target's OWN template answers `ok` (capture E1) — but THIS
+    #: template's bytes were refused: the exact envelope pair `subStatusCode:
+    #: "badJsonContent"` + `errorMsg: "faceURL"` (capture E2, docs/OBSERVED-site-B.md
+    #: "Face WRITE capture"). Not our bug (SHAPE would send someone hunting the body
+    #: builder — that fix is disproven by E1) and not generic OTHER either: it names a
+    #: firmware template-PORTABILITY wall whose only human next step is re-enrollment
+    #: on the target. Faces own this class today; nothing else has ever answered this
+    #: pair, and :func:`gateclerk.migrate_faces.is_template_portability_rejection` is
+    #: the only producer (the pair, never bare `badJsonContent`, is the trigger).
+    TEMPLATE_REJECTED = "template_rejected"
 
 
 class WriteAbortedError(GateclerkError):
@@ -405,6 +416,14 @@ class JournalEntry:
     post_write_hash: str | None = None
     #: the device's own subStatusCode when a write was rejected (verbatim, §6).
     device_sub_status: str | None = None
+    #: E1-11: the :class:`RejectKind` the rejection was classified as, on a ``rejected``
+    #: line. An EXTRA key, not a schema bump: ``gateclerk-migrate-journal/1`` stays, old
+    #: journals (no key) read as ``None``, and the key is only WRITTEN when there is a
+    #: class to record — so every line this module wrote before E1-11 stays byte-identical
+    #: (the journal is append-only history, not a re-rendered report). An unknown VALUE
+    #: for a known key is refused on replay (same rule as an unknown ``state``): a file
+    #: this module cannot read is state a human adjudicates, never a half-read (§0.7).
+    reject_class: RejectKind | None = None
     #: the normalized record we intend (bundle-equivalent bytes, §9).
     intended_record: Mapping[str, Any] | None = None
     #: the full pre-write record from the snapshot (§5a: undo needs the prior object,
@@ -501,9 +520,28 @@ class WriteJournal:
         """Append ``applied`` — the device accepted the request (statusCode 1)."""
         return self._append(_transition(entry, JournalState.APPLIED))
 
-    def rejected(self, entry: JournalEntry, *, sub_status: str | None) -> JournalEntry:
-        """Append ``rejected`` with the device's own word (unknown state = human, §5a)."""
-        return self._append(_transition(entry, JournalState.REJECTED, device_sub_status=sub_status))
+    def rejected(
+        self,
+        entry: JournalEntry,
+        *,
+        sub_status: str | None,
+        reject_class: RejectKind | None = None,
+    ) -> JournalEntry:
+        """Append ``rejected`` with the device's own word (unknown state = human, §5a).
+
+        ``reject_class`` (E1-11) records the :class:`RejectKind` the caller classified
+        the rejection as — a captured-vocabulary fact from :func:`classify_rejection`,
+        never a guess. It rides as an extra key under the unchanged schema; omitting it
+        keeps the line byte-identical to what this journal wrote before E1-11.
+        """
+        return self._append(
+            _transition(
+                entry,
+                JournalState.REJECTED,
+                device_sub_status=sub_status,
+                reject_class=reject_class,
+            )
+        )
 
     def confirmed(self, entry: JournalEntry, *, post_write_hash: str) -> JournalEntry:
         """Append ``confirmed`` — the §6 read-back hash matches the intended hash."""
@@ -600,7 +638,7 @@ def _fold_key(entry: JournalEntry) -> tuple[str, str | None]:
 
 
 def _entry_payload(entry: JournalEntry) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "schema": JOURNAL_SCHEMA,
         "seq": entry.seq,
         "state": str(entry.state),
@@ -617,6 +655,12 @@ def _entry_payload(entry: JournalEntry) -> dict[str, Any]:
         "intendedRecord": dict(entry.intended_record) if entry.intended_record else None,
         "preWriteRecord": dict(entry.pre_write_record) if entry.pre_write_record else None,
     }
+    # E1-11: the class key appears ONLY when there is a class to record — a journal
+    # line written before E1-11 (or by a phase that passes no class) stays byte-identical
+    # on disk; the schema token is unchanged and readers must stay permissive on read.
+    if entry.reject_class is not None:
+        payload["rejectClass"] = str(entry.reject_class)
+    return payload
 
 
 def _replay(path: Path, *, phase: str) -> WriteJournal:
@@ -665,6 +709,19 @@ def _entry_from_payload(raw: Mapping[str, Any], *, line_no: int, path: Path) -> 
         raise JournalError(
             f"journal {path} line {line_no} carries unknown state {raw.get('state')!r}"
         ) from exc
+    # E1-11's extra key: ABSENT on every line written before E1-11 (read as None — the
+    # permissive half of "schema-compatible"); a PRESENT-but-unknown value is refused
+    # exactly like an unknown state, because a rejection class we cannot name is a
+    # classification fact someone wrote down and we must not silently drop it (§0.7).
+    reject_class: RejectKind | None = None
+    if raw.get("rejectClass") is not None:
+        try:
+            reject_class = RejectKind(str(raw["rejectClass"]))
+        except ValueError as exc:
+            raise JournalError(
+                f"journal {path} line {line_no} carries unknown rejectClass "
+                f"{raw.get('rejectClass')!r}"
+            ) from exc
     return JournalEntry(
         seq=int(raw.get("seq") or 0),
         state=state,
@@ -678,6 +735,7 @@ def _entry_from_payload(raw: Mapping[str, Any], *, line_no: int, path: Path) -> 
         intended_hash=_opt_str(raw.get("intendedHash")),
         post_write_hash=_opt_str(raw.get("postWriteHash")),
         device_sub_status=_opt_str(raw.get("deviceSubStatus")),
+        reject_class=reject_class,
         intended_record=_opt_map(raw.get("intendedRecord")),
         pre_write_record=_opt_map(raw.get("preWriteRecord")),
     )

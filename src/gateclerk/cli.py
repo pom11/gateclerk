@@ -2203,7 +2203,15 @@ def migrate_diff(
         probe = require_fresh(load_matrix(root, site_config.name, site_config.host), _now())
         seams = _migrate_seams(client, _client_factory, writable=False)
         planned = apply_mod.migrate_plan(
-            bundle=bundle_data, seams=seams, policy=policy, probe=probe, now=_now()
+            bundle=bundle_data,
+            seams=seams,
+            policy=policy,
+            probe=probe,
+            now=_now(),
+            # E1-11: the report-only facePortability leg reads the bundle's own face
+            # templates (magic head only, never a parse) against the target's face
+            # walk. Report-only by construction — never an abort, never an exit move.
+            bundle_dir=Path(bundle),
         )
         if fmt is OutputFormat.TABLE:
             typer.echo(apply_mod.render_diff_report(planned.plan, fmt="table"), nl=False)
@@ -2295,7 +2303,15 @@ def migrate_apply(
         seams = _migrate_seams(client, _client_factory, writable=apply_writes)
         try:
             planned = apply_mod.migrate_plan(
-                bundle=bundle_data, seams=seams, policy=policy, probe=probe, now=_now()
+                bundle=bundle_data,
+                seams=seams,
+                policy=policy,
+                probe=probe,
+                now=_now(),
+                # E1-11: same report-only facePortability leg as `diff` — the apply
+                # report shows the wall BEFORE the faces phase meets it (the operator's
+                # actual pain). Never an abort, never an exit move.
+                bundle_dir=Path(bundle),
             )
         except DiffAbortedError as exc:
             # `--on-conflict=abort` refused before a single write was planned (§4), so the
@@ -2328,7 +2344,9 @@ def migrate_apply(
             confirm=apply_writes,
             batch_delay=0.0,
             sleep=lambda _s: None,
-            recheck=apply_mod.freshness_recheck(bundle_data, seams, policy, probe, _now()),
+            recheck=apply_mod.freshness_recheck(
+                bundle_data, seams, policy, probe, _now(), bundle_dir=Path(bundle)
+            ),
         )
         _emit_apply(report, fmt)
     raise typer.Exit(code=report.exit_code)

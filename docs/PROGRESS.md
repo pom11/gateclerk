@@ -837,3 +837,23 @@ without operator-sanctioned capture (lockout budget). Separate observability gap
 noted (NOT in this card): --verbose does not log write-seam requests (seams use
 client.raw -> bypasses LoggedClient) — journal carries the intent, CLI -v shows reads
 only; card if operator wants -v completeness for writes.
+
+## 2026-10-24 — E1-11 done: template_rejected class + report-only facePortability warning
+
+Capture truth is now code: the faces phase classifies the EXACT captured pair
+(subStatusCode badJsonContent + errorMsg faceURL — never bare badJsonContent, which
+stays shape_rejected) as RejectKind.template_rejected, journals it under the unchanged
+schema as the additive `rejectClass` key (old journals read with class None; unknown
+values fail closed), and aborts naming the wall and the human step ("faces require
+re-enrollment on the target — docs/OBSERVED-site-B.md"); zero retry unchanged (§0.6).
+Pre-apply, plan/diff compare readable template families (first 8 bytes, `FR\d{6}` —
+transport, never a parse): source family the target has never held earns a REPORT-ONLY
+facePortability note per person (table notes + `-o json` field), silence — never a
+guess — when either side is unreadable/empty (a faceless target has never rejected
+anything). Body builder untouched (capture E1 proves it correct on V4.13.0); users/
+cards/fp phases untouched. A->B face carry remains blocked BY DEVICE until templates
+are re-enrolled on B or a sanctioned capture finds an accepted cross-generation shape.
+Tests: test_e1_11_template_portability (19; real IsapiClient+MockTransport bare+
+LoggedClient; the four card mutation probes each kill red); site-B sanitized fixtures
+under tests/fixtures/recorded/site-b-ds-k1t344mbfwx-e1/ and the hygiene lock now
+globs every recorded site.

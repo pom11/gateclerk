@@ -81,6 +81,7 @@ from gateclerk.migrate_faces import (
     FaceWrite,
     ReaderCaller,
     apply_faces_phase,
+    bundle_face_magics,
     faces_report,
     plan_face_writes,
     undo_faces,
@@ -492,25 +493,46 @@ def _roster(state: EnrollmentState) -> list[str]:
 
 def read_target_faces(
     state: EnrollmentState, faces_reader: SearchReader
-) -> tuple[Mapping[str, tuple[TemplateRef, ...]] | None, str | None]:
-    """The target's live face set per person, by template sha (§9).
+) -> tuple[
+    Mapping[str, tuple[TemplateRef, ...]] | None,
+    str | None,
+    tuple[str, ...],
+]:
+    """The target's live face set per person (by template sha, §9) + the E1-11 magic union.
 
     Reuses the faces module's own ``read_face_row`` (one request per person, the
     captured FLAT filter, and its coverage rules), so the plan and the phase can never
-    disagree about what a face row means. ``(None, why)`` on any read failure: E1-02
-    turns that into UNKNOWN / ``unknown_enrollments``, never "has none" (§0.7).
+    disagree about what a face row means. ``(None, why, ())`` on any read failure:
+    E1-02 turns that into UNKNOWN / ``unknown_enrollments``, never "has none" (§0.7).
+
+    The third element is the REPORT-ONLY device-wide set of readable template
+    families (``FR\\d{6}`` markers) across every PRESENT row this walk saw — the
+    "target's native magic where the target has ≥1 face" the capture recorded
+    (V4.13.0 -> FR702706, docs/OBSERVED-site-B.md). It rides the ``modelData`` decode
+    ``read_face_row`` already performs for the hash (``template_magic`` reads at most
+    8 of those bytes — transport, never a parse, §2), costs zero extra requests, and
+    feeds ONLY the report-only ``facePortability`` note. Empty on a failed read (and
+    for a target with no readable rows) — which the note helper answers with SILENCE:
+    never a guess (§0.7), never an abort.
     """
     from gateclerk.migrate_faces import RowState, read_face_row
 
     caller = ReaderCaller(faces_reader)
     refs: dict[str, tuple[TemplateRef, ...]] = {}
+    magics: set[str] = set()
     for employee_no in _roster(state):
         row = read_face_row(caller, employee_no)
         if row.state is RowState.ERROR:
-            return None, (
-                f"FDSearch read failed for {person_hash(employee_no)}: {row.note} — "
-                "UNKNOWN, never zero (§0.7)"
+            return (
+                None,
+                (
+                    f"FDSearch read failed for {person_hash(employee_no)}: {row.note} — "
+                    "UNKNOWN, never zero (§0.7)"
+                ),
+                (),
             )
+        if row.magic:
+            magics.add(row.magic)
         if row.state is RowState.PRESENT and row.sha256 is not None and row.length is not None:
             refs[employee_no] = (
                 TemplateRef(
@@ -520,7 +542,7 @@ def read_target_faces(
                     length=row.length,
                 ),
             )
-    return refs, None
+    return refs, None, tuple(sorted(magics))
 
 
 def read_target_fingerprints(
@@ -556,6 +578,7 @@ def migrate_plan(
     probe: CapabilityMatrix | None,
     now: datetime,
     state: EnrollmentState | None = None,
+    bundle_dir: Path | None = None,
 ) -> MigratePlan:
     """§4's diff over a FRESH target read — the ONE computation ``diff`` and ``apply`` share.
 
@@ -563,12 +586,23 @@ def migrate_plan(
     reads once and reuses it for classify *and* both biometric set reads: one instant,
     not three, so the axes cannot disagree with each other). The write phases still
     re-read the target themselves — §4's per-phase freshness is theirs, not this one.
+
+    ``bundle_dir`` (E1-11) enables the REPORT-ONLY ``facePortability`` leg: the
+    bundle's own ``faces/*.b64`` are the source-magic read
+    (``bundle_face_magics`` — transport decode, never a parse), compared against the
+    target magic union the face walk already rode. ``None`` (a caller without the
+    directory on hand) simply yields silence for that leg — §0.7: no family is
+    invented from absence, and nothing in the plan or the exit code changes either
+    way (the notes are report-only by construction).
     """
     target = seams.read_target_state() if state is None else state
-    faces_refs, faces_error = read_target_faces(target, seams.faces_reader)
+    faces_refs, faces_error, target_face_magics = read_target_faces(target, seams.faces_reader)
     fp_refs, fp_error = read_target_fingerprints(target, seams.fp_reader)
     bundle_faces = template_refs(bundle.faces)
     bundle_fingerprints = template_refs(bundle.fingerprints)
+    source_magics = (
+        None if bundle_dir is None else bundle_face_magics(bundle_dir, bundle.faces.entries)
+    )
     plan = build_plan(
         bundle,
         target,
@@ -580,9 +614,11 @@ def migrate_plan(
             faces_error=faces_error,
             fingerprints=fp_refs,
             fingerprints_error=fp_error,
+            target_face_magics=target_face_magics,
         ),
         bundle_faces=bundle_faces,
         bundle_fingerprints=bundle_fingerprints,
+        bundle_face_magics=source_magics,
     )
     return MigratePlan(
         plan=plan, bundle_faces=bundle_faces, bundle_fingerprints=bundle_fingerprints
@@ -1527,17 +1563,28 @@ def freshness_recheck(
     policy: DiffPolicy,
     probe: CapabilityMatrix,
     now: datetime,
+    bundle_dir: Path | None = None,
 ) -> Callable[[], Sequence[Any]]:
     """E1-02's §4 seam, wired: re-read the target NOW and re-classify.
 
     ``apply_*_phase`` calls the result and compares it with ``plan_still_valid``; the
     composer only supplies the closure, it never re-implements the comparison. The
     bundle-side template refs are identical on both passes, so only the target read
-    moves — which is the whole point of the gate.
+    moves — which is the whole point of the gate. ``bundle_dir`` (E1-11) threads the
+    report-only facePortability source read so a re-diff renders the same warnings as
+    the plan pass; the gate itself is unchanged (it compares classification + reasons,
+    never notes).
     """
 
     def recheck() -> Sequence[Any]:
-        fresh = migrate_plan(bundle=bundle, seams=seams, policy=policy, probe=probe, now=now)
+        fresh = migrate_plan(
+            bundle=bundle,
+            seams=seams,
+            policy=policy,
+            probe=probe,
+            now=now,
+            bundle_dir=bundle_dir,
+        )
         return fresh.plan.items
 
     return recheck

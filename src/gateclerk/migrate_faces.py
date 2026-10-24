@@ -97,6 +97,17 @@ from gateclerk.migrate_bundle import (
     FaceTemplate,
     safe_template_stem,
 )
+from gateclerk.migrate_diff import (
+    # E1-11's shared face-template vocabulary. Defined in migrate_diff because the
+    # import spine is faces -> migrate_write -> migrate_diff (both committed edges):
+    # diff is the lowest module BOTH consumers already load, so keeping it here is
+    # what keeps the DAG acyclic. The faces phase consumes `template_magic` (the
+    # report-only family marker) and `face_portability_notes` (the shared formatter);
+    # the diff/plan pass uses the same two. One helper, both paths (card §2).
+    FACE_PORTABILITY_NOTE_PREFIX,
+    face_portability_notes,
+    template_magic,
+)
 from gateclerk.migrate_export import FD_PORTABLE_FACE_LIB_TYPE, FD_PORTABLE_FDID
 from gateclerk.migrate_probe import CapabilityMatrix, require_fresh
 from gateclerk.migrate_write import (
@@ -120,6 +131,7 @@ __all__ = [
     "FACE_DELETE_PARAMS",
     "FACE_DELETE_PATH",
     "FACE_LIB_TYPE",
+    "FACE_PORTABILITY_NOTE_PREFIX",
     "FACE_SEARCH_PATH",
     "FACE_SETUP_PATH",
     "FDID_PORTABLE",
@@ -127,6 +139,7 @@ __all__ = [
     "OP_FACE_DELETE",
     "OP_FACE_SETUP",
     "REBOOTSTRAP_AT_AUTHED_CALLS",
+    "TEMPLATE_PORTABILITY_HINT",
     "BudgetedFaceReader",
     "FaceIntent",
     "FacePhaseAbortedError",
@@ -147,16 +160,20 @@ __all__ = [
     "apply_faces_phase",
     "build_face_delete_body",
     "build_face_setup_body",
+    "bundle_face_magics",
     "count_face_rows",
     "decode_template",
+    "face_portability_notes",
     "face_template_path",
     "faces_report",
+    "is_template_portability_rejection",
     "journal_fingerprint",
     "live_metadata",
     "load_face_writes",
     "plan_face_writes",
     "read_face_row",
     "run_faces_phase",
+    "template_magic",
     "undo_faces",
     "verify_faces",
     "verify_journal_faces",
@@ -227,6 +244,71 @@ ABSENT_SHA = hashlib.sha256(b"").hexdigest()
 #: The journal ``op`` values this module writes (an undo of a face add is a delete).
 OP_FACE_SETUP = "face_setup"
 OP_FACE_DELETE = "face_delete"
+
+#: E1-11 (site-B capture, 2026-10-23, docs/OBSERVED-site-B.md "Face WRITE capture"):
+#: the EXACT rejection pair V4.13.0 answers when the request shape is right and the
+#: TEMPLATE BYTES are from another firmware generation. Captured verbatim as
+#: ``tests/fixtures/recorded/site-b-v4130/enrollment/facesetup_crossgen_reject_400.json``
+#: (HTTP 400 ``{"statusCode":6,"statusString":"Invalid Content","subStatusCode":
+#: "badJsonContent","errorCode":1610612759,"errorMsg":"faceURL"}``). The pair is the
+#: trigger — capture E1 proved our flat body with the target's OWN template answers
+#: ``ok`` on the same box, and the SAME box answers bare ``badJsonContent`` (naming the
+#: offending key, e.g. ``EmployeeNoList``/``enableCardReader`` in the bench-A captures)
+#: for real shape problems. Matching on bare ``badJsonContent`` would mislabel every
+#: shape bug as a firmware wall, so BOTH fields must match.
+_TEMPLATE_REJECT_SUB_STATUS = "badJsonContent"
+_TEMPLATE_REJECT_ERROR_MSG = "faceURL"
+
+#: The human-facing sentence the abort carries, and the ONLY honest exit from this
+#: class: the picture route is dead on both boxes (A's faceURL JPEG export 404s,
+#: capture-proven; B says ``isSupportFDSearchDataPackage:false``), so there is no
+#: automatic path — faces require re-enrollment on the target.
+TEMPLATE_PORTABILITY_HINT = (
+    "target firmware rejected the source face templates (generation mismatch: the "
+    "captured pair subStatusCode=badJsonContent + errorMsg=faceURL — the device could "
+    "not parse modelData and asked for a picture instead, and the picture route is "
+    "dead on both firmwares). Faces require re-enrollment on the target — "
+    "docs/OBSERVED-site-B.md 'Face WRITE capture'."
+)
+
+
+def is_template_portability_rejection(exc: WriteRejectedError) -> bool:
+    """True for the EXACT captured portability envelope — the pair, never one half.
+
+    ``subStatusCode == "badJsonContent"`` alone is NOT this class: the committed
+    captures show bare ``badJsonContent`` answering a wrong key (``EmployeeNoList``,
+    ``enableCardReader``, a wrapped body) and that stays ``SHAPE`` (our bug). Only the
+    full captured pair — that sub-status WITH ``errorMsg == "faceURL"`` — names the
+    template-portability wall (capture E2; the shape control E1 rules our body out as
+    the cause). Reads the envelope the transport carried; a rejection that arrived
+    without one is not this class (we refuse to infer the pair from the message text).
+    """
+    envelope = exc.envelope
+    return (
+        envelope.get("subStatusCode") == _TEMPLATE_REJECT_SUB_STATUS
+        and envelope.get("errorMsg") == _TEMPLATE_REJECT_ERROR_MSG
+    )
+
+
+def reject_kind_for(exc: WriteRejectedError) -> RejectKind:
+    """Classify one rejection: the captured portability pair first, then the generic map.
+
+    One entry point so a phase can never classify the SAME envelope two ways: the pair
+    check consumes the E2 envelope, and everything else keeps
+    :func:`gateclerk.migrate_write.classify_rejection`'s mapping verbatim (an unmapped
+    word stays OTHER with the device's word riding on, §6).
+    """
+    if is_template_portability_rejection(exc):
+        return RejectKind.TEMPLATE_REJECTED
+    return classify_rejection(exc.sub_status)
+
+
+# ``template_magic``, ``face_portability_notes`` and ``FACE_PORTABILITY_NOTE_PREFIX``
+# are imported above from migrate_diff (the one shared home — see the import comment)
+# and re-exported here because the faces phase is where a reader expects the face
+# vocabulary to live; the diff/plan pass imports the same objects from their home.
+# There is exactly ONE definition of each, so the plan-time warning and the phase's
+# understanding of the wall can never drift apart in text or in rule.
 
 
 # --- errors ---------------------------------------------------------------------------------
@@ -478,6 +560,46 @@ def load_face_writes(
     return tuple(order), tuple(skipped)
 
 
+def bundle_face_magics(
+    bundle_dir: str | os.PathLike[str],
+    entries: Sequence[FaceTemplate],
+) -> dict[str, tuple[str, ...]]:
+    """Each indexed person's readable template families, read off the bundle's ``.b64``.
+
+    E1-11's SOURCE side for the report-only ``facePortability`` warning. Reads the
+    SAME ``faces/<employeeNo>.b64`` files ``load_face_writes`` uploads (the same
+    layout, the same tolerant decode) and asks :func:`template_magic` about at most
+    8 bytes per template — transport + a head marker, never a parse (§2). A person
+    whose file is missing, unreadable, or not clean base64 is simply ABSENT from the
+    mapping: the plan pass has nothing to name for them, and the helper must not
+    invent a family from silence (§0.7 — the warning's own helper answers absence
+    with silence; the phase's skipped list remains where a broken bundle is REPORTED).
+
+    A person may hold several readable families (the target walk is per row); the
+    tuple is deduped and sorted so the warning text is deterministic.
+    """
+    magics: dict[str, tuple[str, ...]] = {}
+    for entry in entries:
+        try:
+            path = face_template_path(bundle_dir, entry.employee_no)
+        except ValueError:
+            continue
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            raw = decode_template(entry.employee_no, text.strip())
+        except FaceShapeError:
+            continue
+        magic = template_magic(raw)
+        if magic is not None:
+            magics[entry.employee_no] = (magic,)
+    return magics
+
+
 def plan_face_writes(
     *,
     bundle_dir: str | os.PathLike[str],
@@ -570,13 +692,23 @@ class RowState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class FaceRow:
-    """One targeted FDSearch answer: state + identity, never the template bytes."""
+    """One targeted FDSearch answer: state + identity, never the template bytes.
+
+    ``magic`` (E1-11) is the template family marker :func:`template_magic` reads off
+    the PRESENT row's decoded head — the first 8 bytes only, and only where the row
+    actually carries a hashable template (every other state leaves it None). It rides
+    on the same decode the sha256 already required (no second look at the bytes, no
+    parsing — §2's opaque rule) and feeds ONLY the report-only ``facePortability``
+    warning; it never changes a verdict, a write decision, or an exit code.
+    """
 
     state: RowState
     sha256: str | None = None
     length: int | None = None
     #: why a non-PRESENT row is what it is (the device's own words where it had any).
     note: str = ""
+    #: E1-11: ``FR\\d{6}`` family marker of the row's template, or None (unknown).
+    magic: str | None = None
 
 
 class SearchCaller(Protocol):
@@ -743,7 +875,14 @@ def read_face_row(
         raw = decode_template(employee_no, row.get("modelData"))
     except FaceShapeError as exc:
         return FaceRow(RowState.ERROR, note=str(exc))
-    return FaceRow(RowState.PRESENT, sha256=hashlib.sha256(raw).hexdigest(), length=len(raw))
+    # The decode the hash REQUIRES is also the only look at the bytes the portability
+    # marker needs — first 8 bytes, no parse (§2 opaque rule holds, E1-11).
+    return FaceRow(
+        RowState.PRESENT,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        length=len(raw),
+        magic=template_magic(raw),
+    )
 
 
 def count_face_rows(
@@ -1023,10 +1162,36 @@ def run_faces_phase(
             # journals `rejected`, records the rejection, and aborts (E1-04's rule).
             _require_ok_ack(ack, intent.employee_hash)
         except WriteRejectedError as exc:
-            journal.rejected(entry, sub_status=exc.sub_status)
-            tally.rejected.append(
-                (intent.employee_hash, classify_rejection(exc.sub_status), exc.sub_status)
-            )
+            # E1-11: ONE classifier for this phase's rejections. The captured E2 pair
+            # (badJsonContent + errorMsg:faceURL) is the template-portability wall;
+            # everything else keeps classify_rejection's mapping verbatim (§6).
+            kind = reject_kind_for(exc)
+            journal.rejected(entry, sub_status=exc.sub_status, reject_class=kind)
+            tally.rejected.append((intent.employee_hash, kind, exc.sub_status))
+            if kind is RejectKind.TEMPLATE_REJECTED:
+                # The wall, named — still fail-fast (§5 step 4) and still never retried
+                # (§0.6): retry-spam against a rejecting firmware spends the lockout
+                # budget for an answer the capture already gave. Only the message
+                # differs from the generic abort: it must name the wall and the human
+                # next step (re-enrollment), not leave the operator at "badJsonContent".
+                raise _abort(
+                    tally,
+                    transport,
+                    planned=planned,
+                    skipped=skipped,
+                    size=size,
+                    message=(
+                        f"faces phase aborted at {intent.employee_hash} after "
+                        f"{len(tally.applied)} of {len(writes)} accepted: "
+                        f"{TEMPLATE_PORTABILITY_HINT} "
+                        f"The journal entry is 'rejected' with class "
+                        f"{RejectKind.TEMPLATE_REJECTED} (device words: "
+                        f"{exc.sub_status}/{_TEMPLATE_REJECT_ERROR_MSG}); applied[] in "
+                        "the carried result lists who landed; nothing was retried (§0.6) "
+                        "and no further face upload may be attempted against this "
+                        "target in this run."
+                    ),
+                ) from exc
             raise _abort(
                 tally,
                 transport,
