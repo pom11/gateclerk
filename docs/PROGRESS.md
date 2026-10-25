@@ -857,3 +857,24 @@ Tests: test_e1_11_template_portability (19; real IsapiClient+MockTransport bare+
 LoggedClient; the four card mutation probes each kill red); site-B sanitized fixtures
 under tests/fixtures/recorded/site-b-ds-k1t344mbfwx-e1/ and the hygiene lock now
 globs every recorded site.
+
+## 2026-10-25 — P2-11b winter acceptance site-B CLOSED (orchestrator read-only; operator did step 1)
+- Step 1 (operator, 06:53 EET, 1 call): claim flipped — localTime +02:00, claimed_offset
+  120, tz_offset_mismatch false, skew −1.2 s, verdict agrees. p1-05c per-run claim read
+  confirmed against a MOVING claim; no device_tz mapping added.
+- isSummerTime quirk (operator-flagged): stays TRUE post-flip on V4.13.0. Product is
+  immune — repo-wide grep: zero occurrences in src/, tests/, fixtures, config. Claim
+  comes ONLY from localTime offset (tz.read_system_time -> device_window_labels, once/run).
+- Step 2 REVERSED A/B: current-claim (+02:00) windows return 0 over pre-flip events;
+  +03:00-labeled same-digit windows hit (6 serials 31–36, 5 serials 40–44); +02:00 hits
+  pre-flip history only at digits −1 h. Render re-anchored (digits +31–36 moved −1 h;
+  40–44 digits preserved) — device render path lies +1 h post-flip for stored events;
+  SEARCH anchor == product site-tz utc == true instant for clean post-fix events (40–44).
+  p1-06c "records correct, site-tz authoritative" positively demonstrated at the flip edge.
+- Step 3: day-of-window (Oct 25) 0 events yet (no winter scan); naive cross-boundary
+  reads fire the p1-06c summary warning 16/16, stderr-only, exit 0 — correct.
+  Live cursor unaffected (never re-reads pre-flip); any cross-DST backfill must split at
+  the flip and PROBE per side (winter-labeled window over summer history = 0).
+- Oct 25 zero rows also proves no stale claim in windows (dev 120 on all rows read today).
+- Receipts in OBSERVED-site-B.md §1b; card t_0d976509 closed. Optional closure leg for
+  "winning label == current claim": operator scans once on B post-flip (not required).

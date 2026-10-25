@@ -37,6 +37,43 @@ via `pipeline.device_window_labels`) handles this automatically; **nothing may c
 the claim across runs** — the flip lands **Sun 2026-10-25 04:00→03:00 local** (two
 days after this record), so winter acceptance is imminent, not hypothetical.
 
+### 1b. WINTER ACCEPTANCE (P2-11b, 2026-10-25 post-flip) — claim flipped; two device quirks found
+Post-flip read (operator, 06:53 EET, one call): `localTime 2026-10-25T06:53:25+02:00`,
+`device_claimed_offset_min 120`, site resolves 120 at the instant,
+`tz_offset_mismatch false`, skew −1.2 s, NTP — **claim flipped right**, verdict
+`agrees`, no `device_tz` mapping added. Then (orchestrator, read-only, same morning):
+- **Quirk 1 — `isSummerTime` stays `true` after the flip** even though `localTime`
+  carries `+02:00`. It is a STALE FLAG on V4.13.0. Nothing may key off it: the product
+  reads zero occurrences — `isSummerTime` appears nowhere in src/, tests/, fixtures,
+  or config (verified by repo-wide grep 2026-10-25). The claim comes ONLY from the
+  `localTime` offset (`tz.read_system_time` → `claimed_offset_minutes`;
+  `pipeline.device_window_labels` reads it once per run). Do not "fix" the flag by
+  trusting it.
+- **Quirk 2 — post-flip, stored-event SEARCH and RENDER disagree by one hour
+  (measured, mechanism not fully explained).** The 16 Oct-23 events, read post-flip:
+  `raw.time` renders 31–36 at `11:45:23+02:00` and 40–44 at `12:50:45+02:00`, but the
+  windows that actually HIT them (all 11 scan rows, both groups, across 4 probe
+  windows) are the `+03:00`-labeled SAME-DIGITS windows — i.e. window instants exactly
+  ONE HOUR BEFORE the rendered instants. The current-claim pair (digits + `+02:00`)
+  returns 0 for every pre-flip window; `+02:00`-labeled windows hit only at digits
+  shifted −1 h. Notably the product's own `event_time_utc` (site-tz resolution of the
+  naive digits = 08:45:23/09:50:45 UTC) agrees with what SEARCH matches — so p1-06c's
+  "records correct, site-tz authoritative" is positively demonstrated at the flip edge.
+  (Pre-flip, the same events were hit by their rendered+03:00 pair, so group 31–36's
+  search anchor also MOVED at the flip; we do not claim the mechanism — the fw's
+  display path and search index clearly keep different anchors.)
+  **Operational rule: the live cursor is unaffected (never re-reads pre-flip events),
+  but any cross-DST backfill/re-window on this device must split at the flip boundary,
+  and each side must be PROBED (small window, count rows) rather than assumed — one
+  label silently misses every event on the wrong side. A single winter-labeled window
+  over summer history returned 0.**
+- Day-of-window read for Oct 25: zero events on B yet post-flip, so the card's
+  "winning label == current claim for POST-flip events" leg is DEFERRED until B's
+  first winter scan exists (optional one-scan closure by the operator). Cross-boundary
+  reads (Oct 23 history queried post-flip) fire the p1-06c mismatch warning 16/16
+  — expected and correct (rendered +02:00 ≠ site-tz +03:00 at those instants;
+  records correct, site-tz authoritative).
+
 ### 2. Dense-window ARITHMETIC acceptance on the new fw — PASSED (2 read-only POSTs)
 Same decisive shape as the site-a A/B (OBSERVED main "ARITHMETIC" section), run over
 the 12:44–12:46 local window containing the 12:45 test scans:
