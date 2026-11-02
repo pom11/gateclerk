@@ -58,11 +58,33 @@ page_delay_ms = 100                  # between pages of one paged search
 # db_warn_bytes = 2147483648         # warn past this store size (§2b: keep-everything
 #                                    # plus a watermark alert, not purging)
 # push_target = "stub://local/ingest"
-#                                    # outbound push REF (§3: P3 out of scope). `stub://`
-#                                    # appends JSONL locally for tests; a real `https://`
-#                                    # ref is allowed; ftp://, http://, file:// and
-#                                    # anything else are REFUSED. There is never a
-#                                    # hardcoded default: omitted means pusher off.
+#                                    # outbound push REF (§3: never a hardcoded default;
+#                                    # omitted means pusher off). Two schemes:
+#                                    #   `stub://` appends JSONL locally for tests;
+#                                    #   `https://` is the real ingest — the gateclerk_ingest
+#                                    #     function URL, per site (Task 15). ftp://,
+#                                    #     http://, file:// and anything else are REFUSED
+#                                    #     (a bearer token never crosses clear text).
+# push_target = "https://INGEST-HOST/gateclerk_ingest"
+#                                    # the deployed gateclerk_ingest function URL (the real
+#                                    # host is deployment config, never committed). The
+#                                    # bearer token DETERMINES the site server-side;
+#                                    # `X-Gateclerk-Site` below only confirms it. Get the
+#                                    # token from the operator: it lives in the macOS
+#                                    # keychain item named by the site, NEVER in this
+#                                    # file, and never in a log:
+#                                    #   security add-generic-password -U \
+#                                    #       -s gateclerk-ingest-site-a -a site-a -w
+#                                    # (env rung for headless hosts:
+#                                    #  GATECLERK_INGEST_TOKEN_SITE-A, same name the ingest
+#                                    #  function uses in Secret Manager).
+# device_code = "D-IF-1"             # OPTIONAL (Task 15): the BC device code (page 70602)
+#                                    # this device is registered under. The hourly
+#                                    # device-users roster names the device by this code
+#                                    # when set, else by its serial — the ingest resolves
+#                                    # serial -> code itself, so omit unless BC's registry
+#                                    # carries a different code. Unknown/blocked -> 422
+#                                    # with the actionable serial list.
 # push_dead_letter_after_s = 86400   # continuous push failure before a batch is
 #                                    # dead-lettered into the same sqlite db (§2c: 24 h)
 

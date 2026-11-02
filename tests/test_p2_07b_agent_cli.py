@@ -1248,21 +1248,43 @@ def test_report_dataclasses_are_payload_free_by_construction() -> None:
     assert run.as_dict()["parked"] == [] and run.as_dict()["circuit_open"] == []
 
 
-def test_a_push_target_that_is_not_a_stub_is_refused_rather_than_invented(
+def test_an_https_push_target_without_a_token_warns_and_pushes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """§3: this repo ships only the `stub://` ingest and never invents an endpoint.
+    """§3 after Task 15: `https://` HAS a transport now — but still never invents an
+    endpoint, and a target whose bearer is missing must NOT burn the outage clock.
 
-    An `https://` target is config-legal (P2-01 accepts it for the day an owner wires a
-    transport) but the AGENT must refuse to run against it silently rather than pretend to push.
+    The pre-Task-15 behaviour was a startup refusal (the repo shipped only `stub://`).
+    The contract now: the agent runs, stores (the store is the truth), and the push step
+    warns naming the keychain item `gateclerk-ingest-<site>` while LEAVING rows queued —
+    draining anyway would fail every row on the same missing-token error until the 24 h
+    §2c bound dead-lettered the whole backlog for what is an install step, not an outage.
+    Zero bytes may reach the ingest, and the test never touches the real keychain: the
+    reader is faked to answer "item missing" exactly as `security` would.
     """
+    import gateclerk.agent_push as agent_push
+    from gateclerk.config import CredentialUnavailable
+
+    class _MissingItemReader:
+        def read(self, target, *, with_comment: bool = True):
+            raise CredentialUnavailable(
+                f"keychain item missing for service {target.keychain_service!r}"
+            )
+
+    monkeypatch.setattr(agent_push, "KeychainReader", _MissingItemReader)
+    monkeypatch.delenv(f"GATECLERK_INGEST_TOKEN_{SITE.upper()}", raising=False)
     device = seeded_device()
     device.add_events(*punch_events(T0, -300))
     h = AgentHarness(tmp_path, device, monkeypatch, push_target="https://ingest.example.invalid/x")
     code, out = h.cli(["run", "--site", SITE, "--state-root", str(h.state_root), "--once"])
-    assert code == CONFIG_ERROR_EXIT
-    assert "transport" in out.lower() or "stub" in out.lower()
-    assert device.served == [] or h.pushed_lines() == []
+    assert code == 0, out
+    assert "gateclerk-ingest-" in out, "the warn must name the keychain item to fix"
+    # The punch was STORED (polling works without a push token) and NOT pushed (no stub
+    # file exists for an https target, and the drain never ran: queue depth says so).
+    assert h.stored_serials(), "the store is still the truth without a token"
+    with h.conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM push_queue").fetchone()[0] >= 1
+        assert conn.execute("SELECT COUNT(*) FROM dead_letter").fetchone()[0] == 0
 
 
 def test_agent_cli_imports_without_the_cli_and_without_typer_names_in_its_warn_path() -> None:

@@ -39,22 +39,49 @@ Two refusals this module owns:
   event, and a replay must name a real dead-letter row. A silently-skipped id is a
   punch nobody will ever find out was never sent.
 
-The HTTP transport is an INJECTED callable `(url, body) -> status`: this module never
-imports a client and never opens a socket, and `stub_transport` (the owner-authorized
-local ingest: append JSONL to a local path) is the only implementation this card ships.
+The HTTP transport is an INJECTED callable `(url, body) -> status`. P2-04 shipped only
+`stub_transport` (the owner-authorized local ingest: append JSONL to a local path);
+Task 15 adds the real one, `https_transport` — and it is still the same injected
+seam, so the queue, the backoff ladder and the dead-letter machinery above are
+untouched by the switch (test_t15 pins that: the same `drain` accepts either).
+
+Task 15 (spec §7, the merged `gateclerk_ingest` function is the frozen contract):
+
+    POST <push_target>                      Content-Type: application/jsonl
+    Authorization: Bearer *** ingest token>     401 absent/unknown/revoked
+    X-Gateclerk-Site: <SITE>                        CONFIRMS the token's site only;
+                                                  a contradicting claim is 403 there
+
+The bearer DETERMINES the site server-side, so it is resolved PER SITE with no global
+fallback rung — explicit token > env `GATECLERK_INGEST_TOKEN_<SITE>` > keychain service
+`gateclerk-ingest-<site>` (account = site) — and it is held only as a `secrets.Secret`:
+repr/str of the transport, every message this module raises about it, and every column
+of `push_queue`/`dead_letter` are token-free by construction (`test_token_never_logged`).
+A missing token is a loud refusal naming the `security add-generic-password` command,
+never a header-less send: an unauthenticated POST is a 401 and a punch in the dead-
+letter queue for reasons the owner could have fixed at install time.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from gateclerk.config import DEFAULT_PUSH_DEAD_LETTER_AFTER_S, PUSH_TARGET_SCHEMES
+from gateclerk.config import (
+    DEFAULT_PUSH_DEAD_LETTER_AFTER_S,
+    PUSH_TARGET_SCHEMES,
+    DeviceTarget,
+    KeychainReader,
+)
+from gateclerk.exceptions import CredentialUnavailable
 from gateclerk.isapi_transport import DEFAULT_BUSY_BACKOFF_BASE, DEFAULT_BUSY_BACKOFF_CAP
+from gateclerk.model import UserRecord
+from gateclerk.secrets import Secret, redact
 
 __all__ = [
     "DEAD_LETTER_COLUMNS",
@@ -67,6 +94,8 @@ __all__ = [
     "DeadLetterMissingError",
     "DrainResult",
     "HttpStatusRejectedError",
+    "HttpsIngestTransport",
+    "IngestTokenUnavailableError",
     "Pending",
     "PushError",
     "PushTargetError",
@@ -75,8 +104,10 @@ __all__ = [
     "dead_letter_depth",
     "dead_letter_rows",
     "delete_dead_letter",
+    "device_users_line",
     "drain",
     "enqueue_events",
+    "https_transport",
     "pending_rows",
     "queue_depth",
     "replay_dead_letter",
@@ -787,6 +818,367 @@ def dead_letter_rows(
         )
         for row in conn.execute(sql, args)
     )
+
+
+# --- the HTTPS ingest transport (Task 15: spec §7, the real push target) ---------------------
+
+#: The only scheme this transport serves — checked case-sensitively, like P2-01's
+#: validator (`HTTPS://` in a config is a mistake worth a loud error).
+INGEST_SCHEME = "https://"
+
+#: The env rung mirrors the function's OWN variable name (`_GATECLERK_INGEST_SECRET_PREFIX`
+#: in functions/main.py): one name per site works in the agent's environment and in the
+#: Cloud Run runtime, so an operator sets exactly one thing per site either way.
+INGEST_TOKEN_ENV_PREFIX = "GATECLERK_INGEST_TOKEN_"  # noqa: S105 — a variable-NAME prefix
+
+#: The keychain service holding one site's ingest token. The account is the site (the
+#: device credential's account is the host — different item, different purpose, both
+#: macOS-managed: device creds and the ingest token never enter sites.toml).
+INGEST_KEYCHAIN_SERVICE_PREFIX = "gateclerk-ingest-"
+
+#: Wall-clock ceilings for one push. The connect budget is short because a dead
+#: endpoint should fail fast into P2-04's backoff, not stall the tick; the read budget
+#: is generous because a 200-line batch travels to Cloud Run, waits on BC writes, and
+#: the function is allowed to take its time (a read timeout here is a retry, never a
+#: loss — idempotency lives server-side on the fingerprint).
+DEFAULT_INGEST_CONNECT_TIMEOUT_S = 10.0
+DEFAULT_INGEST_READ_TIMEOUT_S = 30.0
+
+
+class IngestTokenUnavailableError(PushError):
+    """No bearer token for this site: refused BEFORE sending, never a header-less POST.
+
+    A POST without `Authorization` is a 401 by contract — the same queue failure class
+    an outage produces, but caused by an install step nobody ran. Naming the exact
+    `security add-generic-password` command turns the agent's log line into the fix.
+    The message names the keychain SERVICE (never any value) and passes through
+    `secrets.redact` like every other text this module raises.
+    """
+
+
+def ingest_token_env_var(site: str) -> str:
+    """The env variable naming one site's ingest token: `GATECLERK_INGEST_TOKEN_<SITE>`.
+
+    Site names are uppercased for the lookup because the function uppercases site codes
+    before comparing (`GATECLERK_SITES` / `GATECLERK_INGEST_TOKEN_SITE-A` on both ends).
+    """
+    return f"{INGEST_TOKEN_ENV_PREFIX}{site.strip().upper()}"
+
+
+def ingest_keychain_service(site: str) -> str:
+    """The keychain service holding one site's ingest token: `gateclerk-ingest-<site>`."""
+    return f"{INGEST_KEYCHAIN_SERVICE_PREFIX}{site.strip()}"
+
+
+def _add_token_command(site: str) -> str:
+    """The copy-pasteable command that would satisfy a missing ingest token.
+
+    Built here rather than reusing `DeviceTarget.add_command()` because that one carries
+    a `user=` comment hint for a *device login* — an ingest bearer has no user half, and
+    a misleading command is worse than none. `-w` last so the value is prompted, never
+    typed into shell history (DESIGN.md credential plumbing).
+    """
+    import shlex
+
+    service = ingest_keychain_service(site)
+    return (
+        "security add-generic-password -U "
+        f"-s {shlex.quote(service)} -a {shlex.quote(site.strip())} -w"
+    )
+
+
+class HttpsIngestTransport:
+    """The real `Transport`: one POST per drain row, bearer-authenticated, TLS-verified.
+
+    Implements the injected callable `(url, body) -> status` P2-04 defined — this class
+    changes nothing about the queue, the backoff ladder or the dead-letter table. A
+    non-2xx status is RETURNED (drain folds it into `HttpStatus<code>` and its existing
+    policy); a raised httpx error is the normal shape of "the internet is down" and the
+    drain already treats any exception as one failed row. Deliberately NOT wrapped into
+    a private exception class: the class name (`ConnectError` vs `ReadTimeout`) is the
+    operator's diagnostic, and §2b's error-class column reads it verbatim.
+
+    The token lives only in `_token: Secret` — the holder whose repr/str are `***`.
+    `repr(self)` prints the Secret wrapper, never a value; the label names the SOURCE
+    (`keychain:gateclerk-ingest-site-a`, `env:GATECLERK_INGEST_TOKEN_SITE-A`, `flag`) so an
+    operator can tell which rung answered without printing what it answered.
+
+    The token is resolved LAZILY (first send) and cached: building the agent must not
+    spend a `security` call (each is a macOS ACL prompt) before there is anything to
+    send, and a keychain added ten minutes after install still works — the next drain
+    resolves it on its own.
+    """
+
+    __slots__ = (
+        "_client",
+        "_env",
+        "_explicit",
+        "_keychain",
+        "_owns_client",
+        "_token",
+        "confirm_site",
+        "site",
+        "timeout",
+        "verify",
+    )
+
+    def __init__(
+        self,
+        site: str,
+        *,
+        token: str | Secret | None = None,
+        env: Mapping[str, str] | None = None,
+        keychain: Any = None,
+        client: Any = None,
+        confirm_site: bool = True,
+        connect_timeout_s: float = DEFAULT_INGEST_CONNECT_TIMEOUT_S,
+        read_timeout_s: float = DEFAULT_INGEST_READ_TIMEOUT_S,
+    ) -> None:
+        if not site or not site.strip():
+            raise ValueError("an ingest transport needs the site name it authenticates as")
+        import httpx
+
+        self.site = site.strip()
+        #: The `X-Gateclerk-Site` claim is a CONFIRMATION only (the token determines the
+        #: site); a site whose operator prefers to send no claim at all gets that.
+        self.confirm_site = bool(confirm_site)
+        self._env = env
+        self._keychain = keychain
+        self._explicit = (
+            Secret(token, label=f"flag:{self.site}") if isinstance(token, str) else token
+        )
+        self._token: Secret | None = None
+        self._owns_client = client is None
+        # TLS verification stays ON: a bearer token over a TLS connection that trusts
+        # whoever answers the DNS is the credential handed to the network (gotchas §4.1
+        # bans verify=False repo-wide). `trust_env=False` on the client WE build keeps
+        # the push off any proxy configured in the ambient environment — a proxy would
+        # see the bearer header, and the agent's own network path must not depend on
+        # ambient shell state (forked children included) to reach the ingest.
+        self.timeout = httpx.Timeout(read_timeout_s, connect=connect_timeout_s)
+        self.verify = True
+        self._client: Any = (
+            client
+            if client is not None
+            else httpx.Client(
+                timeout=self.timeout,
+                verify=True,
+                trust_env=False,
+                headers={"User-Agent": "gateclerk-agent/1"},
+            )
+        )
+        if client is not None:
+            # Read the injected client's own posture rather than asserting our default:
+            # an honest `verify` attribute beats a decorative one.
+            self.verify = getattr(client, "verify", True) is True
+
+    # --- the Transport seam ----------------------------------------------------------------
+
+    def __call__(self, url: str, body: str) -> int:
+        self._check_url(url)
+        token = self._resolve_token()
+        headers = {
+            "Authorization": f"Bearer {token.reveal()}",
+            # Pinned by the function's own frozen test docstring (`Content-Type:
+            # application/jsonl`); the body itself is the byte-verbatim stored line.
+            "Content-Type": "application/jsonl",
+        }
+        if self.confirm_site:
+            # Uppercase because the function uppercases the claim before comparing it
+            # to the token's site; a wrong-cased claim is still only ever a claim.
+            headers["X-Gateclerk-Site"] = self.site.upper()
+        payload = body if body.endswith("\n") else f"{body}\n"
+        response = self._client.post(
+            url,
+            content=payload.encode("utf-8"),
+            headers=headers,
+        )
+        # The response body is NOT folded into any exception or log: a server message
+        # is uncontrolled text, and §2b's error class needs only the status.
+        return int(response.status_code)
+
+    def close(self) -> None:
+        """Release the socket pool — only for the client this transport built."""
+        if self._owns_client:
+            self._client.close()
+
+    # --- the wire-shape guards and the token rungs -------------------------------------------
+
+    def _check_url(self, url: str) -> None:
+        if not url.startswith(INGEST_SCHEME):
+            raise PushTargetError(
+                f"the bearer transport cannot serve {url!r}: it speaks {INGEST_SCHEME} "
+                "only. A bearer token must never cross clear text, and a bearer "
+                "transport aimed at a local stub would let a test go green by writing "
+                "to disk while believing it authenticated to the ingest."
+            )
+
+    @property
+    def token_label(self) -> str | None:
+        """What we may safely say about the token (which rung answered), or None."""
+        return None if self._token is None else self._token.label
+
+    def token_available(self) -> bool:
+        """Whether a bearer token can be produced now — a probe, returns no secret.
+
+        For the agent's push step: an `https://` target whose token is missing must warn
+        and LEAVE the rows queued rather than run a drain whose every row dies on
+        `IngestTokenUnavailable` — the 24 h dead-letter clock measures OUTAGES (§2c),
+        and a never-installed keychain item is not an outage, it is an install step.
+        Resolves and caches on success (the resolver is lazy and idempotent); any
+        failure — missing item, locked keychain — answers False and the push path
+        surfaces the real class later.
+        """
+        try:
+            self._resolve_token()
+        except Exception:
+            return False
+        return True
+
+    def _resolve_token(self) -> Secret:
+        """flag > env > keychain — per site, no global fallback rung, then refuse.
+
+        No shared "one ingest token" rung exists ON PURPOSE: the function's contract is
+        that the token DETERMINES the site, so a resolver that fell back to some other
+        site's token would either 403 (site_token_mismatch, zero BC traffic) or — the
+        bad case — authenticate fine and attribute one site's punches to another.
+        """
+        if self._token is not None:
+            return self._token
+        resolved: Secret | None = None
+        if self._explicit is not None:
+            resolved = self._explicit
+        else:
+            environ: Mapping[str, str] = os.environ if self._env is None else self._env
+            name = ingest_token_env_var(self.site)
+            value = environ.get(name)
+            resolved = Secret(value, label=f"env:{name}") if value else self._read_keychain()
+        if resolved is None or not resolved.reveal():
+            raise IngestTokenUnavailableError(
+                f"no ingest bearer token for site {self.site!r}: set "
+                f"{ingest_token_env_var(self.site)} or add the keychain item with\n"
+                f"    {_add_token_command(self.site)}\n"
+                "Refusing to send unauthenticated: the ingest answers 401 and the "
+                "punch would dead-letter for a reason install-time config could fix."
+            )
+        self._token = resolved
+        return resolved
+
+    def _read_keychain(self) -> Secret | None:
+        target = DeviceTarget(
+            host=self.site,  # the keychain ACCOUNT is the site (device creds: the host)
+            site=self.site,
+            keychain_service=ingest_keychain_service(self.site),
+        )
+        reader = self._keychain if self._keychain is not None else KeychainReader()
+        try:
+            # with_comment=False: a second `security` invocation is a second macOS ACL
+            # prompt, and a bearer token has no `user=` hint to read anyway.
+            item = reader.read(target, with_comment=False)
+        except CredentialUnavailable as exc:
+            # config.py guarantees this message names service/account and no value;
+            # re-raise the pusher's own class so the operator gets the ingest-specific
+            # fix line. `redact` is belt-and-braces against a future reader echoing one.
+            raise IngestTokenUnavailableError(
+                redact(
+                    f"no ingest bearer token for site {self.site!r}: {exc}\n"
+                    f"    add it with: {_add_token_command(self.site)}",
+                    self._token,
+                )
+            ) from None
+        return item.password
+
+
+def https_transport(
+    site: str,
+    *,
+    token: str | Secret | None = None,
+    env: Mapping[str, str] | None = None,
+    keychain: Any = None,
+    client: Any = None,
+    confirm_site: bool = True,
+    connect_timeout_s: float = DEFAULT_INGEST_CONNECT_TIMEOUT_S,
+    read_timeout_s: float = DEFAULT_INGEST_READ_TIMEOUT_S,
+) -> HttpsIngestTransport:
+    """Build the HTTPS ingest transport for one site (the factory mirrors p1-02's rungs).
+
+    `token`/`env`/`keychain`/`client` are all injectable for exactly the reason they are
+    across this repo: a test that reads the real keychain or opens a real socket is not
+    a test (conftest's netoff would kill the socket anyway). Production passes nothing
+    but the site and gets flag>env>keychain resolution over `gateclerk-ingest-<site>`.
+    """
+    return HttpsIngestTransport(
+        site,
+        token=token,
+        env=env,
+        keychain=keychain,
+        client=client,
+        confirm_site=confirm_site,
+        connect_timeout_s=connect_timeout_s,
+        read_timeout_s=read_timeout_s,
+    )
+
+
+# --- the hourly roster line (Task 15: "also push device-user list hourly") --------------------
+
+#: The four user keys the ingest's `device_users` classifier reads — and the whole
+#: privacy boundary of this line. `UserRecord` already strips the device `password`
+#: hash at read time; what stays home on top of that is payroll-adjacent metadata the
+#: BC Nelegati list has no use for: validity windows, user type, the raw device blob.
+_ROSTER_USER_KEYS = ("employee_no", "name", "cardNo", "hasFace")
+
+
+def device_users_line(
+    *,
+    device_code: str,
+    users: Sequence[UserRecord] | Iterable[UserRecord],
+) -> str:
+    """One JSONL roster line, byte-shaped exactly as `gateclerk_ingest` classifies it.
+
+    The function's rule (functions/main.py, frozen contract): `kind == "device_users"`,
+    a non-empty `deviceCode`, a `users` LIST, and per user `employee_no` (empty -> 400
+    invalid_user_line), `name`, `cardNo` (or `card_no`), `hasFace` (or `has_face`).
+    Everything else it ignores, so everything else is data with no reason to cross the
+    wire. `cardNo`/`hasFace` are read from the record's verbatim device `raw` blob
+    (`cardNo`, `numOfFace`) because those are the shapes OBSERVED.md records; a device
+    that said neither answers `None`/False, which is the honest roster, not a gap.
+
+    `deviceCode` is the BC page-70602 code when the site configures one, else the
+    serial — the function resolves serial -> code through `gateclerkDevices` and accepts
+    either. An unknown-or-blocked one comes back 422 with the actionable list.
+
+    Compact separators + `ensure_ascii=False` + exactly one trailing newline: the
+    function `splitlines()`s the body, a pretty-printed roster would arrive as broken
+    lines, and names with diacritics must survive as themselves (model._dumps' rule).
+    """
+    import json
+
+    payload = {
+        "kind": "device_users",
+        "deviceCode": device_code,
+        "users": [_roster_user(user) for user in users],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+
+
+def _roster_user(user: UserRecord) -> dict[str, Any]:
+    """The four-key projection of one UserRecord — no more keys may exist here.
+
+    Accepts `UserRecord` or any object exposing `employee_no`/`name`/`raw` so a caller
+    holding deserialized records is not forced to re-validate them just to roster.
+    """
+    raw: Mapping[str, Any] = getattr(user, "raw", None) or {}
+    card = raw.get("cardNo", raw.get("card_no"))
+    faces = raw.get("numOfFace")
+    # `numOfFace` is the device's own face count (OBSERVED.md); any non-zero is a face
+    # on file. Absent = the device did not say = False, never a guess of True.
+    has_face = isinstance(faces, (int, float)) and not isinstance(faces, bool) and bool(faces)
+    return {
+        "employee_no": user.employee_no,
+        "name": user.name,
+        "cardNo": None if card is None else str(card),
+        "hasFace": has_face,
+    }
 
 
 # --- the stub ingest (§3: the abstract target, made real locally) ----------------------------

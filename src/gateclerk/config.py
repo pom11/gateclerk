@@ -210,6 +210,10 @@ class SiteConfig:
     #: Ingest endpoint REF for the outbound push (§3: abstract, never defaulted). `None`
     #: means the pusher is off. Accepted schemes: `PUSH_TARGET_SCHEMES`.
     push_target: str | None = None
+    #: Task 15: the BC device code (page 70602) this device is registered under, when it
+    #: differs from the serial. The hourly device-users roster names the device by this
+    #: code when set, else by its serial (the ingest resolves serial -> code itself).
+    device_code: str | None = None
     #: Continuous-push-failure seconds before a batch is dead-lettered (§2c: 24 h).
     push_dead_letter_after_s: int = DEFAULT_PUSH_DEAD_LETTER_AFTER_S
     #: Which process is reading (see `ConfigSurface`). NOT a TOML key: strictness
@@ -236,6 +240,7 @@ class SiteConfig:
             "db_path",
             "db_warn_bytes",
             "push_target",
+            "device_code",
             "push_dead_letter_after_s",
         }
     )
@@ -317,6 +322,11 @@ class SiteConfig:
             problem = _push_target_problem(self.push_target)
             if problem:
                 problems.append(problem)
+        # Task 15: a blank `device_code` would roster with an empty `deviceCode`, which
+        # the ingest answers 400 `invalid_user_line` for — an empty string is "unset",
+        # and the roster then names the device by serial like any unset key does.
+        if self.device_code is not None and not self.device_code.strip():
+            problems.append("device_code must not be empty (omit the key to use the serial)")
         # §2d: on the agent surface the zone is REQUIRED, never defaulted. The
         # compiled-in DEFAULT_IANA_TZ is a site-a value and must never decide another
         # site's payroll, so it is simply absent from this branch — an agent that wants
@@ -372,6 +382,9 @@ class SiteConfig:
             db_warn_bytes=_int(table.get("db_warn_bytes", DEFAULT_DB_WARN_BYTES), "db_warn_bytes"),
             push_target=(
                 _text(table["push_target"], "push_target") if "push_target" in table else None
+            ),
+            device_code=(
+                _text(table["device_code"], "device_code") if "device_code" in table else None
             ),
             push_dead_letter_after_s=_int(
                 table.get("push_dead_letter_after_s", DEFAULT_PUSH_DEAD_LETTER_AFTER_S),

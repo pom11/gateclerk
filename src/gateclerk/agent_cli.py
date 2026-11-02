@@ -48,8 +48,10 @@ rule); the file is its export format. A write failure warns and does not stop th
 instrument panel must not be able to park a door agent.
 
 Security: no credential value is stored on this module, printed, or put in a report; no
-endpoint is invented (an `https://` push target is refused with the reason, because P2-04
-ships only the `stub://` ingest — §3); device hosts come from sites.toml, never from here.
+endpoint is invented (targets come from sites.toml — §3). Since Task 15 the real ingest
+transport ships: an `https://` push target wires `agent_push.https_transport` for the
+site (bearer from the keychain item `gateclerk-ingest-<site>`), so the value lives only in
+the transport's `Secret` and never in this module, a report, or a log line.
 """
 
 from __future__ import annotations
@@ -512,6 +514,13 @@ class SiteAgent:
                 stall = self.policy.check_stall(loop.device_serial)
                 if stall is not None:
                     report.alerts.append(stall)
+            # Task 15's hourly roster step, pulled per cycle: a no-op (None) until the
+            # hour is up, and ONLY reached for a loop that actually ticked — a parked
+            # device above got `guarded_tick` -> None and must still see ZERO requests
+            # (§1.9). The DeviceUsersResult is deliberately dropped: the roster leg
+            # reports through `warn` (the collector observes the funnel) and BC's own
+            # Nelegati view, never through the punch counters P2-05/P2-06 read.
+            loop.push_device_users_if_due()
         report.alerts.extend(self._observe_watermark())
         if self.push_target is not None:
             self._push(moment, report)
@@ -632,15 +641,43 @@ class SiteAgent:
         if transport is None:
             if target.startswith("stub://"):
                 transport = agent_push.stub_transport(target)
+            elif target.startswith("https://"):
+                # Task 15: the real ingest leg exists now. A SiteAgent built directly
+                # (not through `build_site_agent`) resolves the bearer on the rungs the
+                # transport owns — env `GATECLERK_INGEST_TOKEN_<SITE>`, then the keychain
+                # item `gateclerk-ingest-<site>`.
+                transport = agent_push.https_transport(self.site.name)
+                self._push_transport = transport
             else:
                 raise ConfigError(
-                    f"push_target {target!r} needs a transport the owner wires: this repo "
-                    "ships only the `stub://` ingest and never invents an endpoint "
-                    "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at a stub."
+                    f"push_target {target!r} has no transport: this repo serves "
+                    "`stub://` and `https://` only and never invents an endpoint "
+                    "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at one "
+                    "of those."
                 )
         report.queued = len(
             queue_new_events(self.conn, endpoint=target, now=moment, ledger=self.ledger)
         )
+        # Task 15: a bearer transport with no token skips THIS cycle's drain, loudly.
+        # The alternative — draining anyway — fails every row with the same error until
+        # the 24 h bound dead-letters the site's whole backlog for a missing keychain
+        # item, which §2c's outage clock was never meant to measure. The rows stay
+        # queued; installing the token fixes the run without owner replay. The probe
+        # runs only when something is actually pending: an idle cycle must not spend a
+        # `security` invocation (each can be a macOS ACL prompt), and once a token IS
+        # resolvable the transport caches it and every later probe is free.
+        pending = report.queued or agent_push.queue_depth(self.conn)
+        probe = getattr(transport, "token_available", None)
+        if pending and probe is not None and not probe():
+            self._warn(
+                f"warning: push target {target!r} has no ingest bearer token for site "
+                f"{self.site.name!r}: set "
+                f"{agent_push.ingest_token_env_var(self.site.name)} or add the keychain "
+                f"item with security add-generic-password -U -s gateclerk-ingest-"
+                f"{self.site.name} -a {self.site.name} -w. Queued events stay queued "
+                "until then (no attempts burned, no dead-letters)."
+            )
+            return
         result = agent_push.drain(
             self.conn,
             endpoint=target,
@@ -815,19 +852,22 @@ def build_site_agent(
     collector (module docstring), `warn` is the single stderr funnel the collector also
     observes, and `sink` defaults to P2-05's own journald sink.
     """
-    # Refuse an unwired push target BEFORE anything is opened: an `https://` ref is config-legal
-    # (P2-01 accepts it for the day an owner wires a transport) but this repo ships only the
-    # `stub://` ingest, and an agent that polled all day while silently not pushing is the worst
-    # possible outcome — the store fills, the watermark alerts, and nobody's ingest has a punch.
+    # Task 15: an `https://` target now HAS a transport in this repo — the bearer ingest
+    # leg (`agent_push.https_transport`, keychain item `gateclerk-ingest-<site>`). What the
+    # old refusal protected against stays protected against: an agent that polls all day
+    # while silently not pushing. The transport is wired here (when the caller did not
+    # inject one) and its lazy token resolution means a missing keychain item fails every
+    # push with a loud error class instead of a silent zero — plus the warn line below,
+    # so the missing install step names itself at startup rather than at dead-letter time.
     if (
         site.push_target is not None
         and push_transport is None
-        and not site.push_target.startswith("stub://")
+        and not site.push_target.startswith(("stub://", "https://"))
     ):
         raise ConfigError(
-            f"push_target {site.push_target!r} needs a transport the owner wires: this repo "
-            "ships only the `stub://` ingest and never invents an endpoint "
-            "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at a stub."
+            f"push_target {site.push_target!r} has no transport: this repo serves "
+            "`stub://` and `https://` only and never invents an endpoint "
+            "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at one of those."
         )
     db_path = resolve_db_path(site, state_root)
     root = Path(db_path).parent
@@ -861,6 +901,23 @@ def build_site_agent(
         base_warn(text)
 
     loops: list[DeviceLoop] = []
+    # Task 15: the site's push transport, built ONCE here and shared by every leg — the
+    # punches (SiteAgent._push) and the hourly roster (DeviceLoop) hit the SAME endpoint
+    # with the SAME bearer, and one httpx.Client means one connection pool. An injected
+    # `push_transport` (tests, owner-wired) always wins. The token is resolved lazily
+    # inside the transport — deliberately NOT probed here: every `security` invocation can
+    # raise a macOS ACL prompt (KeychainReader's own rule about the second call), and an
+    # agent that has queued nothing yet has no reason to ask. A missing token surfaces at
+    # the first push instead, as a warning naming the keychain item (§3, SiteAgent._push).
+    ingest_transport = push_transport
+    if (
+        ingest_transport is None
+        and site.push_target is not None
+        and site.push_target.startswith("https://")
+    ):
+        ingest_transport = agent_push.https_transport(site.name, env=env, keychain=keychain)
+    # `stub://` stays lazy inside SiteAgent._push: the path is resolved per call,
+    # matching the shipped P2-04 behaviour byte-for-byte.
     for host in _site_hosts(site):
         client = _client_for_host(
             site,
@@ -880,6 +937,7 @@ def build_site_agent(
                 monotonic=monotonic,
                 sleep=sleep,
                 warn=funnel,
+                push_transport=ingest_transport,
             )
         )
     policy = AlertPolicy(
@@ -898,7 +956,9 @@ def build_site_agent(
         db_path=db_path,
         collector=collector,
         health_path=(root / HEALTH_DIR_NAME / HEALTH_FILE_NAME if health else None),
-        push_transport=push_transport,
+        # The SAME transport object the loops roster through (one client, one bearer);
+        # `stub://` sites keep it None and _push keeps resolving the stub lazily.
+        push_transport=ingest_transport,
         ledger=ledger,
         now=clock,
         sleep=sleep,

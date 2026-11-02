@@ -55,6 +55,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from gateclerk.agent_db import connect
+from gateclerk.agent_push import Transport as PushTransport
+from gateclerk.agent_push import device_users_line
 from gateclerk.agent_store import Checkpoint, advance_checkpoint, read_checkpoint, store_events
 from gateclerk.config import DeviceTarget, resolve_credentials
 from gateclerk.exceptions import IsapiError
@@ -76,7 +78,9 @@ from gateclerk.pipeline import (
 from gateclerk.tz import TimeResolver, offset_hhmm
 
 __all__ = [
+    "DEFAULT_DEVICE_USERS_INTERVAL_S",
     "DeviceLoop",
+    "DeviceUsersResult",
     "TickResult",
     "build_device_loop",
     "run_forever",
@@ -134,6 +138,31 @@ def _default_warn(text: str) -> None:
     make_console(stderr=True).print(text, markup=False)
 
 
+#: Task 15: the roster leg's cadence — "also push device-user list hourly" (card).
+#: Deliberately decoupled from `cadence_s`: the punches poll every 5 min against the
+#: ~190-use nonce budget, and a per-tick `UserInfo/Search` walk (paged, ~20/page per
+#: OBSERVED.md) would spend that budget re-reading a list that only changes when
+#: someone is enrolled. Hourly bounds the cost and still bounds the staleness of BC's
+#: Nelegati view at one hour.
+DEFAULT_DEVICE_USERS_INTERVAL_S = 3600
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceUsersResult:
+    """One roster push attempt (Task 15). Returned as DATA, like TickResult.
+
+    A roster is RE-DERIVABLE from the device at any time; a punch is not. That asymmetry
+    is why this leg deliberately does NOT go through `push_queue`/`dead_letter` (whose
+    `event_id` is an FK to a stored event — a roster row has no event to point at) and
+    why a failure is a warning plus a retry at the NEXT hourly slot, never a dead-letter.
+    """
+
+    ok: bool
+    status: int | None
+    users: int
+    error: str | None = None
+
+
 class DeviceLoop:
     """One device, one long-lived client, one tick function.
 
@@ -163,11 +192,21 @@ class DeviceLoop:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         warn: Callable[[str], None] = _default_warn,
+        push_target: str | None = None,
+        push_transport: PushTransport | None = None,
+        device_users_interval_s: int = DEFAULT_DEVICE_USERS_INTERVAL_S,
+        device_code: str | None = None,
+        roster: Callable[[], Any] | None = None,
     ) -> None:
         if cadence_s <= 0:
             raise ValueError(f"cadence_s {cadence_s} must be > 0 (config validated this)")
         if overlap_s < 0:
             raise ValueError(f"overlap_s {overlap_s} must be >= 0 (config validated this)")
+        if device_users_interval_s <= 0:
+            raise ValueError(
+                f"device_users_interval_s {device_users_interval_s} must be > 0 "
+                "(0 would roster on every tick — the nonce budget says otherwise)"
+            )
         self.client = client
         self.conn = conn
         self.site = site
@@ -188,6 +227,20 @@ class DeviceLoop:
         self._monotonic = monotonic
         self._sleep = sleep
         self._warn = warn
+        # --- Task 15: the hourly device-users leg (module doc; DeviceUsersResult doc) ----
+        # None target = the site does not push at all (§3: no invented default), and both
+        # roster methods are then honest no-ops rather than crashes.
+        self.push_target = push_target
+        self._push_transport = push_transport
+        self.device_users_interval_s = device_users_interval_s
+        #: BC page-70602 device code when the site declares one; otherwise the roster
+        #: names the device by serial and the function resolves serial -> code.
+        self.device_code = device_code
+        #: Injectable so tests never walk a real `UserInfo/Search`; the default walks
+        #: the loop's own long-lived client through the p1-05 paging engine (one client,
+        #: spec §2a — the roster does not get a second session).
+        self._roster = roster
+        self._last_roster_push_at: datetime | None = None
         # Bootstrap state: read once per client, never per tick (spec §2a math).
         self.device_serial: str | None = None
         self._caps: Any = None
@@ -268,6 +321,118 @@ class DeviceLoop:
         """Release the client's socket pool and the db connection (unit shutdown)."""
         self.client.close()
         self.conn.close()
+
+    # --- the hourly device-users leg (Task 15) ------------------------------------------------
+
+    def push_device_users_if_due(self) -> DeviceUsersResult | None:
+        """The loop's roster leg: push when the hour is up, otherwise a no-op (None).
+
+        The clock is the loop's injected wall clock (same instant the windows are built
+        from), so a test drives whole days without sleeping. `tick()` never calls this:
+        the roster cadence (§2a's nonce-budget argument) is a separate hour-clock from
+        the 5-minute punch cadence, and only `run_forever`'s per-cycle step — or an
+        operator's explicit call — pulls it.
+        """
+        if self.push_target is None or self._push_transport is None:
+            return None
+        moment = self._now()
+        if self._last_roster_push_at is not None:
+            elapsed = (moment - self._last_roster_push_at).total_seconds()
+            if elapsed < self.device_users_interval_s:
+                return None
+        return self.push_device_users()
+
+    def push_device_users(self) -> DeviceUsersResult | None:
+        """One roster push over the site's authenticated push channel; None if not wired.
+
+        Deliberately NOT the queue: `push_queue.event_id` is an FK to a stored event and
+        a roster is not an event (module's DeviceUsersResult docstring for the full
+        asymmetry). Failure is warn-and-retry-next-hour — a roster the ingest never got
+        is refreshed by the next hour's walk, while a punch that never got there is a
+        payroll row nobody else can re-derive, which is why only punches dead-letter.
+
+        Never raises: like `tick()`, everything that can go wrong comes back as data.
+        The warning line carries the exception CLASS and a redacted message, never any
+        header — the bearer lives in the transport and this module never sees its value.
+        """
+        if self.push_target is None or self._push_transport is None:
+            return None
+        # Mark the attempt (not the success) as the clock anchor: a failing ingest must
+        # not be re-hit every tick by a loop that treats "never succeeded" as "always
+        # due" — the hourly bound is a request-budget promise, not a success promise.
+        self._last_roster_push_at = self._now()
+        try:
+            users = self._read_roster()
+            line = device_users_line(
+                device_code=self.device_code or self._device_identity(),
+                users=users,
+            )
+            status = self._push_transport(self.push_target, line)
+        except Exception as exc:  # the leg converts everything to data, like tick()
+            self._warn(
+                f"warning: device-users roster push failed ({type(exc).__name__}); "
+                f"site={self.site} next attempt in {self.device_users_interval_s}s"
+            )
+            return DeviceUsersResult(
+                ok=False,
+                status=None,
+                users=0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        result = DeviceUsersResult(
+            ok=200 <= status < 300,
+            status=status,
+            users=len(users),
+        )
+        if not result.ok:
+            # A 401/403 here is the same keychain-shaped problem a 401 on punches is;
+            # naming the keychain item turns journald into the fix instruction.
+            hint = (
+                f" check the ingest token keychain item gateclerk-ingest-{self.site}."
+                if status in (401, 403)
+                else ""
+            )
+            self._warn(
+                f"warning: device-users roster push answered HTTP {status}; "
+                f"site={self.site} users={result.users}{hint}"
+            )
+        return result
+
+    def _device_identity(self) -> str:
+        """What the roster names the device with when no `device_code` is configured.
+
+        The function resolves serial -> code through `gateclerkDevices` and accepts either,
+        so the loop's own serial (read once per client, bootstrap) is legal and free. An
+        un-bootstrapped loop has nothing honest to name — refusing (via the exception
+        path of `push_device_users`) beats sending an empty `deviceCode`, which the
+        function answers 400 `invalid_user_line` for.
+        """
+        if self.device_serial:
+            return self.device_serial
+        raise IsapiError(
+            "cannot roster before the device serial is known: run a tick first (the "
+            "bootstrap reads deviceInfo once per client) or configure device_code"
+        )
+
+    def _read_roster(self) -> list[Any]:
+        """The device-user list, through the loop's ONE client (injectable seam).
+
+        Default: p1-05's `iter_users` over `UserInfo/Search` on the existing digest
+        session (a second client would double the session/nonce cost spec §2a exists to
+        avoid), mapped through p1-07's `user_record_from_device` — which is where the
+        device `password` hash is stripped, so the roster leg inherits the redaction
+        rather than re-implementing it (seam 6: reuse, do not fork).
+        """
+        if self._roster is not None:
+            return list(self._roster())
+        from gateclerk.paging import PagingLimits, iter_users
+        from gateclerk.pipeline import user_record_from_device
+
+        limits = self._limits or (
+            paging_limits_from_caps(self._caps) if self._caps is not None else PagingLimits()
+        )
+        reader = _search_reader(self.client, "user_info_search")
+        return [user_record_from_device(raw) for raw in iter_users(reader, limits=limits)]
 
     # --- internals ----------------------------------------------------------------------
 
@@ -472,16 +637,18 @@ class _WalkCounts:
         self.termination = chunk.termination  # last completed chunk wins
 
 
-def _search_reader(client: Any) -> Any:
+def _search_reader(client: Any, endpoint: str = "acs_event_search") -> Any:
     """paging's PageReader over the client (same shape pipeline._search_reader uses).
 
     Kept local rather than imported from pipeline because the engine contract here is
     one lambda; pipeline owns the registry assertion in its own reader for the CLI, and
     `iter_event_windows` only ever POSTs the AcsEvent search POST in the registry.
+    Task 15 passes `user_info_search` for the roster walk — the SAME client, the
+    registry name of the other endpoint (endpoints.py owns both shapes).
     """
 
     def read(body: Mapping[str, Any]) -> dict[str, Any]:
-        return client.search("acs_event_search", body)
+        return client.search(endpoint, body)
 
     return read
 
@@ -581,17 +748,25 @@ def run_forever(
     sleep: Callable[[float], None] = time.sleep,
     max_ticks: int | None = None,
 ) -> list[TickResult]:
-    """The scheduler seam: tick, sleep(cadence), repeat. Injectable sleep, no clock touch.
+    """The scheduler seam: tick, roster-if-due, sleep(cadence), repeat. No clock touch.
 
     The systemd unit runs this (or P2-07's CLI wrapper does); tests hand it a recorder
     and a tick cap and finish in milliseconds. A failed tick does NOT stop the loop —
     the overlap heals it on the next one, and the alerting decision is P2-05's reading
     of the returned results, not an exception that kills the unit.
+
+    Task 15: each cycle also pulls the loop's hourly roster step. It is a no-op (None)
+    for a loop with no push wiring and for every cycle before the hour is up, so an
+    unconfigured site's behaviour is byte-identical to before; when it does run, the
+    `DeviceUsersResult` is deliberately not collected into the TickResult list — the
+    roster leg reports through `warn` (journald) and BC's own Nelegati view, not
+    through the punch metrics P2-05/P2-06 read.
     """
     results: list[TickResult] = []
     ticks = 0
     while max_ticks is None or ticks < max_ticks:
         results.append(loop.tick())
+        loop.push_device_users_if_due()
         ticks += 1
         if max_ticks is not None and ticks >= max_ticks:
             break
@@ -610,6 +785,7 @@ def build_device_loop(
     warn: Callable[[str], None] | None = None,
     env: Mapping[str, str] | None = None,
     keychain: Any = None,
+    push_transport: PushTransport | None = None,
 ) -> DeviceLoop:
     """Wire one `SiteConfig` (P2-01's schema) into a running loop. No socket opens here.
 
@@ -617,6 +793,11 @@ def build_device_loop(
     config carries refs only, values resolve per host — `GATECLERK_<HOST>_PASSWORD` or
     the keychain item on a macOS box, systemd `LoadCredential=` on an agent host).
     `db_path_resolved` is P2-01's derived `./gateclerk-<site>.sqlite3` when unset.
+
+    Task 15: when the site declares a `push_target`, the loop also gets the hourly
+    roster leg wired — the target as configured (never defaulted), the injected
+    transport (the bearer lives THERE, per site; this function never sees a token),
+    and the optional `device_code` the BC registry knows the device by.
     """
     db = conn if conn is not None else connect(site.db_path_resolved)
     if client is None:
@@ -646,6 +827,10 @@ def build_device_loop(
         kwargs["sleep"] = sleep
     if warn is not None:
         kwargs["warn"] = warn
+    if getattr(site, "push_target", None) is not None:
+        kwargs["push_target"] = site.push_target
+        kwargs["push_transport"] = push_transport
+        kwargs["device_code"] = getattr(site, "device_code", None)
     return DeviceLoop(
         client=client,
         conn=db,
