@@ -41,6 +41,7 @@ tests/fixtures/README convention); no real host or serial appears here.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import UTC, datetime
 from typing import Any
@@ -599,8 +600,35 @@ def test_migrations_are_a_list_of_ascending_versions() -> None:
     assert versions and versions[0] == 1, "the migration list starts at 1 and counts up"
     for m in agent_db.MIGRATIONS:
         assert m.name and m.sql, "every migration names itself and its additive SQL"
-        # Additive-only: the shipped migrations CREATE, never destroy.
-        assert "DROP TABLE" not in m.sql.upper(), f"migration {m.version} destroys a table"
+        assert_additive(m)
+
+
+def assert_additive(migration: agent_db.Migration) -> None:
+    """The additive law: a migration may CREATE, and may REBUILD a table to change a
+    constraint it cannot ALTER, but it may never destroy data.
+
+    sqlite cannot change a `UNIQUE` constraint in place, so SINKS-CORE's v5/v6 (queue
+    identity moving from `UNIQUE(event_id, endpoint)` to `UNIQUE(event_id, sink_name)`)
+    use the documented rebuild shape: CREATE the replacement -> INSERT INTO it SELECT the
+    rows -> DROP the old -> ALTER ... RENAME the replacement back. That honours the law in
+    the only sense it means — every row survives — so it is allowed here, and the row-for-
+    row claim is pinned behaviourally where it can actually be observed:
+    tests/test_sinks_storage.py walks a real pre-upgrade backlog through each step. A drop
+    with no copy-out, or a replacement that never takes the old name back, still fails.
+    """
+    for dropped in re.findall(r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)", migration.sql, re.I):
+        copied_out = re.search(
+            rf"INSERT\s+INTO\s+\w+\s*\([^)]*\)\s*SELECT.*?\bFROM\s+{dropped}\b",
+            migration.sql,
+            re.DOTALL | re.IGNORECASE,
+        )
+        renamed_back = re.search(
+            rf"ALTER\s+TABLE\s+\w+\s+RENAME\s+TO\s+{dropped}\b", migration.sql, re.IGNORECASE
+        )
+        assert copied_out and renamed_back, (
+            f"migration {migration.version} destroys table {dropped} "
+            "(no copy-out before the drop, or the name is never restored)"
+        )
 
 
 def test_a_new_migration_appends_and_applies_on_next_open(tmp_path, monkeypatch) -> None:

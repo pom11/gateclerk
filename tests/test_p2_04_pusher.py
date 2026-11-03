@@ -172,7 +172,18 @@ def test_the_queue_and_dead_letter_tables_ship_in_the_same_db(db) -> None:
     assert {"push_queue", "dead_letter"} <= names, f"missing tables: {sorted(names)}"
     versions = [r[0] for r in db.execute("SELECT version FROM schema_migrations ORDER BY version")]
     assert versions == [m.version for m in agent_db.MIGRATIONS]
-    assert len(agent_db.MIGRATIONS) == 4, "v1 bookkeeping, v2 agent db, v3 queue, v4 dead_letter"
+    # P2-04's own entries are pinned BY VERSION, not as a literal length of the whole
+    # list: a later card appends v5/v6 (SINKS-CORE did), and a total-count assertion
+    # would make every such card edit this unrelated test. Precedent: the P2-02
+    # downgrade-wall test was changed from a literal 3 to `len(MIGRATIONS) + 1` for
+    # exactly this reason (docs/PROGRESS.md, P2-04 entry) — strengthen the seam, do not
+    # freeze the length.
+    assert [(m.version, m.name) for m in agent_db.MIGRATIONS[:4]] == [
+        (1, "schema_migrations_bookkeeping"),
+        (2, "events_and_checkpoint"),
+        (3, "push_queue"),
+        (4, "dead_letter"),
+    ], "v1 bookkeeping, v2 agent db, v3 queue, v4 dead_letter"
 
 
 def test_queue_columns_are_the_cards_tuple_plus_provenance(db) -> None:

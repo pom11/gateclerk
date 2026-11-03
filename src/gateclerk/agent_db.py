@@ -181,6 +181,8 @@ CREATE TABLE push_queue (
     enqueued_at TEXT NOT NULL,
     -- One buffer per (event, target): the overlap poll re-stores the same events every
     -- 5 minutes and must not grow a second row per poll — that would be a duplicate push.
+    -- SINKS-CORE note: this is the SINGLE-target shape, replaced by `push_queue_per_sink`
+    -- (v5) with UNIQUE (event_id, sink_name). `endpoint` survives as provenance.
     UNIQUE (event_id, endpoint)
 );
 
@@ -212,6 +214,123 @@ CREATE TABLE dead_letter (
 CREATE INDEX dead_letter_endpoint ON dead_letter (endpoint);
 """
 
+# --- SINKS-CORE appends here (v5 + v6: per-sink delivery state) -------------------------------
+#
+# Today's queue was keyed `UNIQUE (event_id, endpoint)`, which is exactly the shape of the
+# config that produced it: ONE `push_target` per site. Named sinks let one site have
+# several delivery targets, so the identity of a buffer becomes `(event_id, sink_name)`.
+#
+# Why these two steps REBUILD rather than ALTER: sqlite cannot drop or change a UNIQUE
+# constraint, and a table-level UNIQUE cannot be replaced by an index on a live table. So
+# each step creates the new table, COPIES every row (no filtering, no re-derivation), drops
+# the old table and renames. `DROP TABLE` here is therefore not the "migrations never
+# destroy" rule being broken — it is the only way to change a constraint while keeping
+# every byte, and the rule it must satisfy instead is the stronger one: the copy carries
+# every payload, attempt count and outage stamp. `test_upgrade_preserves_payload_bytes_and_
+# retry_state_byte_for_byte` (tests/test_sinks_storage.py) is that guarantee, and
+# `test_migrations_are_a_list_of_ascending_versions` pins the copy shape.
+#
+# `endpoint` STAYS as provenance: an owner triaging a two-month-old outage reads the ref
+# the row actually failed against, which is not necessarily today's configured ref.
+#
+# Pre-upgrade rows are addressed to the implicit sink (`sinks.IMPLICIT_SINK_NAME` =
+# `legacy`), because a site that had a `push_target` has exactly one sink after the
+# upgrade and it is that target. The one case that cannot be `legacy` for every row: the
+# old UNIQUE allowed ONE event to be buffered against TWO targets (the operator moved
+# `push_target` while a backlog was queued). The oldest row of an event keeps `legacy`
+# (it is the site's sink); any additional row gets `legacy+<id>`, which cannot collide and
+# — carrying a `+`, which the config's identifier rule rejects — can never be mistaken for
+# a configured sink name.
+
+_PUSH_QUEUE_V5 = """
+CREATE TABLE push_queue_v5 (
+    id INTEGER PRIMARY KEY,
+    -- Same pointer, same law: a send buffer POINTS at a stored event and RESTRICTs the
+    -- delete that would orphan a punch (see v3; the choice survives the rebuild).
+    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+    payload TEXT NOT NULL,
+    -- Provenance now, identity before: `sink_name` is which sink this buffer belongs to.
+    endpoint TEXT NOT NULL,
+    sink_name TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    first_failed_at TEXT,
+    last_attempt_at TEXT,
+    last_error_class TEXT,
+    next_attempt_at TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    -- One buffer per (event, SINK): the overlap poll re-queues the same events every
+    -- 5 minutes and must not grow a second row per poll, but two sinks of one site each
+    -- get their own buffer (and their own 24 h outage clock) for the same event.
+    UNIQUE (event_id, sink_name)
+);
+
+INSERT INTO push_queue_v5 (
+    id, event_id, payload, endpoint, sink_name, attempts,
+    first_failed_at, last_attempt_at, last_error_class,
+    next_attempt_at, enqueued_at
+)
+SELECT
+    id, event_id, payload, endpoint,
+    CASE WHEN id = (SELECT MIN(later.id) FROM push_queue AS later
+                     WHERE later.event_id = push_queue.event_id)
+         THEN 'legacy'
+         ELSE 'legacy+' || id
+    END,
+    attempts, first_failed_at, last_attempt_at, last_error_class,
+    next_attempt_at, enqueued_at
+  FROM push_queue;
+
+DROP TABLE push_queue;
+
+ALTER TABLE push_queue_v5 RENAME TO push_queue;
+
+-- Both drain query shapes are indexed: the per-sink one is the one the agent now runs,
+-- the per-endpoint one keeps a pre-upgrade backlog (and any owner's ad-hoc triage) from
+-- turning a 5-minute tick into a full scan.
+CREATE INDEX push_queue_due ON push_queue (endpoint, next_attempt_at);
+CREATE INDEX push_queue_sink_due ON push_queue (sink_name, next_attempt_at);
+"""
+
+_DEAD_LETTER_V6 = """
+CREATE TABLE dead_letter_v6 (
+    id INTEGER PRIMARY KEY,
+    -- No FK, deliberately, and unchanged by this step: the row must OUTLIVE the event
+    -- (§2b: deleted only by the owner's command) and carries its own payload.
+    event_id INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    sink_name TEXT NOT NULL,
+    error_class TEXT NOT NULL,
+    attempts INTEGER NOT NULL CHECK (attempts >= 1),
+    first_attempt_at TEXT NOT NULL,
+    last_attempt_at TEXT NOT NULL,
+    -- Re-failing a replay REFRESHES this row instead of duplicating it, per sink: so
+    -- `dead_letter_depth` counts distinct (push, sink) pairs.
+    UNIQUE (event_id, sink_name)
+);
+
+INSERT INTO dead_letter_v6 (
+    id, event_id, payload, endpoint, sink_name, error_class,
+    attempts, first_attempt_at, last_attempt_at
+)
+SELECT
+    id, event_id, payload, endpoint,
+    CASE WHEN id = (SELECT MIN(later.id) FROM dead_letter AS later
+                     WHERE later.event_id = dead_letter.event_id)
+         THEN 'legacy'
+         ELSE 'legacy+' || id
+    END,
+    error_class, attempts, first_attempt_at, last_attempt_at
+  FROM dead_letter;
+
+DROP TABLE dead_letter;
+
+ALTER TABLE dead_letter_v6 RENAME TO dead_letter;
+
+CREATE INDEX dead_letter_endpoint ON dead_letter (endpoint);
+CREATE INDEX dead_letter_sink ON dead_letter (sink_name);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -231,6 +350,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     # --- P2-04 (the pusher) appends from here; the same forward-only rules apply. ----------
     Migration(version=3, name="push_queue", sql=_PUSH_QUEUE_V3),
     Migration(version=4, name="dead_letter", sql=_DEAD_LETTER_V4),
+    # --- SINKS-CORE (named sinks) appends from here: per-sink delivery state. See the
+    # comment block above v5 for why these REBUILD the tables instead of altering them. --
+    Migration(version=5, name="push_queue_per_sink", sql=_PUSH_QUEUE_V5),
+    Migration(version=6, name="dead_letter_per_sink", sql=_DEAD_LETTER_V6),
 )
 
 

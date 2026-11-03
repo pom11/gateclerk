@@ -65,6 +65,7 @@ letter queue for reasons the owner could have fixed at install time.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -74,7 +75,7 @@ from typing import Any
 
 from gateclerk.config import (
     DEFAULT_PUSH_DEAD_LETTER_AFTER_S,
-    PUSH_TARGET_SCHEMES,
+    SINK_REF_SCHEMES,
     DeviceTarget,
     KeychainReader,
 )
@@ -82,6 +83,7 @@ from gateclerk.exceptions import CredentialUnavailable
 from gateclerk.isapi_transport import DEFAULT_BUSY_BACKOFF_BASE, DEFAULT_BUSY_BACKOFF_CAP
 from gateclerk.model import UserRecord
 from gateclerk.secrets import Secret, redact
+from gateclerk.sinks import IMPLICIT_SINK_NAME, sink_name_problem
 
 __all__ = [
     "DEAD_LETTER_COLUMNS",
@@ -129,6 +131,12 @@ DEFAULT_PUSH_BATCH_LIMIT = 200
 #: error class on the row, and an HTTP status has no exception class of its own).
 HTTP_ERROR_CLASS = "HttpStatus"
 
+#: The one sink-name shape the config cannot produce but the storage layer must accept:
+#: the v5/v6 migration mints `legacy+<rowid>` for a pre-upgrade event that had been
+#: buffered against two targets (see `agent_db`), and the `+` keeps it from ever colliding
+#: with — or being confused for — a configured sink name.
+_MIGRATED_SINK_NAME = re.compile(r"^legacy\+[0-9]+$")
+
 
 class PushError(Exception):
     """Base for pusher-level refusals."""
@@ -161,9 +169,12 @@ class DrainResult:
 
     `push_ok` / `push_failed` / `dead_letter_depth` are the §2e metric vocabulary: P2-05
     and P2-06 read these, so they count ROWS, not anything this module invented.
+    `sink_name` (SINKS-CORE) names the sink this drain served — one per configured sink,
+    so a per-sink backlog can be reported instead of one blended number.
     """
 
     endpoint: str
+    sink_name: str = IMPLICIT_SINK_NAME
     sent: tuple[int, ...] = ()
     retried: tuple[int, ...] = ()
     dead_lettered: tuple[int, ...] = ()
@@ -179,10 +190,15 @@ class DrainResult:
 
 @dataclass(frozen=True, slots=True)
 class Pending:
-    """One queue row, read back (the CLI/health surface must not hand-write SQL)."""
+    """One queue row, read back (the CLI/health surface must not hand-write SQL).
+
+    `sink_name` (SINKS-CORE) is the row's identity — which configured sink it belongs to;
+    `endpoint` is the ref the row was aimed at when it was queued, kept for triage.
+    """
 
     id: int
     event_id: int
+    sink_name: str
     endpoint: str
     attempts: int
     next_attempt_at: str
@@ -193,11 +209,12 @@ class Pending:
 
 @dataclass(frozen=True, slots=True)
 class DeadLetter:
-    """One dead-letter row: exactly what §2b demanded the table hold."""
+    """One dead-letter row: exactly what §2b demanded the table hold (+ the sink)."""
 
     id: int
     event_id: int
     payload: str
+    sink_name: str
     endpoint: str
     error_class: str
     attempts: int
@@ -209,11 +226,14 @@ class DeadLetter:
 
 #: The queue's own columns (the card's tuple is (rowid, payload_ref, attempts,
 #: next_attempt_at, first_failed_at); the extras are the provenance §2b's dead-letter
-#: needs without a second lookup, and the endpoint this buffer is aimed at).
+#: needs without a second lookup, and — since SINKS-CORE — the SINK this buffer belongs
+#: to. `endpoint` stayed as provenance: the ref a row actually failed against is not
+#: necessarily today's configured ref).
 QUEUE_COLUMNS: tuple[str, ...] = (
     "id",
     "event_id",
     "payload",
+    "sink_name",
     "endpoint",
     "attempts",
     "first_failed_at",
@@ -227,6 +247,7 @@ DEAD_LETTER_COLUMNS: tuple[str, ...] = (
     "id",
     "event_id",
     "payload",
+    "sink_name",
     "endpoint",
     "error_class",
     "attempts",
@@ -234,63 +255,10 @@ DEAD_LETTER_COLUMNS: tuple[str, ...] = (
     "last_attempt_at",
 )
 
-_PUSH_QUEUE_V3 = """
-CREATE TABLE push_queue (
-    id INTEGER PRIMARY KEY,
-    -- A send buffer POINTS at a stored event; it is not a copy of the store. RESTRICT
-    -- (not CASCADE) is the load-bearing choice: deleting an event that has not been
-    -- pushed yet is refused, so no purge can outrun the queue and lose a punch with no
-    -- dead-letter row to account for it (spec §2b: purging is the owner's, and it must
-    -- not be able to do this by accident).
-    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
-    -- The bytes to send, read from events.jsonl at enqueue time: the drain must not
-    -- re-derive the payload (that would put a serialisation step on the send path, and
-    -- P2-02 proved the stored line IS to_jsonl() verbatim).
-    payload TEXT NOT NULL,
-    endpoint TEXT NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-    -- The 24 h clock starts at the FIRST failure and survives a re-enqueue: it measures
-    -- the outage, not the age of this row.
-    first_failed_at TEXT,
-    last_attempt_at TEXT,
-    last_error_class TEXT,
-    -- Due when this is <= now. `attempts + next_attempt_at` IS the backoff: the drain
-    -- never sleeps, it just finds what is due (an agent that sleeps 30 s would miss the
-    -- next poll window; SIGTERM would interrupt the sleep anyway).
-    next_attempt_at TEXT NOT NULL,
-    enqueued_at TEXT NOT NULL,
-    -- One buffer per (event, target): the overlap poll re-stores the same events every
-    -- 5 minutes and must not grow a second row per poll (that is a duplicate push).
-    UNIQUE (event_id, endpoint)
-);
+# The queue/dead-letter DDL lives in `gateclerk.agent_db.MIGRATIONS` (v3 + v4, rebuilt
+# per-sink by v5 + v6) — this module reads those tables, it does not declare them.
+# `QUEUE_COLUMNS` / `DEAD_LETTER_COLUMNS` above are the read-side contract.
 
--- The drain's query shape is (endpoint, due-by): without this index every 5-min tick
--- scans the whole backlog.
-CREATE INDEX push_queue_due ON push_queue (endpoint, next_attempt_at);
-"""
-
-_DEAD_LETTER_V4 = """
-CREATE TABLE dead_letter (
-    id INTEGER PRIMARY KEY,
-    -- No FK here, deliberately: the dead-letter row must OUTLIVE the event row (it is
-    -- the record of what could not be sent, and §2b says it is deleted only by the
-    -- owner's command), and a payload-carrying row does not need a parent to be
-    -- readable. `event_id` stays for the triage join.
-    event_id INTEGER NOT NULL,
-    -- §2b: the COMPLETE JSONL payload line, so a replay needs nothing but this table.
-    payload TEXT NOT NULL,
-    endpoint TEXT NOT NULL,
-    error_class TEXT NOT NULL,
-    attempts INTEGER NOT NULL CHECK (attempts >= 1),
-    first_attempt_at TEXT NOT NULL,
-    last_attempt_at TEXT NOT NULL,
-    -- "replay = re-push, UPSERT makes it safe" (spec §2b): re-failing a replay REFRESHES
-    -- this row instead of duplicating it, so the depth is a count of distinct pushes.
-    UNIQUE (event_id, endpoint)
-);
-
-CREATE INDEX dead_letter_endpoint ON dead_letter (endpoint);
-"""
 
 # --- helpers --------------------------------------------------------------------------------
 
@@ -308,18 +276,45 @@ def _parse(stored: str) -> datetime:
 
 
 def _check_endpoint(endpoint: str, *, what: str) -> None:
-    """Refuse any target outside `PUSH_TARGET_SCHEMES` (§3), case-sensitively.
+    """Refuse any target outside `SINK_REF_SCHEMES` (§3), case-sensitively.
 
     Same policy as P2-01's config validator: `HTTPS://` is a mistake worth a loud error,
-    and `ftp://`/`file://`/scheme-less are exactly the shapes that would turn "abstract
-    ingest ref" into an endpoint someone invented at 2 a.m.
+    and `ftp://`/scheme-less are exactly the shapes that would turn "abstract ingest ref"
+    into an endpoint someone invented at 2 a.m.
+
+    SINKS-CORE widens the queue's accepted set by `file://` (see `config.SINK_REF_SCHEMES`)
+    because a csv/jsonl sink's ref is a local path, and the storage layer must be able to
+    hold a row for it. That is not §3 loosening: `push_target` still refuses `file://`
+    (config's own `_push_target_problem` keeps `PUSH_TARGET_SCHEMES`), and a `file://` ref
+    can only be MINTED by the sink registry from a validated absolute, traversal-free path
+    — so no config can put one here by hand.
     """
-    if not endpoint.startswith(PUSH_TARGET_SCHEMES):
-        allowed = " or ".join(PUSH_TARGET_SCHEMES)
+    if not endpoint.startswith(SINK_REF_SCHEMES):
+        allowed = " or ".join(SINK_REF_SCHEMES)
         raise PushTargetError(
             f"{what} {endpoint!r} has an unacceptable scheme: a push target must start "
             f"with {allowed} (docs/P2-SITE-AGENT.md §3 — never invented, never defaulted)"
         )
+
+
+def _check_sink_name(sink_name: str) -> None:
+    """Refuse a sink identity the config could never have produced (SINKS-CORE).
+
+    The name is a queue KEY (`UNIQUE (event_id, sink_name)`), a log-line token and the
+    value of the CSV `sink_name` column, so it keeps the config's identifier rule rather
+    than absorbing whatever a caller passes. Without it a row could be written under a
+    name no configured sink can ever select — a punch that is queued, counted, and
+    unreachable forever, which is exactly the silent loss this module refuses elsewhere.
+
+    `legacy+<n>` is the one shape outside the identifier rule that is legal here: the v5/v6
+    migrations mint it for a pre-upgrade event that was buffered against two targets (see
+    `agent_db`), so the storage layer accepts it and nothing else.
+    """
+    if _MIGRATED_SINK_NAME.match(sink_name or ""):
+        return
+    problem = sink_name_problem(sink_name)
+    if problem is not None:
+        raise QueueError(f"{problem} — a row keyed on an unusable name can never be drained")
 
 
 def _error_class(outcome: BaseException) -> str:
@@ -382,18 +377,27 @@ def enqueue_events(
     *,
     endpoint: str,
     now: datetime,
+    sink_name: str = IMPLICIT_SINK_NAME,
 ) -> tuple[int, ...]:
-    """Queue stored events for `endpoint`; returns the queue row ids.
+    """Queue stored events for one sink; returns the queue row ids.
 
     Payload bytes come from `events.jsonl` in the INSERT's SELECT — the caller hands over
     rowids, never bodies, so the store stays the source of truth (card SEMANTICS).
 
-    Idempotent on (event_id, endpoint): a re-enqueue refreshes the payload (an event whose
+    `sink_name` is the row's IDENTITY (SINKS-CORE) and `endpoint` the physical ref it is
+    aimed at. Both default to the site's single legacy sink (`IMPLICIT_SINK_NAME` + the
+    ref the caller supplies), which is what keeps `agent_cli`'s existing
+    `endpoint=site.push_target` call working unchanged for a `push_target`-only site —
+    the storage half of "zero config change at upgrade".
+
+    Idempotent on (event_id, sink_name): a re-enqueue refreshes the payload (an event whose
     bytes were revised by an overlap poll must not stay unsent) and PRESERVES the retry
     state — attempts and `first_failed_at` are the outage history, and re-polling an
-    overlap window must not be able to reset a 24 h failure clock.
+    overlap window must not be able to reset a 24 h failure clock. Two sinks of one site
+    each get their own row for the same event, each with its own clock.
     """
     _check_endpoint(endpoint, what="push target")
+    _check_sink_name(sink_name)
     stamp = _stamp(now)
     ids: list[int] = []
     conn.execute("BEGIN IMMEDIATE")
@@ -410,22 +414,22 @@ def enqueue_events(
             conn.execute(
                 """
                 INSERT INTO push_queue (
-                    id, event_id, payload, endpoint, attempts,
+                    id, event_id, payload, sink_name, endpoint, attempts,
                     first_failed_at, last_attempt_at, last_error_class,
                     next_attempt_at, enqueued_at
                 )
-                SELECT NULL, events.id, events.jsonl, ?, 0,
+                SELECT NULL, events.id, events.jsonl, ?, ?, 0,
                        NULL, NULL, NULL, ?, ?
                   FROM events WHERE events.id = ?
-                ON CONFLICT(event_id, endpoint) DO UPDATE
-                SET payload = excluded.payload
+                ON CONFLICT(event_id, sink_name) DO UPDATE
+                SET payload = excluded.payload, endpoint = excluded.endpoint
                 RETURNING id
                 """,
-                (endpoint, stamp, stamp, event_id),
+                (sink_name, endpoint, stamp, stamp, event_id),
             ).fetchone()
             row = conn.execute(
-                "SELECT id FROM push_queue WHERE event_id = ? AND endpoint = ?",
-                (event_id, endpoint),
+                "SELECT id FROM push_queue WHERE event_id = ? AND sink_name = ?",
+                (event_id, sink_name),
             ).fetchone()
             ids.append(row["id"])
     except BaseException:
@@ -450,14 +454,21 @@ def drain(
     cap_s: float = DEFAULT_PUSH_BACKOFF_CAP_S,
     limit: int = DEFAULT_PUSH_BATCH_LIMIT,
     log: LogSink | None = None,
+    sink_name: str = IMPLICIT_SINK_NAME,
 ) -> DrainResult:
-    """Push every due row for `endpoint`; back off, or dead-letter, whatever fails.
+    """Push every due row for one sink; back off, or dead-letter, whatever fails.
 
-    Due means `next_attempt_at <= now` for THIS endpoint — rows aimed at another target
-    are left alone (§2d: push target is per site), and a row that is not due is not sent
-    even by one second (§1 seam 9: never hammer). `now` and `rng` are injected so the
-    1→30 s ladder and the 24 h bound are testable at second resolution; the agent passes
-    its clock and `random.random`.
+    Due means `next_attempt_at <= now` for THIS sink — rows belonging to another sink are
+    left alone (one sink's outage must not stall another's, and §2d's per-site isolation
+    is now per-sink), and a row that is not due is not sent even by one second (§1 seam 9:
+    never hammer). `now` and `rng` are injected so the 1→30 s ladder and the 24 h bound are
+    testable at second resolution; the agent passes its clock and `random.random`.
+
+    `sink_name` defaults to the implicit legacy sink, and rows are matched on `endpoint` as
+    well: the legacy caller (which passes only `endpoint=site.push_target`) must not start
+    draining a row another sink owns, and a pre-upgrade row whose ref was rewritten by a
+    config edit stays exactly as unreachable as it was before the upgrade — never silently
+    sent somewhere else.
 
     Each row is its own transaction and its own transport call, so one poison row cannot
     wedge the rows behind it (the spec's "keep retrying the queue" only means something
@@ -465,10 +476,12 @@ def drain(
     dead-letter row for the same key — the store keeps the event either way.
     """
     stamp = _stamp(now)
+    _check_sink_name(sink_name)
     rows = conn.execute(
         "SELECT id, event_id, payload, attempts, first_failed_at FROM push_queue"
-        " WHERE endpoint = ? AND next_attempt_at <= ? ORDER BY next_attempt_at, id LIMIT ?",
-        (endpoint, stamp, max(1, int(limit))),
+        " WHERE sink_name = ? AND endpoint = ? AND next_attempt_at <= ?"
+        " ORDER BY next_attempt_at, id LIMIT ?",
+        (sink_name, endpoint, stamp, max(1, int(limit))),
     ).fetchall()
 
     sent: list[int] = []
@@ -477,7 +490,12 @@ def drain(
     for row in rows:
         outcome = _call_transport(transport, endpoint, row["payload"])
         if isinstance(outcome, int):
-            _mark_sent(conn, queue_id=row["id"], event_id=row["event_id"], endpoint=endpoint)
+            _mark_sent(
+                conn,
+                queue_id=row["id"],
+                event_id=row["event_id"],
+                sink_name=sink_name,
+            )
             sent.append(row["event_id"])
             continue
 
@@ -493,6 +511,7 @@ def drain(
                 row,
                 event_id=row["event_id"],
                 payload=row["payload"],
+                sink_name=sink_name,
                 endpoint=endpoint,
                 attempts=attempts,
                 error_class=_error_class(outcome),
@@ -518,13 +537,19 @@ def drain(
             retried.append(row["event_id"])
 
     if log is not None:
+        # The prefix and the three counter fields stay EXACTLY as P2-04 printed them:
+        # `agent_health.observe_push_log` partitions on "push drain: " and refuses a line
+        # with anything before it, so a reworded prefix would silently zero the §2e push
+        # gauges (a health counter that stops counting is worse than one that is wrong).
+        # The sink rides as an extra token, which that parser ignores by design.
         log(
-            f"push drain: sent={len(sent)} retried={len(retried)} "
+            f"push drain: sink={sink_name} sent={len(sent)} retried={len(retried)} "
             f"dead_lettered={len(dead_lettered)} "
             f"ids={sorted(set(sent) | set(retried) | set(dead_lettered))}"
         )
     return DrainResult(
         endpoint=endpoint,
+        sink_name=sink_name,
         sent=tuple(sent),
         retried=tuple(retried),
         dead_lettered=tuple(dead_lettered),
@@ -598,18 +623,28 @@ def _note_failure(
     conn.execute("COMMIT")
 
 
-def _mark_sent(conn: sqlite3.Connection, *, queue_id: int, event_id: int, endpoint: str) -> None:
-    """Success: DELETE the buffer row and any dead-letter row for the same key.
+def _mark_sent(
+    conn: sqlite3.Connection,
+    *,
+    queue_id: int,
+    event_id: int,
+    sink_name: str,
+) -> None:
+    """Success: DELETE the buffer row and any dead-letter row for the same sink key.
 
     One transaction, so a kill cannot leave the event dead-lettered *and* delivered. The
     events row is untouched — the queue is transient, the store is the truth.
+
+    The dead-letter delete is keyed on (event_id, sink_name): a row dead-lettered for
+    ANOTHER sink must survive this success, because that sink has still not received the
+    punch. Clearing it by event alone would be the silent loss §2b exists to prevent.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("DELETE FROM push_queue WHERE id = ?", (queue_id,))
         conn.execute(
-            "DELETE FROM dead_letter WHERE event_id = ? AND endpoint = ?",
-            (event_id, endpoint),
+            "DELETE FROM dead_letter WHERE event_id = ? AND sink_name = ?",
+            (event_id, sink_name),
         )
     except BaseException:
         conn.execute("ROLLBACK")
@@ -623,6 +658,7 @@ def _move_to_dead_letter(
     *,
     event_id: int,
     payload: str,
+    sink_name: str,
     endpoint: str,
     attempts: int,
     error_class: str,
@@ -635,22 +671,35 @@ def _move_to_dead_letter(
     overwritten) so the owner can cite one row across replays; the queue DELETE is in the
     same transaction because a poison row left in the queue is a drain that loops on it
     forever instead of continuing to push the healthy events behind it.
+
+    The UPSERT key is (event_id, sink_name) — one dead-letter row per (push, sink), so a
+    punch that reached one sink and failed against another is visible as exactly that.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
             """
             INSERT INTO dead_letter (
-                id, event_id, payload, endpoint, error_class,
+                id, event_id, payload, sink_name, endpoint, error_class,
                 attempts, first_attempt_at, last_attempt_at
-            ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(event_id, endpoint) DO UPDATE
+            ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id, sink_name) DO UPDATE
             SET payload = excluded.payload,
+                endpoint = excluded.endpoint,
                 error_class = excluded.error_class,
                 attempts = excluded.attempts,
                 last_attempt_at = excluded.last_attempt_at
             """,
-            (event_id, payload, endpoint, error_class, attempts, first_failed_at, last_attempt),
+            (
+                event_id,
+                payload,
+                sink_name,
+                endpoint,
+                error_class,
+                attempts,
+                first_failed_at,
+                last_attempt,
+            ),
         )
         conn.execute("DELETE FROM push_queue WHERE id = ?", (row["id"],))
     except BaseException:
@@ -668,15 +717,21 @@ def replay_dead_letter(
     *,
     endpoint: str | None = None,
     now: datetime,
+    sink_name: str | None = None,
 ) -> int:
     """Re-queue one dead-letter row for another push; returns the queue row id.
 
-    `endpoint` defaults to the target the row failed against (§2b's "replay = re-push"),
-    and may be overridden when the ingest has moved. The retry state is carried over —
-    attempts continue and `first_failed_at` stays the original outage start, so a replay
-    into an endpoint that is still down dead-letters again promptly instead of buying a
-    fresh 24 hours. Replaying twice (or while the row is somehow still queued) is safe:
-    the queue's UNIQUE(event_id, endpoint) means one buffer, one send.
+    `endpoint` defaults to the ref the row failed against (§2b's "replay = re-push") and
+    may be overridden when the ingest has moved. `sink_name` (SINKS-CORE) defaults to the
+    sink the row belongs to — the row's identity is what its outage clock was measured
+    against, so replaying "into the archive" and replaying "into the ingest" are different
+    acts and stay separate rows.
+
+    The retry state is carried over — attempts continue and `first_failed_at` stays the
+    original outage start, so a replay into a sink that is still down dead-letters again
+    promptly instead of buying a fresh 24 hours. Replaying twice (or while the row is
+    somehow still queued) is safe: the queue's UNIQUE(event_id, sink_name) means one
+    buffer, one send.
 
     The dead-letter row itself STAYS until a push of that key succeeds: a replay that has
     not yet been accepted is not evidence the owner can delete the payload by.
@@ -688,28 +743,30 @@ def replay_dead_letter(
             "with `dead_letter_rows` (P2-07's `gateclerk dead-letter list`)."
         )
     target = row["endpoint"] if endpoint is None else endpoint
+    sink = row["sink_name"] if sink_name is None else sink_name
     _check_endpoint(target, what="push target")
+    _check_sink_name(sink)
     stamp = _stamp(now)
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
             """
             INSERT INTO push_queue (
-                id, event_id, payload, endpoint, attempts,
+                id, event_id, payload, sink_name, endpoint, attempts,
                 first_failed_at, last_attempt_at, last_error_class,
                 next_attempt_at, enqueued_at
             )
-            SELECT NULL, event_id, payload, ?, attempts,
+            SELECT NULL, event_id, payload, ?, ?, attempts,
                    first_attempt_at, last_attempt_at, error_class, ?, ?
               FROM dead_letter WHERE id = ?
-            ON CONFLICT(event_id, endpoint) DO UPDATE
-            SET payload = excluded.payload
+            ON CONFLICT(event_id, sink_name) DO UPDATE
+            SET payload = excluded.payload, endpoint = excluded.endpoint
             """,
-            (target, stamp, stamp, dead_letter_id),
+            (sink, target, stamp, stamp, dead_letter_id),
         )
         queued = conn.execute(
-            "SELECT id FROM push_queue WHERE event_id = ? AND endpoint = ?",
-            (row["event_id"], target),
+            "SELECT id FROM push_queue WHERE event_id = ? AND sink_name = ?",
+            (row["event_id"], sink),
         ).fetchone()
     except BaseException:
         conn.execute("ROLLBACK")
@@ -762,24 +819,40 @@ def dead_letter_depth(conn: sqlite3.Connection) -> int:
 
 
 def pending_rows(
-    conn: sqlite3.Connection, *, endpoint: str | None = None, limit: int = DEFAULT_PUSH_BATCH_LIMIT
+    conn: sqlite3.Connection,
+    *,
+    endpoint: str | None = None,
+    limit: int = DEFAULT_PUSH_BATCH_LIMIT,
+    sink_name: str | None = None,
 ) -> tuple[Pending, ...]:
     """The queue, due-first — payload deliberately NOT included (a CLI table that prints
-    payloads is how payroll fields end up on a terminal)."""
+    payloads is how payroll fields end up on a terminal).
+
+    `sink_name` (SINKS-CORE) filters to one sink's backlog; an unknown name is an empty
+    result, not an error — a sink can be removed from config while its rows are still
+    queued, and the operator still has to be able to list them.
+    """
     sql = (
-        "SELECT id, event_id, endpoint, attempts, next_attempt_at, first_failed_at,"
-        " last_attempt_at, last_error_class FROM push_queue"
+        "SELECT id, event_id, sink_name, endpoint, attempts, next_attempt_at,"
+        " first_failed_at, last_attempt_at, last_error_class FROM push_queue"
     )
+    clauses: list[str] = []
     args: list[Any] = []
     if endpoint is not None:
-        sql += " WHERE endpoint = ?"
+        clauses.append("endpoint = ?")
         args.append(endpoint)
+    if sink_name is not None:
+        clauses.append("sink_name = ?")
+        args.append(sink_name)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY next_attempt_at, id LIMIT ?"
     args.append(max(1, int(limit)))
     return tuple(
         Pending(
             id=row["id"],
             event_id=row["event_id"],
+            sink_name=row["sink_name"],
             endpoint=row["endpoint"],
             attempts=row["attempts"],
             next_attempt_at=row["next_attempt_at"],
@@ -792,17 +865,27 @@ def pending_rows(
 
 
 def dead_letter_rows(
-    conn: sqlite3.Connection, *, endpoint: str | None = None, limit: int = DEFAULT_PUSH_BATCH_LIMIT
+    conn: sqlite3.Connection,
+    *,
+    endpoint: str | None = None,
+    limit: int = DEFAULT_PUSH_BATCH_LIMIT,
+    sink_name: str | None = None,
 ) -> tuple[DeadLetter, ...]:
     """The dead letters, oldest outage first — the triage list the owner reads."""
     sql = (
-        "SELECT id, event_id, payload, endpoint, error_class, attempts,"
+        "SELECT id, event_id, payload, sink_name, endpoint, error_class, attempts,"
         " first_attempt_at, last_attempt_at FROM dead_letter"
     )
+    clauses: list[str] = []
     args: list[Any] = []
     if endpoint is not None:
-        sql += " WHERE endpoint = ?"
+        clauses.append("endpoint = ?")
         args.append(endpoint)
+    if sink_name is not None:
+        clauses.append("sink_name = ?")
+        args.append(sink_name)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY first_attempt_at, id LIMIT ?"
     args.append(max(1, int(limit)))
     return tuple(
@@ -810,6 +893,7 @@ def dead_letter_rows(
             id=row["id"],
             event_id=row["event_id"],
             payload=row["payload"],
+            sink_name=row["sink_name"],
             endpoint=row["endpoint"],
             error_class=row["error_class"],
             attempts=row["attempts"],

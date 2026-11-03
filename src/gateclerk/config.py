@@ -39,10 +39,13 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from gateclerk.exceptions import ConfigError, CredentialUnavailable, redact_b64
 from gateclerk.secrets import Secret, redact
+
+if TYPE_CHECKING:  # sinks.py imports this module (one direction only, no import cycle)
+    from gateclerk.sinks import SinkSpec
 
 __all__ = [
     "DEFAULT_CADENCE_S",
@@ -61,6 +64,7 @@ __all__ = [
     "KEYCHAIN_EXIT_NOT_FOUND",
     "PUSH_TARGET_SCHEMES",
     "SECURITY_BIN",
+    "SINK_REF_SCHEMES",
     "ConfigSurface",
     "CredentialProvider",
     "CredentialSource",
@@ -113,8 +117,16 @@ DEFAULT_DB_PATH_TEMPLATE = "./gateclerk-{site}.sqlite3"
 
 #: The only `push_target` schemes the validator accepts (§3: the push leg is ordinary
 #: HTTPS to our own endpoint; `stub://` is the owner-authorized local stub ingest).
-#: Everything else — `ftp://`, plaintext `http://`, `file://`, scheme-less — is refused.
+#: Everything else — `ftp://`, plaintext `http://`, scheme-less — is refused.
 PUSH_TARGET_SCHEMES = ("stub://", "https://")
+
+#: SINKS-CORE: the schemes a SINK ref may carry — §3's two, plus `file://` for a local
+#: csv/jsonl sink. Kept SEPARATE from `PUSH_TARGET_SCHEMES` on purpose: `push_target`
+#: still refuses `file://` (a push target is a remote ingest ref, and loosening §3 to
+#: accommodate sinks would quietly widen the law the queue's own guard enforces). A
+#: `file://` ref is only ever MINTED by the registry from a validated absolute path, so
+#: the extra scheme cannot be hand-written around the path rules.
+SINK_REF_SCHEMES = (*PUSH_TARGET_SCHEMES, "file://")
 
 ENV_PREFIX = "GATECLERK"
 SECURITY_BIN = "/usr/bin/security"
@@ -216,6 +228,12 @@ class SiteConfig:
     device_code: str | None = None
     #: Continuous-push-failure seconds before a batch is dead-lettered (§2c: 24 h).
     push_dead_letter_after_s: int = DEFAULT_PUSH_DEAD_LETTER_AFTER_S
+    #: SINKS-CORE: the site's parsed `[[site.sink]]` blocks, in declaration order. Empty
+    #: when the file declares none — which is NOT the same as "no sinks": a site with only
+    #: `push_target` still has one (see `effective_sinks`). Validated by the type registry
+    #: in `gateclerk.sinks`, which is what makes an unknown `type` a loud error instead of an
+    #: silently-absent sink.
+    sinks: tuple[SinkSpec, ...] = ()
     #: Which process is reading (see `ConfigSurface`). NOT a TOML key: strictness
     #: belongs to the caller, so a shared sites.toml can never disqualify its own CLI.
     surface: ConfigSurface = ConfigSurface.CLI
@@ -242,6 +260,11 @@ class SiteConfig:
             "push_target",
             "device_code",
             "push_dead_letter_after_s",
+            # SINKS-CORE: TOML spells `[[site.sink]]` as a `sink` key inside the block.
+            # It is a table ARRAY, so it gets its own parse path (`from_table`), not a
+            # `_KNOWN_KEYS`-style scalar read — but it must be KNOWN here or the
+            # unknown-key refusal would reject every sink block.
+            "sink",
         }
     )
 
@@ -252,6 +275,27 @@ class SiteConfig:
         # ConfigError, never a silent downgrade to CLI — that hole would be §2d again.
         object.__setattr__(self, "surface", _coerce_surface(self.surface))
         self.validate()
+
+    @property
+    def effective_sinks(self) -> tuple[SinkSpec, ...]:
+        """What this site actually delivers to — the answer the drain and the queue use.
+
+        The backward-compat law in one branch: a site that declares sinks uses them; a
+        site that declares only `push_target` gets ONE implicit https sink named
+        `legacy` aimed at exactly that ref, so a live site needs zero config change at
+        upgrade. A site with neither has nothing to push (unchanged: spec §3 forbids
+        defaulting an endpoint, so absence means the pusher is off).
+
+        Both keys together cannot reach here — `validate()` refuses that combination — so
+        this property never has to choose which one wins.
+        """
+        if self.sinks:
+            return self.sinks
+        if self.push_target is not None:
+            from gateclerk.sinks import implicit_https_sink
+
+            return (implicit_https_sink(self.push_target),)
+        return ()
 
     @property
     def db_path_resolved(self) -> str:
@@ -322,6 +366,41 @@ class SiteConfig:
             problem = _push_target_problem(self.push_target)
             if problem:
                 problems.append(problem)
+        # --- SINKS-CORE ----------------------------------------------------------------
+        # `push_target` AND `[[site.sink]]` is refused rather than resolved: two sources
+        # for one site's sinks would either double-push the same punch (the ingest
+        # accepts it twice) or silently drop the legacy target. Either way the operator
+        # finds out from a payroll discrepancy, so this is where they find out.
+        if self.push_target is not None and self.sinks:
+            problems.append(
+                "push_target and [[site.sink]] cannot both be declared: the sinks below "
+                "would replace the push target, or sit alongside it and push every punch "
+                "twice. Delete push_target and add it as a named sink when you move to "
+                "[[site.sink]]"
+            )
+        # Re-validated here even though `parse_site_sinks` already checked them: the
+        # rule every SiteConfig key obeys is that building the object in code cannot
+        # escape validation (an agent could otherwise hand-construct a sink whose type
+        # nobody implements and get a silent no-send at drain time).
+        from gateclerk.sinks import sink_name_problem, sink_spec_problem
+
+        seen: set[str] = set()
+        for spec in self.sinks:
+            problem = sink_spec_problem(spec)
+            if problem:
+                problems.append(problem)
+            name_problem = sink_name_problem(spec.name)
+            if name_problem:
+                problems.append(name_problem)
+            elif spec.name == "legacy":
+                problems.append(
+                    "sink name 'legacy' is reserved for the implicit sink a site gets "
+                    "from push_target alone"
+                )
+            elif spec.name in seen:
+                problems.append(f"duplicate sink name {spec.name!r}")
+            else:
+                seen.add(spec.name)
         # Task 15: a blank `device_code` would roster with an empty `deviceCode`, which
         # the ingest answers 400 `invalid_user_line` for — an empty string is "unset",
         # and the roster then names the device by serial like any unset key does.
@@ -390,8 +469,29 @@ class SiteConfig:
                 table.get("push_dead_letter_after_s", DEFAULT_PUSH_DEAD_LETTER_AFTER_S),
                 "push_dead_letter_after_s",
             ),
+            sinks=_sinks_from_table(table, name=_text(table["name"], "name")),
             surface=_coerce_surface(surface),
         )
+
+
+def _sinks_from_table(table: Mapping[str, Any], *, name: str) -> tuple[Any, ...]:
+    """Parse the block's `[[site.sink]]` array (TOML hands it over as a `sink` key).
+
+    The shape check lives here because this is where a hand-built or JSON-shaped config
+    can slip a non-array in: `sink = [...]` of non-tables must be refused, not iterated
+    into something half-valid.
+    """
+    raw = table.get("sink")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(
+            f"site {name!r}: `sink` must be an array of [[site.sink]] tables, got "
+            f"{type(raw).__name__}"
+        )
+    from gateclerk.sinks import parse_site_sinks
+
+    return parse_site_sinks(raw, site=name)
 
 
 def _text(value: object, key: str) -> str:
