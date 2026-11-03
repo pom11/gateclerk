@@ -160,8 +160,15 @@ first FAILED line the unfiltered run prints.
   `dead_letter_rows` (with payloads).
 - `replay_dead_letter` + `delete_dead_letter` are the functions P2-07's CLI subcommands
   wrap; `delete_dead_letter` returns a bool so a typo'd id cannot look like a success.
-- `stub_transport("stub://<path>")` is the only ingest this repo ships; a real `https://`
-  target needs a transport the owner wires (§3 — no endpoint is invented here). The
-  `Transport` type is `(url, body) -> status`, raising is "not accepted".
-- Nothing here imports `httpx` or opens a socket: the module is socket-free by
-  construction, not by convention.
+- This repo ships **both** ingests behind the one injected `Transport` seam:
+  `stub_transport("stub://<path>")` (append JSONL to a local path) and, since Task 15,
+  `https_transport(site)` -> `HttpsIngestTransport` (POST to the configured `https://`
+  target, per-site bearer resolved flag > env `GATECLERK_INGEST_TOKEN_<SITE>` > keychain
+  `gateclerk-ingest-<site>`, TLS verify ON, `trust_env=False`). The `Transport` type is
+  `(url, body) -> status`, raising is "not accepted". The §3 law is untouched by the
+  second transport: the **endpoint** is still never invented or defaulted — absence of
+  `push_target` still means the pusher is off, and a scheme outside
+  `config.PUSH_TARGET_SCHEMES` is still a `PushTargetError`.
+- `stub_transport` and the queue/backoff/dead-letter machinery stay socket-free; `httpx`
+  is imported only *inside* `HttpsIngestTransport.__init__`, so a run that never aims at
+  an `https://` target never loads it and never opens a socket.
