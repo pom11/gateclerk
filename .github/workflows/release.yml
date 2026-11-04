@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    name: build + smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-14
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv + Python 3.12
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.5.4"
+          enable-cache: true
+
+      - name: Sync dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Build release artifacts + SHA256SUMS + Homebrew formula
+        run: uv run --frozen python scripts/build_dist.py --dist-dir dist
+
+      - name: Smoke-test hash-verified artifact (${{ matrix.target }})
+        run: uv run --frozen python scripts/smoke_artifact.py --dist-dir dist --target ${{ matrix.target }}
+
+      - name: Smoke-test linux-arm64 portable zipapp on Linux runner
+        if: matrix.target == 'linux-x86_64'
+        run: uv run --frozen python scripts/smoke_artifact.py --dist-dir dist --target linux-arm64
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/gateclerk-*.tar.gz
+            dist/gateclerk-*.pyz
+            dist/SHA256SUMS
+            dist/gateclerk.rb
