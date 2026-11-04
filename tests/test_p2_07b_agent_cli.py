@@ -972,13 +972,16 @@ def test_existing_cli_surface_is_unchanged_and_agent_is_the_only_addition() -> N
             assert tree[name] - added == sub, f"{name} changed shape: {tree[name]} != {sub}"
             assert added <= set(tree[name]), f"{name} lost an authorized command: {tree[name]}"
     # E1-07 (docs/ENROLLMENT-MIGRATION.md §7) added the `migrate` group on top of the
-    # agent card's addition, t_ce142a14 the `demo` group (offline fake device), and
-    # SINKS-CLI (docs/SINKS plan) the `sink` group — each appended to this enumerated
-    # allow-list, so an UNANNOUNCED command still fails here. The card's binding rule
+    # agent card's addition, t_ce142a14 the `demo` group (offline fake device), SINKS-CLI
+    # (docs/SINKS plan) the `sink` group, and CLI-INIT the `init` command (declared as a
+    # callback-only Typer group in `gateclerk/init_cli.py`) — each enters the one
+    # authoritative leaf set below, which derives this allowance, so an UNANNOUNCED
+    # command still fails here. The card's binding rule
     # ("nothing existing moves") holds: every PREVIOUS_SURFACE entry is pinned unchanged
     # above, and each group's own shape is pinned by its own test
     # (test_migrate_group_shape_is_the_section7_surface,
-    # tests/test_sinks_cli.py::test_sink_group_exposes_exactly_the_four_commands).
+    # tests/test_sinks_cli.py::test_sink_group_exposes_exactly_the_four_commands,
+    # tests/test_cli_init.py::test_init_is_a_top_level_command_with_the_shared_output_flag).
     #
     # CLI-SPLIT-STRUCTURE: the allowed-extra set is DERIVED from `EXPECTED_LEAVES` (every
     # head that is not one of the four historical ones), so adding a group bumps the one

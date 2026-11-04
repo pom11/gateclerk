@@ -121,6 +121,7 @@ EXPECTED_LEAVES: set[str] = {
     "device info",
     "device time",
     "events",
+    "init",
     "migrate apply",
     "migrate diff",
     "migrate export",
@@ -159,7 +160,11 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    assert len(leaves) == len(EXPECTED_LEAVES) == 25
+    # 26 = the 25 CLI-SPLIT-STRUCTURE shipped, plus CLI-INIT's `init` (a Typer group whose
+    # only behaviour is its callback, which `_leaves` reads as one leaf because its
+    # `commands` dict is empty — the shape CLI-SPLIT-STRUCTURE asks for, counted like any
+    # command).
+    assert len(leaves) == len(EXPECTED_LEAVES) == 26
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"

@@ -2200,6 +2200,18 @@ def migrate_undo(
 sink_cmds.register(app)  # the `sink` group (SINKS-CLI), moved out of this file
 demo_cmds.register(app)  # the `demo` group, moved out of this file
 
+# --- `gateclerk init` — the group lives in gateclerk.init_cli, and so does every handler ---------
+#
+# CLI-INIT declares the group and its callback in `gateclerk.init_cli` (the `sink_cli.py`
+# precedent: domain module owns the surface, `cli.py` only registers it). That is also what
+# makes CLI-SPLIT-STRUCTURE's later move of the per-group declarations a no-op for `init`.
+# The one thing `cli.py` needs to do is put it on the tree; the leaf-set pins in
+# `tests/test_cli_conventions.py` and `tests/test_p2_07b_agent_cli.py` are what force an
+# unannounced new command to be noticed.
+from gateclerk.init_cli import init_app  # noqa: E402  (registered here, declared there)
+
+app.add_typer(init_app)
+
 
 def main(argv: list[str] | None = None) -> int:
     try:
