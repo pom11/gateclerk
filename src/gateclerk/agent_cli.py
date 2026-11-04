@@ -1086,6 +1086,7 @@ def build_site_agent(
     sink: Callable[[Alert], None] | None = None,
     client_factory: Callable[[str, str, str], IsapiClient] | None = None,
     push_transport: agent_push.Transport | None = None,
+    sink_transports: Mapping[str, agent_push.Transport] | None = None,
     park_dir: Path | str | None = None,
     credentials_dir: Path | str | None = None,
     password: str | None = None,
@@ -1216,6 +1217,11 @@ def build_site_agent(
         # The SAME transport object the loops roster through (one client, one bearer);
         # `stub://` sites keep it None and _push keeps resolving the stub lazily.
         push_transport=ingest_transport,
+        # SINKS-WIRING's `SiteAgent` seam, passed through: an injected per-sink transport
+        # always wins over what `_sink_transport` would build (tests and the demo wire the
+        # https leg to a loopback target; production passes nothing and behaviour is
+        # unchanged). Keyed by sink NAME — the identity — never by ref.
+        sink_transports=sink_transports,
         ledger=ledger,
         now=clock,
         sleep=sleep,

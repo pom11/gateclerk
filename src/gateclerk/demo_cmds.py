@@ -18,7 +18,7 @@ from typing import Annotated
 import typer
 
 from gateclerk import demo_device as demo
-from gateclerk.cli_shared import OutputOpt
+from gateclerk.cli_shared import OutputOpt, _config_exit
 from gateclerk.output import OutputFormat, render
 
 demo_app = typer.Typer(
@@ -129,6 +129,74 @@ def demo_device_urls(
         fmt=output.value,
         columns=("kind", "name", "url", "user", "password"),
     )
+
+
+@demo_app.command("demo")
+def demo_walkthrough_command(
+    root: Annotated[
+        str | None,
+        typer.Option(
+            "--root",
+            help="Scratch tree for the run (config, state, csv, health). Default: a fresh "
+            "temporary directory under the system temp dir.",
+        ),
+    ] = None,
+    ticks: Annotated[
+        int,
+        typer.Option(
+            "--ticks",
+            min=1,
+            help="How many agent ticks to run. One tick is already a full delivery; more "
+            "ticks show the checkpoint law holding (no re-pull of delivered rows).",
+        ),
+    ] = 3,
+    keep: Annotated[
+        bool,
+        typer.Option(
+            "--keep",
+            help="Leave the scratch tree in place so the csv, the health snapshot and the "
+            "generated config can be read afterwards. Without it the tree is deleted.",
+        ),
+    ] = False,
+    output: OutputOpt = OutputFormat.TABLE,
+) -> None:
+    """Run the whole loop against synthetic peers, in your terminal. Read-only.
+
+    One command, no door controller, no ingest deployment, no keychain item, no real
+    credentials: the real `IsapiClient` polls a fake Hikvision device on loopback, the agent
+    stores and queues the punches it reports, and the per-sink fan-out delivers them to two
+    sinks — a local `csv` sink and a mock `https` ingest this command hosts itself. The
+    printed loop is the evidence: events stored, then per tick the rows claimed and what each
+    sink took; a final summary names the csv path, its row count and its tail.
+
+    Nothing outside the scratch tree is touched, so there is nothing to undo and no `migrate`
+    step. The credential pair used is the published `demo device` pair above, which documents
+    a fake device and is therefore safe to name; the ingest bearer is a recognisable
+    placeholder that exists only in the process.
+
+    Needs `openssl` on PATH for the mock's throwaway certificate — without it this exits 2
+    saying so, because a clear-text mock ingest would teach the wrong law.
+
+    Exit: 0 ok - 2 missing `openssl`, an unusable `--root`, or a tick failure.
+    """
+    # Imported lazily, the way `agent_cmds` reaches `agent_cli`: the walkthrough pulls in
+    # the agent surface, and a command module keeps that dependency out of `--help` time.
+    from pathlib import Path
+
+    from gateclerk import demo_walkthrough
+
+    try:
+        report = demo_walkthrough.run_demo_walkthrough(
+            root=Path(root).expanduser() if root else None,
+            ticks=ticks,
+            keep=keep,
+            out=typer.echo,
+        )
+    except (demo_walkthrough.DemoWalkthroughError, OSError, ValueError) as exc:
+        # A demo refusal is a missing-tool / bad-`--root` failure — the configuration class
+        # (exit 2), the same mapping `sink add` uses for a refused edit.
+        raise _config_exit(output, str(exc)) from exc
+    render([report.as_dict()], fmt=output.value)
 
 
 def register(app: typer.Typer) -> None:
