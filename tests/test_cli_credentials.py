@@ -97,7 +97,6 @@ def captured_client_urls(
     What comes back is the base_url the CLI *asked to build* — the only place a dropped
     `sites.toml` port, or a guessed host, shows up while the run stays offline.
     """
-    import gateclerk.cli as cli_mod
 
     seen: list[str] = []
 
@@ -120,7 +119,9 @@ def captured_client_urls(
         def search(self, _name: str, _payload: object) -> dict[str, object]:
             return {}
 
-    monkeypatch.setattr(cli_mod, "IsapiClient", _Recorder)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "IsapiClient", _Recorder)
     run(args, env)
     return seen
 

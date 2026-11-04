@@ -182,7 +182,9 @@ def test_stdout_bytes_identical_to_the_same_run_with_the_feature_off(box, monkey
     code_on, out_on, err_on = invoke_events(box("happy_day"))
     assert code_on == 0 and len(warn_lines(err_on)) == 1
 
-    monkeypatch.setattr(cli_mod, "_warn_tz_mismatch", lambda records, **kw: None)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "_warn_tz_mismatch", lambda records, **kw: None)
     off_box = box("happy_day")
     code_off, out_off, err_off = invoke_events(off_box)
     assert code_off == 0

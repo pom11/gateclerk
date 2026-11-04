@@ -319,7 +319,7 @@ def probe_device(
     """
     from gateclerk import pipeline
     from gateclerk.capabilities import device_identity
-    from gateclerk.cli import IsapiClient  # the seam the suite redirects
+    from gateclerk.cli_shared import IsapiClient  # the seam the suite redirects
 
     with IsapiClient(
         f"http://{host}:{port}", user, password.reveal(), read_timeout=timeout_s

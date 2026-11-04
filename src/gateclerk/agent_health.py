@@ -342,7 +342,7 @@ class AgentHealthCollector:
         # its stderr console at call time, so `redirect_stderr` sees exactly the line
         # an operator would have seen). The anti-fork pin is the test's
         # `collector.mismatch_policy is cli._warn_tz_mismatch`.
-        from gateclerk.cli import _warn_tz_mismatch  # lazy: cli pulls typer + rich
+        from gateclerk.cli_shared import _warn_tz_mismatch  # lazy: cli_shared pulls typer + rich
 
         self.mismatch_policy = _warn_tz_mismatch
         self._stats: dict[str, DeviceStats] = {}

@@ -32,7 +32,6 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-import gateclerk.cli as cli_mod
 from _cli_surface import command_at, declared_flags, declared_param, declared_prose
 from fakedevice import BASE_URL, FakeDevice
 from gateclerk.cli import (
@@ -138,8 +137,10 @@ def device(monkeypatch: pytest.MonkeyPatch) -> FakeDevice:
         _BASE_URLS.append(base_url)
         return real(base_url, user, password, transport=d.transport, sleep=lambda _s: None)
 
+    from gateclerk import cli_shared
+
     _BASE_URLS.clear()
-    monkeypatch.setattr(cli_mod, "IsapiClient", factory)
+    monkeypatch.setattr(cli_shared, "IsapiClient", factory)
     from gateclerk.capabilities import capability_cache
 
     capability_cache().clear()
@@ -724,8 +725,10 @@ def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
     (`cli_mod._now`, which is what `RunContext.now` is wired to) is what lets the
     byte-equality tests below compare output instead of tolerating a race.
     """
+    from gateclerk import cli_shared
+
     instant = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
-    monkeypatch.setattr(cli_mod, "_now", lambda: instant)
+    monkeypatch.setattr(cli_shared, "_now", lambda: instant)
     return instant
 
 

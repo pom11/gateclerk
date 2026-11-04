@@ -39,7 +39,12 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "gateclerk"
 #: Modules the split created. These are the ones the import law binds.
 SPLIT_MODULES = (
     "cli_shared.py",
+    "device_cmds.py",
+    "users_cmds.py",
+    "events_cmds.py",
+    "creds_cmds.py",
     "agent_cmds.py",
+    "migrate_cmds.py",
     "sink_cmds.py",
     "demo_cmds.py",
     "export_cmds.py",
@@ -56,12 +61,17 @@ NEIGHBOUR_MODULES = (
     "status_cli.py",
     "service_cli.py",
     "doctor_cli.py",
+    "init_cli.py",
 )
 
 #: Group declarations that must NOT reappear in cli.py (they live in the cmd modules now).
 MOVED_GROUPS = (
+    "device_app",
+    "users_app",
+    "creds_app",
     "agent_app",
     "deadletter_app",
+    "migrate_app",
     "sink_app",
     "demo_app",
     "demo_device_app",
@@ -139,7 +149,11 @@ def test_moved_group_declarations_are_gone_from_cli_py() -> None:
 def test_each_moved_group_is_registered_from_its_module() -> None:
     """(2b) And the registrations still happen exactly once, from the cmd modules."""
     for module, app_name in (
+        ("device_cmds.py", "device_app"),
+        ("users_cmds.py", "users_app"),
+        ("creds_cmds.py", "creds_app"),
         ("agent_cmds.py", "agent_app"),
+        ("migrate_cmds.py", "migrate_app"),
         ("sink_cmds.py", "sink_app"),
         ("demo_cmds.py", "demo_app"),
         ("export_cmds.py", "export_app"),
@@ -152,7 +166,12 @@ def test_each_moved_group_is_registered_from_its_module() -> None:
         assert f"app.add_typer({app_name})" in text, module
     cli_text = (SRC / "cli.py").read_text(encoding="utf-8")
     for call in (
+        "device_cmds.register(app)",
+        "users_cmds.register(app)",
+        "creds_cmds.register(app)",
+        "events_cmds.register(app)",
         "agent_cmds.register(app)",
+        "migrate_cmds.register(app)",
         "sink_cmds.register(app)",
         "demo_cmds.register(app)",
         "export_cmds.register(app)",

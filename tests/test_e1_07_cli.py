@@ -129,7 +129,9 @@ class Box:
             harness.built_under.append(harness._tag)
             return client
 
-        monkeypatch.setattr(cli_mod, "IsapiClient", factory)
+        from gateclerk import cli_shared
+
+        monkeypatch.setattr(cli_shared, "IsapiClient", factory)
         capability_cache().clear()
 
     def tag(self, label: str) -> None:
