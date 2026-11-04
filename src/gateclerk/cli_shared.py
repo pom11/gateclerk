@@ -1,38 +1,31 @@
-"""The shared CLI furniture: option spellings, hidden-alias groups, failure-to-exit.
+"""The shared CLI furniture: option spellings, hidden-alias groups, failure-to-exit, and seams.
 
-CLI-SPLIT-STRUCTURE moved this out of `gateclerk.cli` (the merge-collision generator)
-together with the `agent` / `sink` / `demo` command groups. It is the module every command
-module may import — `cli.py` imports it too, so a shared flag spelling, a shared option
-default and the failure-to-exit renderer exist EXACTLY ONCE for the whole surface. The
-dependency direction is a law, not a style note:
+CLI-SPLIT-STRUCTURE and CLI-SEAM-MOVE moved this out of `gateclerk.cli` together with every
+command group. It is the module every command module imports — `cli.py` imports it too, so
+a shared flag spelling, a shared option default, the failure-to-exit renderer, and the
+client/clock/migration seams (`IsapiClient`, `_now`, `_warn_tz_mismatch`, `_migrate_client`,
+`_migrate_seams`) exist EXACTLY ONCE for the whole surface. The dependency direction is a
+law, not a style note:
 
-    gateclerk.cli  ->  gateclerk.cli_shared, gateclerk.agent_cmds, gateclerk.sink_cmds,
-                     gateclerk.demo_cmds, <domain modules>
+    gateclerk.cli  ->  gateclerk.cli_shared, gateclerk.*_cmds, <domain modules>
     <cmd module>   ->  gateclerk.cli_shared                  (NEVER -> gateclerk.cli)
 
-What belongs here, and why nothing else does:
-
-* `_alias_group` — CLI-VERBS-HELP's hidden-alias click class. Every group carrying a
-  superseded spelling needs it, including the groups that now live in their own module.
-* The shared `Annotated[...]` option aliases (HostArg … CountOpt) and the agent group's
-  site/config/state-root trio, which the `sink` group reuses. `tests/_cli_surface.py`
-  reads declared flags from the Click definition, so these help strings and defaults ARE
-  the pinned surface; a second copy of a help string is a surface that can drift.
-* The failure-to-exit conversion (`_config_exit` … `_Guard`). The exit-code CONTRACT and
-  its numbers live in `gateclerk.cli_conventions`; what lives here is the per-class payload
-  and renderer that turns a failure into the documented number.
-
-Nothing in this module builds a `typer.Typer` or registers a command — that is exactly
-what keeps it importable from any command module without an import cycle.
+Nothing in this module builds a `typer.Typer` or registers a command — that is what keeps
+it importable from any command module without an import cycle.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
+import httpx
 import typer
 from typer.core import TyperGroup
 
+from gateclerk import config as cfg
+from gateclerk import pipeline
 from gateclerk.cli_conventions import (
     AUTH_TERMINAL_EXIT,
     CONFIG_ERROR_EXIT,
@@ -41,34 +34,33 @@ from gateclerk.cli_conventions import (
     resolve_alias,
 )
 from gateclerk.cli_conventions import exit_code_for as _exit_code_for
+from gateclerk.config import KeychainReader, resolve_credentials, site_from_args
+from gateclerk.exceptions import ConfigError, CredentialUnavailable
+from gateclerk.isapi_transport import IsapiClient
 from gateclerk.output import CHOICES as OUTPUT_CHOICES
 from gateclerk.output import OutputFormat, make_console, render
-from gateclerk.pipeline import DEFAULT_SITE_LABEL
+from gateclerk.pipeline import DEFAULT_SITE_LABEL, RequestLogger, RunContext
+from gateclerk.tz import (
+    TimestampInputError,
+    UserTimestamp,
+    offset_hhmm,
+    parse_user_timestamp,
+)
+
+DEFAULT_PORT = cfg.DEFAULT_PORT
+DEFAULT_TIMEOUT = cfg.DEFAULT_TIMEOUT_S
+DEFAULT_TZ = cfg.DEFAULT_IANA_TZ
+
+VERIFY_CHOICES = ("face", "card", "fp", "password")
+OUTCOME_CHOICES = ("granted", "denied", "info")
 
 
-#: The click class for a group whose verb vocabulary was normalized by CLI-VERBS-HELP: it
-#: accepts the superseded spellings declared in ``cli_conventions.ALIASES`` on the command
-#: line WITHOUT declaring them.
-#:
-#: Why a subclass rather than a second ``@creds_app.command("check")`` on the same
-#: function: a registered alias lands in ``Group.commands``, so it shows up in ``--help``
-#: and in every "the surface is exactly these commands" test. Two spellings printed side by
-#: side teach the operator nothing about which one to type, and a surface test that has to
-#: allow both stops catching real additions. Resolving in ``get_command`` keeps the DECLARED
-#: surface at one spelling per operation while every existing script, cron wrapper and
-#: muscle memory keeps working.
-#:
-#: A subclass per group, not one class with a mutable attribute: two groups sharing a class
-#: would share whichever path was assigned last, so `creds`'s aliases would silently apply
-#: inside `agent deadletter`. A closure over `path` cannot drift.
 def _alias_group(path: tuple[str, ...]) -> type[TyperGroup]:
     class _Group(TyperGroup):
         def get_command(self, ctx: Any, cmd_name: str) -> Any:
             command = super().get_command(ctx, cmd_name)
             if command is not None:
                 return command
-            # Consulted only after the real lookup missed, so an alias can never shadow a
-            # real command and an unknown name still reaches click and exits 2 (usage).
             canonical = resolve_alias(path, cmd_name)
             return super().get_command(ctx, canonical) if canonical is not None else None
 
@@ -77,14 +69,6 @@ def _alias_group(path: tuple[str, ...]) -> type[TyperGroup]:
 
 
 # --- shared options -----------------------------------------------------------------
-# Declared once so every device-reading command spells them identically. p1-02 layers
-# Keychain + env resolution underneath --user/--password; p1-03 consumes --timeout.
-#
-# `--host` is optional at the OPTION level (not at the command level): a device is still
-# never guessed at, it can now also arrive via `--site` from sites.toml.
-# `gateclerk.cli._resolve_site()` below turns "neither given" into a config error (exit 2),
-# which is a different and more
-# useful signal than a click usage error.
 
 HostArg = Annotated[
     str | None,
@@ -175,10 +159,6 @@ CountOpt = Annotated[
     ),
 ]
 
-
-#: `--site` is REQUIRED here, unlike the CLI's `--site`/`--host` pair: one unit is one site and
-#: the systemd instance name (`%i`) is the only thing that selects it. There is no `--host`
-#: because a site's device hosts belong to sites.toml, not to whoever typed the command line.
 AgentSiteOpt = Annotated[
     str,
     typer.Option("--site", help="Site block to serve (the systemd instance name, %i)."),
@@ -238,12 +218,7 @@ def _device_exit(fmt: OutputFormat, message: str) -> typer.Exit:
 
 
 def _auth_exit(fmt: OutputFormat, message: str) -> typer.Exit:
-    """Report a terminal 401 (exit 3) with the lockout warning attached.
-
-    The warning is not decoration: at three sites a wrong password in a deployed poller
-    locks the admin account, and the same account is what opens the door. The transport
-    already stopped retrying; the human has to verify the credential by hand.
-    """
+    """Report a terminal 401 (exit 3) with the lockout warning attached."""
     hint = (
         " (the transport circuit-opened to protect against a terminal account lockout — "
         "verify the credential before retrying; see gateclerk creds test)"
@@ -264,16 +239,6 @@ def _runaway_exit(fmt: OutputFormat, message: str) -> typer.Exit:
 
 
 def _classify(exc: BaseException) -> int:
-    """`cli_conventions.exit_code_for`, with unclassified exceptions re-raising THEMSELVES.
-
-    `exit_code_for` reports an unknown class as a `KeyError` naming it — right for a
-    lookup, wrong here: p1-08's `_fail` ended in `raise exc` so the traceback shows the
-    module that actually has the bug, and a `KeyError` substituting for it would hide it.
-    `from None` drops the KeyError from the chain so the traceback reads as it did before.
-
-    Exit 1 is deliberately NOT a catch-all: an unclassified crash must not read as an
-    expected, branchable failure (see the conventions module's table, code 1).
-    """
     try:
         return _exit_code_for(exc)
     except KeyError:
@@ -281,18 +246,7 @@ def _classify(exc: BaseException) -> int:
 
 
 def _fail(fmt: OutputFormat, exc: BaseException) -> typer.Exit:
-    """Map any exception escaping a command body onto the documented exit code.
-
-    The CLASSIFICATION lives in `gateclerk.cli_conventions.exit_code_for` — the one place a
-    new exception class can be added — and this function owns only the per-class message
-    and payload. That split is what keeps the numbers from drifting: the mapping is not
-    restated here, so a command body cannot pick a different code for the same failure and
-    the conventions module's table stays the truth a reviewer can read.
-
-    `TimestampInputError` and `EventBoundsError` land on 2 on purpose: both mean a value
-    the operator typed was unusable, which is the "fix your input" class, not "the box is
-    broken". `SearchProtocolError` lands on 4: the device changed shape on us.
-    """
+    """Map any exception escaping a command body onto the documented exit code."""
     code = _classify(exc)
     if code == AUTH_TERMINAL_EXIT:
         return _auth_exit(fmt, str(exc))
@@ -303,25 +257,8 @@ def _fail(fmt: OutputFormat, exc: BaseException) -> typer.Exit:
     return _device_exit(fmt, str(exc))
 
 
-#: `IsapiError` and the other classes in the import block above were used by the inline
-#: isinstance chain that `_fail` carried; the chain now lives in
-#: `gateclerk.cli_conventions.exit_code_for`, so the classes are no longer named here.
-
-
 class _Guard:
-    """Context manager: `with _Guard(fmt): ...` turns any GateClerkError into its exit code.
-
-    Commands are written straight-line — resolve site, resolve creds, open client, read —
-    and every one of those steps can fail. Repeating a six-branch try/except in each body
-    is how one body ends up mapping a failure differently from its neighbour, so the
-    conversion lives here and the bodies stay readable.
-
-    Note what this does NOT cover: a read that happens *inside* the `with` and whose result
-    is consumed *after* it. A `pipeline` call that raises in there exits from `__exit__`, so
-    the lines below the block never run and no half-built record is ever rendered. Anything
-    that must inspect a result on an error path (the `--json` passthroughs) assigns its own
-    name inside the block and re-raises, rather than letting the failure slip past the guard.
-    """
+    """Context manager: `with _Guard(fmt): ...` turns any GateClerkError into its exit code."""
 
     def __init__(self, fmt: OutputFormat) -> None:
         self._fmt = fmt
@@ -333,3 +270,319 @@ class _Guard:
         if exc is None:
             return False
         raise _fail(self._fmt, exc) from exc
+
+
+# --- shared resolution, client, clock, tz-warning, and migration seams ---------------
+
+
+def _resolve_site(
+    *,
+    host: str | None,
+    site: str | None,
+    port: int,
+    sites_file: str | None,
+    output: OutputFormat,
+) -> cfg.SiteConfig:
+    """--site NAME reads sites.toml; --host is a one-off. Never a guess."""
+    try:
+        return site_from_args(site=site, host=host, port=port, config_path=sites_file)
+    except ConfigError as exc:
+        raise _config_exit(output, str(exc)) from exc
+
+
+def _resolve_creds(
+    target: cfg.DeviceTarget,
+    *,
+    user: str | None,
+    password: str | None,
+    output: OutputFormat,
+    keychain: KeychainReader | None = None,
+) -> cfg.Credentials:
+    """Resolve credentials, converting a failure into the documented exit 2."""
+    try:
+        return resolve_credentials(target, user=user, password=password, keychain=keychain)
+    except (CredentialUnavailable, ConfigError) as exc:
+        raise _config_exit(output, str(exc)) from exc
+
+
+def _client_for(
+    target: cfg.DeviceTarget,
+    creds: cfg.Credentials,
+    *,
+    timeout: float,
+    output: OutputFormat,
+    logger: RequestLogger | None = None,
+) -> Any:
+    """Build the read-only client for one device, wrapped for logging when asked."""
+    try:
+        client = IsapiClient(
+            f"http://{target.host}:{target.port}",
+            creds.user,
+            creds.password.reveal(),
+            read_timeout=timeout,
+        )
+    except (ValueError, httpx.InvalidURL) as exc:
+        raise _config_exit(output, str(exc)) from exc
+    if logger is None:
+        return client
+    return pipeline.LoggedClient(client, logger)
+
+
+def _iso(value: datetime | None) -> str | None:
+    """ISO-8601 for a datetime a record may not have. None stays None."""
+    return None if value is None else value.isoformat()
+
+
+def _nested(body: Mapping[str, Any], key: str) -> Any:
+    """Read `key` from a deviceInfo body, at the top level or one wrapper deep."""
+    if key in body:
+        return body[key]
+    for value in body.values():
+        if isinstance(value, Mapping) and key in value:
+            return value[key]
+    return None
+
+
+def _logger_for(verbose: bool, creds: cfg.Credentials | None) -> RequestLogger | None:
+    """The verbose logger, or None. Built after creds so the password can be redacted."""
+    if not verbose:
+        return None
+    secrets: list[Any] = []
+    if creds is not None:
+        secrets.append(creds.password)
+    return RequestLogger(secrets=tuple(secrets))
+
+
+def _validate_choice(
+    fmt: OutputFormat, value: str | None, *, flag: str, allowed: tuple[str, ...]
+) -> None:
+    """Reject an unknown `--verify`/`--outcome` as exit 2 rather than filtering to nothing."""
+    if value is None:
+        return
+    if value.strip().lower() not in allowed:
+        raise _config_exit(
+            fmt, f"{flag} {value!r} is not one of {', '.join(allowed)} (case-insensitive)"
+        )
+
+
+def _resolve_window(
+    *,
+    since: str | None,
+    until: str | None,
+    site_tz: str,
+    fmt: OutputFormat,
+) -> tuple[UserTimestamp, UserTimestamp]:
+    """Parse --since/--until into instants. Both are required; a bad value exits 2."""
+    try:
+        start = parse_user_timestamp(since, site_tz=site_tz, field_name="--since")
+        end = parse_user_timestamp(until, site_tz=site_tz, field_name="--until")
+    except TimestampInputError as exc:
+        raise _config_exit(fmt, str(exc)) from exc
+    return start, end
+
+
+def _resolved_site_tz(
+    *,
+    tz: str | None,
+    site: cfg.SiteConfig,
+    fmt: OutputFormat,
+    ctx: Any = None,
+) -> tuple[str, bool]:
+    """The zone the run resolves punches in, as `(zone, mapping_in_play)`."""
+    typed_tz = ctx is not None and _tz_flag_given(ctx)
+    if site.device_tz is not None and not typed_tz:
+        chosen = site.device_tz
+        mapped = True
+    else:
+        chosen = tz if tz is not None else (site.iana_tz or DEFAULT_TZ)
+        mapped = False
+    try:
+        RunContext(site="validate", site_tz=chosen)
+    except TimestampInputError as exc:
+        raise _config_exit(fmt, str(exc)) from exc
+    return chosen, mapped
+
+
+def _tz_flag_given(ctx: Any) -> bool:
+    """True when `--tz` was actually typed, not when its declared default landed."""
+    try:
+        source = ctx.get_parameter_source("tz")
+    except Exception:  # pragma: no cover
+        return True
+    return source is not None and source.name != "DEFAULT"
+
+
+def _now() -> datetime:
+    """The clock `captured_at` is stamped from — one module-level seam for tests."""
+    return datetime.now(UTC)
+
+
+def _context(
+    *,
+    site_config: cfg.SiteConfig,
+    site_label: str | None,
+    site_tz: str,
+    caps: Any = None,
+    max_records: int | None,
+    logger: RequestLogger | None,
+    device_claim: pipeline.WindowLabels | None = None,
+) -> RunContext:
+    """Assemble the run context, translating a bad flag value into exit 2."""
+    label = site_label if site_label is not None else (site_config.name or DEFAULT_SITE_LABEL)
+    try:
+        return pipeline.compile_run_context(
+            site=label,
+            site_tz=site_tz,
+            caps=caps,
+            page_delay_ms=site_config.page_delay_ms,
+            max_records=max_records,
+            logger=logger,
+            claimed_offset_min=None if device_claim is None else device_claim.claimed_offset_min,
+            claimed_offset_note=None if device_claim is None else device_claim.note,
+            now=lambda: _now(),
+        )
+    except (ValueError, TimestampInputError) as exc:
+        raise _config_exit(logger_format(logger), str(exc)) from exc
+
+
+def logger_format(logger: RequestLogger | None) -> OutputFormat:  # pragma: no cover
+    return OutputFormat.TABLE
+
+
+def _valid_label(record: Any) -> str:
+    """`Valid.enable` as a word. `unknown` is its own answer, never folded into `no`."""
+    if record.valid_enabled is None:
+        return "unknown"
+    return "yes" if record.valid_enabled else "no"
+
+
+def _print_count_crosscheck(
+    device_count: int | None, shown: int, *, filtered: bool, capped: bool = False
+) -> None:
+    """The `--count` line: display only, and honest about what it compared."""
+    console = make_console(stderr=True)
+    if device_count is None:
+        console.print("count: the device gave no readable count", markup=False)
+        return
+    agrees = not filtered and device_count == shown
+    verb = "agrees" if agrees else "reported"
+    why = ""
+    if not agrees:
+        why = " (client-side filter applied)" if filtered and not capped else ""
+        if capped:
+            why = " (--max-results capped the output)"
+    console.print(f"count: device says {device_count}, printed {shown} ({verb}{why})", markup=False)
+
+
+def _warn_tz_mismatch(records: Sequence[Any], *, mapping_declared: bool = False) -> None:
+    """ONE stderr summary line when any printed record has `tz_offset_mismatch=true`."""
+    if mapping_declared:
+        return
+    flagged = [r for r in records if r.tz_offset_mismatch is True]
+    if not flagged:
+        return
+
+    def label(minutes: int) -> str:
+        try:
+            return offset_hhmm(minutes)
+        except ValueError:
+            return f"{minutes:+d} min"
+
+    pairs: list[tuple[int, int]] = []
+    for record in flagged:
+        claimed, used = record.tz_offset_min_device, record.tz_offset_min
+        if claimed is None or used is None:
+            make_console(stderr=True).print(
+                "warning: some events have tz_offset_mismatch=true but no offsets to "
+                "explain it — see tz_offset_min_device / tz_offset_min in the records",
+                markup=False,
+            )
+            return
+        pair = (claimed, used)
+        if pair not in pairs:
+            pairs.append(pair)
+    zones = sorted({r.iana_tz for r in flagged if r.iana_tz})
+    site = ", ".join(zones) if zones else "the configured site zone"
+    if len(pairs) == 1:
+        claimed, used = pairs[0]
+        detail = (
+            f"device claims {label(claimed)}; site {site} resolves {label(used)} at these instants"
+        )
+    else:
+        joined = "; ".join(
+            f"device claims {label(claimed)} vs site-resolved {label(used)}"
+            for claimed, used in pairs
+        )
+        detail = f"{joined}; site {site} at these instants"
+    make_console(stderr=True).print(
+        f"warning: {len(flagged)} of {len(records)} events have tz_offset_mismatch=true "
+        f"({detail}) — records are correct, site-tz resolution is authoritative",
+        markup=False,
+    )
+
+
+def _migrate_client(
+    *,
+    host: str | None,
+    site: str | None,
+    port: int,
+    config: str | None,
+    user: str | None,
+    password: str | None,
+    timeout: float,
+    fmt: OutputFormat,
+    verbose: bool = False,
+) -> tuple[cfg.SiteConfig, Any, Callable[[], Any]]:
+    """The read client + a FACTORY for fresh ones, built by the SAME helpers P1 uses."""
+    site_config = _resolve_site(host=host, site=site, port=port, sites_file=config, output=fmt)
+    target = site_config.target()
+    creds = _resolve_creds(target, user=user, password=password, output=fmt)
+    logger = _logger_for(verbose, creds)
+
+    def factory() -> Any:
+        return _client_for(target, creds, timeout=timeout, output=fmt, logger=logger)
+
+    return site_config, factory(), factory
+
+
+def _read_target_state(client: Any) -> Any:
+    """A fresh full target read — §4: the target is never a cached or bundled view."""
+    from gateclerk.migrate_export import collect_enrollment_state
+
+    return collect_enrollment_state(client, inter_page_delay=0.0, sleep=lambda _s: None)
+
+
+def _migrate_seams(client: Any, client_factory: Callable[[], Any], *, writable: bool) -> Any:
+    """The composer's seams: registry reads on the command's client, write verbs per phase."""
+    from gateclerk import migrate_apply as apply_mod
+
+    def _read_only_only() -> Any:
+        raise AssertionError(
+            "this migrate command is a read pass: no write client may be constructed here (§7)"
+        )
+
+    return apply_mod.ApplySeams(
+        read_target_state=lambda: _read_target_state(client),
+        users_transport_factory=(
+            (lambda: apply_mod.UserWriteTransport(client_factory()))
+            if writable
+            else _read_only_only
+        ),
+        cards_transport_factory=(
+            (lambda: apply_mod.CardWriteTransport(client_factory()))
+            if writable
+            else _read_only_only
+        ),
+        fp_transport_factory=(
+            (lambda: apply_mod.FpWriteTransport(client_factory())) if writable else _read_only_only
+        ),
+        faces_transport_factory=(
+            (lambda: apply_mod.FaceWriteTransport(client_factory()))
+            if writable
+            else _read_only_only
+        ),
+        users_reader=apply_mod.reader_for(client, "user_info_search"),
+        cards_reader=apply_mod.reader_for(client, "card_info_search"),
+        fp_reader=lambda body: client.search("finger_print_upload", body),
+        faces_reader=apply_mod.reader_for(client, "fd_search"),
+    )

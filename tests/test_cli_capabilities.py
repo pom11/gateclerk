@@ -14,7 +14,6 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-import gateclerk.cli as cli_mod
 from fakedevice import BASE_URL, FakeDevice
 from gateclerk.cli import AUTH_TERMINAL_EXIT, DEVICE_ERROR_EXIT, app
 from gateclerk.isapi_transport import IsapiClient
@@ -66,7 +65,9 @@ def redirect_transport(monkeypatch: pytest.MonkeyPatch, device: FakeDevice) -> F
             base_url, user, password, transport=device.transport, sleep=lambda _s: None
         )
 
-    monkeypatch.setattr(cli_mod, "IsapiClient", factory)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "IsapiClient", factory)
     # The process-wide cache is module state; isolate tests from each other's runs.
     from gateclerk.capabilities import capability_cache
 

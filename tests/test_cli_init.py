@@ -39,7 +39,6 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-import gateclerk.cli as cli_mod
 from _cli_surface import command_at, declared_flags
 from fakedevice import FakeDevice
 from gateclerk import init_cli
@@ -97,7 +96,9 @@ def device(monkeypatch: pytest.MonkeyPatch) -> FakeDevice:
             base_url, user, password, transport=fake.transport, sleep=lambda _s: None
         )
 
-    monkeypatch.setattr(cli_mod, "IsapiClient", factory)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "IsapiClient", factory)
     return fake
 
 
@@ -569,7 +570,9 @@ def test_unreachable_device_exits_device_error(
     def boom(*a: Any, **kw: Any) -> Any:
         raise IsapiError("connection refused", status_code=None)
 
-    monkeypatch.setattr(cli_mod, "IsapiClient", boom)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "IsapiClient", boom)
     monkeypatch.setenv(HOST_PW_ENV, FAKE_PW)
     result = run(["init", "--config", str(tmp_path / "sites.toml"), "--yes"], input=answers())
     assert result.exit_code == 4, result.stdout
@@ -587,7 +590,9 @@ def test_auth_failure_exits_auth_terminal(tmp_path: Path, monkeypatch: pytest.Mo
     def boom(*a: Any, **kw: Any) -> Any:
         raise IsapiAuthError("401 unauthorized")
 
-    monkeypatch.setattr(cli_mod, "IsapiClient", boom)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "IsapiClient", boom)
     monkeypatch.setenv(HOST_PW_ENV, FAKE_PW)
     result = run(["init", "--config", str(tmp_path / "sites.toml"), "--yes"], input=answers())
     assert result.exit_code == 3, result.stdout

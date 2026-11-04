@@ -469,8 +469,10 @@ def install(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> E2E:
         e2e.base_urls.append(base_url)
         return real(base_url, user, password, transport=device.transport, sleep=e2e.sleeps.append)
 
-    monkeypatch.setattr(cli_mod, "IsapiClient", factory)
-    monkeypatch.setattr(cli_mod, "_now", lambda: GOLDEN_NOW)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "IsapiClient", factory)
+    monkeypatch.setattr(cli_shared, "_now", lambda: GOLDEN_NOW)
     from gateclerk.capabilities import capability_cache
 
     capability_cache().clear()

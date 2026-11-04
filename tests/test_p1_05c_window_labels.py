@@ -441,7 +441,9 @@ def test_cli_events_run_reads_the_claim_once_across_all_chunks(monkeypatch) -> N
     def factory(base_url: str, user: str, password: str, **kw: Any) -> IsapiClient:
         return real(base_url, user, password, transport=device.transport, sleep=lambda _s: None)
 
-    monkeypatch.setattr(cli_mod, "IsapiClient", factory)
+    from gateclerk import cli_shared
+
+    monkeypatch.setattr(cli_shared, "IsapiClient", factory)
     from gateclerk.capabilities import capability_cache
 
     capability_cache().clear()
