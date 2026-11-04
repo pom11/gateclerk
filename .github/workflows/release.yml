@@ -1,5 +1,22 @@
 name: release
 
+# Release-proof workflow (packaging from t_f9254c12/t_6be29819; CI proof from t_eb4004b7).
+#
+# What it does: for EACH target, on a runner of THAT platform, build the distribution,
+# verify `SHA256SUMS` twice (once with the runner's own sha256 tool, once inside the smoke
+# script before anything executes), smoke-test the hash-verified artifact for that target,
+# and upload `dist/` as a workflow artifact named `dist-<target>`.
+#
+# What it must never do: create a GitHub release, create or push a tag, write the Homebrew
+# tap, or publish anything public. That flip stays an explicit operator action. The
+# `guard` step re-checks this file on every run, so adding a publishing step turns the run
+# red rather than silently shipping.
+#
+# Runner <-> target pairing is not decorative: `--expect-host-target` makes the smoke
+# script refuse to run when the runner's auto-detected target differs from the target it
+# was asked to prove. A mislabelled matrix entry goes red instead of quietly cross-smoking
+# an arm64 zipapp from an x86_64 box (the exact blind spot this workflow used to have).
+
 on:
   push:
     tags:
@@ -9,47 +26,89 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-smoke:
-    name: build + smoke (${{ matrix.os }})
+    name: build + smoke (${{ matrix.target }})
     strategy:
+      # One broken target must not hide the evidence for the other two.
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
           - os: macos-14
             target: macos-arm64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv + Python 3.12
-        uses: astral-sh/setup-uv@v4
+      - name: Install uv
+        # Same action version and shape as ci.yml (the workflow that runs on every push).
+        # The old pin — setup-uv@v4 with uv 0.5.4 — predates this repo's uv.lock revision
+        # and only worked by luck; ci.yml has been on the current line all along.
+        uses: astral-sh/setup-uv@v10.3.0
         with:
-          version: "0.5.4"
           enable-cache: true
 
-      - name: Sync dependencies (frozen)
+      - name: Provision Python 3.12 (uv-managed, not the runner's python)
+        run: uv python install 3.12
+
+      - name: Sync locked dependencies (frozen)
         run: uv sync --frozen
 
+      - name: Report runner platform and uv/python versions
+        # Per-OS evidence in the log: which machine really built this artifact.
+        run: |
+          uv --version
+          uv run --frozen python -c "import platform; print('runner:', platform.system(), platform.machine())"
+          uv run --frozen python -c "import sys; print('python:', sys.version.split()[0])"
+
       - name: Build release artifacts + SHA256SUMS + Homebrew formula
+        # Builds the tarball plus all three zipapps deterministically (<1s, offline) so
+        # SHA256SUMS is complete and byte-identical on every runner. No tap directory is
+        # ever passed here — see the guard step.
         run: uv run --frozen python scripts/build_dist.py --dist-dir dist
 
-      - name: Smoke-test hash-verified artifact (${{ matrix.target }})
-        run: uv run --frozen python scripts/smoke_artifact.py --dist-dir dist --target ${{ matrix.target }}
+      - name: Verify SHA256SUMS with the runner's own tool
+        # Independent of the smoke script: an OS-level `sha256sum -c` proves the digests
+        # the artifact will be judged by. Fails on any missing or mismatched file.
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict SHA256SUMS
+          else
+            shasum --algorithm 256 --check SHA256SUMS
+          fi
 
-      - name: Smoke-test linux-arm64 portable zipapp on Linux runner
-        if: matrix.target == 'linux-x86_64'
-        run: uv run --frozen python scripts/smoke_artifact.py --dist-dir dist --target linux-arm64
+      - name: Smoke-test hash-verified artifact (${{ matrix.target }}) on ${{ matrix.os }}
+        run: >
+          uv run --frozen python scripts/smoke_artifact.py
+          --dist-dir dist
+          --target ${{ matrix.target }}
+          --expect-host-target ${{ matrix.target }}
+          --print-checks
 
-      - name: Upload release artifacts
+      - name: Guard — this workflow creates no release, tag, or tap commit
+        run: uv run --frozen python scripts/ci_proof_guard.py
+
+      - name: Upload workflow artifacts (dist-${{ matrix.target }})
         uses: actions/upload-artifact@v4
         with:
+          # Whole dist/ per target, so a reviewer can re-run the digest check locally
+          # against exactly what this job verified. These live and expire inside the run:
+          # workflow artifacts, not a release.
           name: dist-${{ matrix.target }}
           path: |
             dist/gateclerk-*.tar.gz
             dist/gateclerk-*.pyz
             dist/SHA256SUMS
             dist/gateclerk.rb
+          if-no-files-found: error
+          retention-days: 30

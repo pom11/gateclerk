@@ -12,6 +12,13 @@ Given a built distribution directory (`--dist-dir dist`):
        * `<artifact> doctor --config <tmp>/sites.toml --state-root <tmp>/state -o json`
        * `<artifact> creds set/get/remove` against a `0600` credential file (proving the
          keychain-free Linux credential path too).
+
+CI pairing note (card t_eb4004b7, RELEASE-CI-PROOF): a `.pyz` is portable, so a smoke run
+proves the HOST it executed on, not the artifact's target name. `.github/workflows/release.yml`
+therefore passes `--expect-host-target <matrix target>` and `assert_host_matches_target`
+refuses a target whose platform differs from the runner's — an arm64 zipapp smoke executed
+on an x86_64 box would otherwise go green while proving nothing about arm64.
+`--print-checks` puts the `sha256sum -c`-style verdict lines in the CI log.
 """
 
 from __future__ import annotations
@@ -71,6 +78,44 @@ def detect_host_target() -> str:
     if machine in ("aarch64", "arm64"):
         return "linux-arm64"
     return "linux-x86_64"
+
+
+def assert_host_matches_target(expected: str) -> str:
+    """Refuse to smoke `expected` on a runner that is not that platform.
+
+    CI passes `--expect-host-target <matrix target>`. Without this, a matrix entry that
+    named the wrong runner would still go green by executing, say, the linux-arm64 zipapp
+    on an x86_64 host — a portable zipapp imports fine there, so the run would prove
+    nothing about arm64 while reporting success. The failure below is the point.
+    """
+    host = detect_host_target()
+    if host != expected:
+        raise RuntimeError(
+            f"refusing to cross-smoke: artifact target {expected!r} does not match "
+            f"the host platform {host!r} — pair each matrix target with its own runner"
+        )
+    return host
+
+
+def print_sha256_check_lines(dist_dir: Path, verified: dict[str, Path]) -> None:
+    """Print `sha256sum -c`-style OK lines for every artifact verified from `SHA256SUMS`.
+
+    Pure evidence for the CI log: the digest the build produced, the file name, and the
+    verdict, for each artifact the smoke step is about to execute.
+    """
+    for name, path in sorted(verified.items()):
+        digest = sha256_of(path)
+        expected = next(
+            (
+                line.split()[0]
+                for line in (dist_dir / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+                if line.strip().endswith(f"  {name}")
+            ),
+            digest,
+        )
+        if digest != expected:  # verify_sha256sums already raised; belt and braces
+            raise RuntimeError(f"digest drift for {name} between verify and report")
+        print(f"{digest}  {name}: OK")
 
 
 def smoke_artifact(
@@ -184,15 +229,32 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Verify SHA256SUMS and smoke-test built artifact.")
     parser.add_argument("--dist-dir", type=Path, default=Path("dist"))
     parser.add_argument("--target", default=None, help="Target name (default: auto-detect host).")
+    parser.add_argument(
+        "--expect-host-target",
+        default=None,
+        help="Fail unless the host platform auto-detects to this target (CI pairing gate).",
+    )
+    parser.add_argument(
+        "--print-checks",
+        action="store_true",
+        help="Print a `sha256sum -c`-style OK line per verified artifact before executing.",
+    )
     args = parser.parse_args(argv)
 
     verified = verify_sha256sums(args.dist_dir)
     target = args.target or detect_host_target()
+    host = detect_host_target()
+    if args.expect_host_target:
+        host = assert_host_matches_target(args.expect_host_target)
+    if args.print_checks:
+        print_sha256_check_lines(args.dist_dir, verified)
+    print(f"host target: {host}; artifact target: {target}")
     matches = [p for name, p in verified.items() if name.endswith(f"-{target}.pyz")]
     if not matches:
         raise RuntimeError(f"no artifact for target {target!r} in {list(verified)}")
 
     report = smoke_artifact(matches[0])
+    report["host_target"] = host
     print(json.dumps(report, indent=2))
     return 0
 
