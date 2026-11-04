@@ -1387,11 +1387,12 @@ def _roster_user(user: UserRecord) -> dict[str, Any]:
 def stub_transport(target: str) -> Transport:
     """A transport that appends the JSONL body to a local file: `stub://<path>`.
 
-    This is the owner-authorized local ingest (card + spec §3) and the only ingest this
-    card ships — it exists so the pusher, its tests and an operator's dry run all exercise
-    the REAL payload path against something that is not an invented endpoint. It writes
-    the bytes it was handed (append-only: truncating would delete the site's history on
-    the first retry) and answers 200, which is the whole contract `drain` relies on.
+    This is the owner-authorized local ingest (card + spec §3); P2-04 shipped only
+    `stub_transport` while Task 15 adds the real one, `https_transport` — it exists so the
+    pusher, its tests and an operator's dry run all exercise the REAL payload path against
+    something that is not an invented endpoint. It writes the bytes it was handed
+    (append-only: truncating would delete the site's history on the first retry) and
+    answers 200, which is the whole contract `drain` relies on.
 
     The scheme check is not decoration: aimed at an `https://` target it must REFUSE, or
     a test could go green by writing to disk while believing it pushed to an ingest.
