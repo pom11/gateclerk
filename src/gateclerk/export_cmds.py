@@ -14,15 +14,16 @@ import typer
 
 from gateclerk import config as cfg
 from gateclerk import export_cli
-from gateclerk.cli_shared import _config_exit
-from gateclerk.exceptions import ConfigError
+from gateclerk.cli_shared import _config_exit, _fail
+from gateclerk.exceptions import ConfigError, EventBoundsError
 from gateclerk.output import OutputFormat
+from gateclerk.tz import TimestampInputError
 
 export_app = typer.Typer(
     name="export",
     help=(
-        "Export site/device configuration inventory (and local store records) to CSV or "
-        "JSONL. Credential references are exported by name; secret values never are."
+        "Export site/device configuration inventory and local store scan records to CSV "
+        "or JSONL. Credential references are exported by name; secret values never are."
     ),
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
@@ -33,8 +34,8 @@ ExportConfigFileOpt = Annotated[
     typer.Option(
         "--config",
         help=(
-            "Path to sites.toml to project (default ./sites.toml). Refs only; "
-            "unknown keys are dropped."
+            "Path to sites.toml to read (default ./sites.toml). Refs only; "
+            "unknown keys are dropped on config export."
         ),
     ),
 ]
@@ -42,14 +43,14 @@ ExportSiteOpt = Annotated[
     str | None,
     typer.Option(
         "--site",
-        help="Export only this named [[site]] block (default: export all configured sites).",
+        help="Site name in sites.toml (required for `export scans` when >1 site is configured).",
     ),
 ]
 ExportStateRootOpt = Annotated[
     str | None,
     typer.Option(
         "--state-root",
-        help="Override the state_dir column reported for each exported site.",
+        help="State directory containing the site SQLite store (or overriding state_dir).",
     ),
 ]
 ExportFormatOpt = Annotated[
@@ -77,6 +78,68 @@ ExportBomOpt = Annotated[
         help="Prepend a UTF-8 BOM to CSV output for Excel-on-Windows compatibility.",
     ),
 ]
+ExportDeviceOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--device",
+        help="Filter exported scans to this device_serial.",
+    ),
+]
+ExportEmployeeOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--employee",
+        help="Filter exported scans to this employee_no string.",
+    ),
+]
+ExportSinceOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--since",
+        help="Lower bound on event time (inclusive; ISO-8601 or YYYY-MM-DD in site timezone).",
+    ),
+]
+ExportUntilOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--until",
+        help="Upper bound on event time (inclusive; ISO-8601 or YYYY-MM-DD in site timezone).",
+    ),
+]
+ExportDirectionOpt = Annotated[
+    str,
+    typer.Option(
+        "--direction",
+        help="Filter by stored direction: `in`, `out`, or `any` (default `any`).",
+    ),
+]
+ExportRedactOpt = Annotated[
+    bool,
+    typer.Option(
+        "--redact",
+        help=(
+            "Drop personal-data identifier columns (`employee_no`, `cardNo`, `name`) and "
+            "strip them from `raw` JSON so the export can be shared safely."
+        ),
+    ),
+]
+
+
+def _resolve_fmt_and_output(fmt: str, output: str | None) -> tuple[str, str | None, OutputFormat]:
+    effective_fmt = fmt
+    effective_output = output
+    if output in ("json", "jsonl") and fmt == "csv":
+        effective_fmt = "jsonl"
+        effective_output = None
+    elif output == "table" and fmt == "csv":
+        effective_fmt = "csv"
+        effective_output = None
+    err_fmt = (
+        OutputFormat.JSON
+        if effective_fmt.strip().lower() in ("json", "jsonl")
+        else OutputFormat.TABLE
+    )
+    return effective_fmt, effective_output, err_fmt
 
 
 @export_app.command("config")
@@ -89,23 +152,7 @@ def export_config(
     bom: ExportBomOpt = False,
 ) -> None:
     """Export sites + devices inventory from sites.toml (allowlist columns, ref names only)."""
-    # When someone invokes `-o json` or `-o jsonl` (the CLI-wide machine-output muscle
-    # memory), treat it as format=jsonl to stdout if stdout is not a TTY, unless `output`
-    # looks like a file path.
-    effective_fmt = fmt
-    effective_output = output
-    if output in ("json", "jsonl") and fmt == "csv":
-        effective_fmt = "jsonl"
-        effective_output = None
-    elif output == "table" and fmt == "csv":
-        effective_fmt = "csv"
-        effective_output = None
-
-    err_fmt = (
-        OutputFormat.JSON
-        if effective_fmt.strip().lower() in ("json", "jsonl")
-        else OutputFormat.TABLE
-    )
+    effective_fmt, effective_output, err_fmt = _resolve_fmt_and_output(fmt, output)
     try:
         stdout_payload, stderr_summary = export_cli.export_config_file(
             config_path=config,
@@ -122,6 +169,51 @@ def export_config(
         sys.stdout.write(stdout_payload)
     if stderr_summary:
         sys.stderr.write(stderr_summary + "\n")
+
+
+@export_app.command("scans")
+def export_scans(
+    config: ExportConfigFileOpt = cfg.DEFAULT_SITES_FILE,
+    site: ExportSiteOpt = None,
+    state_root: ExportStateRootOpt = None,
+    device: ExportDeviceOpt = None,
+    employee: ExportEmployeeOpt = None,
+    since: ExportSinceOpt = None,
+    until: ExportUntilOpt = None,
+    direction: ExportDirectionOpt = "any",
+    fmt: ExportFormatOpt = "csv",
+    output: ExportOutputOpt = None,
+    bom: ExportBomOpt = False,
+    redact: ExportRedactOpt = False,
+) -> None:
+    """Stream stored scans from the local SQLite database to CSV or JSONL (personal data).
+
+    Attendance scans are personal data (GDPR-adjacent workforce records). Output goes to
+    stdout only when piped; on an interactive TTY, `--output <path>` (`-o <path>`) is
+    required so no surprise file is created. Pass `--redact` to omit `employee_no`,
+    `cardNo`, and `name` when sharing diagnostics.
+    """
+    effective_fmt, effective_output, err_fmt = _resolve_fmt_and_output(fmt, output)
+    try:
+        _count, stderr_msg = export_cli.export_scans_stream(
+            config_path=config,
+            site=site,
+            state_root=state_root,
+            device=device,
+            employee=employee,
+            since=since,
+            until=until,
+            direction=direction,
+            fmt=effective_fmt,
+            output_path=effective_output,
+            bom=bom,
+            redact=redact,
+        )
+    except (ConfigError, TimestampInputError, EventBoundsError) as exc:
+        raise _fail(err_fmt, exc) from exc
+
+    if stderr_msg:
+        sys.stderr.write(stderr_msg + "\n")
 
 
 def register(app: typer.Typer) -> None:

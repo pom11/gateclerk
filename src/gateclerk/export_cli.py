@@ -1,25 +1,33 @@
-"""`gateclerk export config` — sites + devices inventory export (card t_7b62b44c).
+"""`gateclerk export config` & `gateclerk export scans` (cards t_7b62b44c, t_5a0f39b2).
 
-Projects `sites.toml` to CSV or JSONL using a HARD allowlist of columns (deny-by-default):
-  * site code, enabled flag, state_dir, db_path, db_warn_bytes
-  * device host (hostname ONLY — any scheme, `user:pass@` userinfo, port or path stripped),
-    port, isapi_user, device_code, serial
-  * iana_tz, device_tz, timeout_s, page_delay_ms, cadence_s, overlap_s,
-    push_dead_letter_after_s
-  * credential REFERENCE names only — never values:
-      - `device_cred_keychain_service` (keychain service name)
-      - `device_cred_env_var`          (`GATECLERK_<HOST>_PASSWORD`)
-      - `device_cred_ref`              (`gateclerk-<site>-<host>`)
-      - `ingest_token_keychain_service` (`gateclerk-ingest-<site>`)
-      - `ingest_token_env_var`          (`GATECLERK_INGEST_TOKEN_<SITE>`)
-  * push_target and `[[site.sink]]` entries sanitized (userinfo/query/fragment stripped,
-    only allowlisted sink keys kept, and `token_env` / `token_keychain` validated through
-    `sink_cli.token_ref_problem` so a secret value mistakenly placed in a ref field is
-    dropped and never echoed).
+Two exports, one module:
 
-Any key not on the allowlist (at top level, in `[[site]]`, or in `[[site.sink]]`), as well
-as any stripped credential userinfo or secret-shaped ref value, is DROPPED and counted in a
-`dropped_keys` summary written to stderr.
+1. `gateclerk export config` — projects `sites.toml` to CSV or JSONL using a HARD allowlist
+   of columns (`CONFIG_EXPORT_COLUMNS`, deny-by-default):
+     * site code, enabled flag, state_dir, db_path, db_warn_bytes
+     * device host (hostname ONLY — any scheme, `user:pass@` userinfo, port or path
+       stripped), port, isapi_user, device_code, serial
+     * iana_tz, device_tz, timeout_s, page_delay_ms, cadence_s, overlap_s,
+       push_dead_letter_after_s
+     * credential REFERENCE names only — never values (`device_cred_keychain_service`,
+       `device_cred_env_var`, `device_cred_ref`, `ingest_token_keychain_service`,
+       `ingest_token_env_var`, plus sink `token_env` / `token_keychain` validated via
+       `sink_cli.token_ref_problem`)
+     * unknown keys and stripped userinfo/secrets are DROPPED and counted in a
+       `dropped_keys` summary on stderr.
+
+2. `gateclerk export scans` — streams stored attendance scans from the agent's local SQLite
+   store (`events` table) in `(event_time_utc, serial_no)` order:
+     * filters: `--site` (required when `> 1` site is configured), `--device`,
+       `--employee`, `--since`, `--until`, `--direction` (`in|out|any`, stored fields
+       only);
+     * streaming: reads in bounded chunks via `cursor.fetchmany(SCAN_EXPORT_CHUNK_SIZE)`
+       and writes chunk-by-chunk (never materializes the table into a list);
+     * formats: `csv` (fixed header `SCAN_EXPORT_COLUMNS`, UTF-8, optional `--bom` for
+       Excel on Windows) or `jsonl` (the agent's stored `EventRecord` lines verbatim);
+     * personal-data law: refuses on an interactive TTY unless `--output <path>` is
+       given; `--redact` drops `employee_no`, `cardNo`, and `name` columns (and strips
+       those keys inside `raw` / JSONL).
 """
 
 from __future__ import annotations
@@ -28,33 +36,86 @@ import csv
 import io
 import json
 import re
+import sqlite3
 import sys
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
 from gateclerk import config as cfg
-from gateclerk.exceptions import ConfigError, redact_b64
+from gateclerk.exceptions import ConfigError, EventBoundsError, redact_b64
 from gateclerk.sink_cli import token_ref_problem
+from gateclerk.tz import DEFAULT_SITE_TZ, parse_user_timestamp
 
 __all__ = [
     "ALLOWED_SINK_KEYS",
     "ALLOWED_SITE_KEYS",
     "CONFIG_EXPORT_COLUMNS",
+    "DIRECTION_CHOICES",
     "EXPORT_FORMATS",
+    "REDACTED_SCAN_FIELDS",
+    "SCAN_EXPORT_CHUNK_SIZE",
+    "SCAN_EXPORT_COLUMNS",
+    "SCAN_EXPORT_REDACTED_COLUMNS",
     "ConfigExportResult",
     "export_config_file",
+    "export_scans_stream",
     "format_dropped_keys_summary",
     "project_sites_toml",
     "render_config_export",
+    "resolve_scan_store_path",
     "sanitize_host",
     "sanitize_target_url",
 ]
 
 EXPORT_FORMATS: tuple[str, ...] = ("csv", "jsonl")
+DIRECTION_CHOICES: tuple[str, ...] = ("any", "in", "out", "unknown")
+
+#: Chunk size for streaming `events` rows out of SQLite (monkeypatchable in tests).
+SCAN_EXPORT_CHUNK_SIZE: int = 256
+
+#: Personal-data columns omitted from CSV headers/rows (and JSONL top-level) under `--redact`.
+REDACTED_SCAN_FIELDS: frozenset[str] = frozenset({"employee_no", "cardNo", "name"})
+
+#: Stable 28-column CSV header for `gateclerk export scans` (documented in docs/EXPORT-COLUMNS.md).
+SCAN_EXPORT_COLUMNS: tuple[str, ...] = (
+    "site",
+    "device_serial",
+    "serial_no",
+    "employee_no",
+    "cardNo",
+    "name",
+    "event_time_utc",
+    "event_time_local",
+    "tz_offset_min",
+    "tz_offset_min_device",
+    "tz_source",
+    "iana_tz",
+    "tz_unresolved",
+    "tz_ambiguous",
+    "tz_nonexistent",
+    "tz_reason",
+    "tz_offset_mismatch",
+    "direction",
+    "attendance_status",
+    "direction_source",
+    "verify_mode",
+    "major",
+    "minor",
+    "outcome",
+    "unknown_code",
+    "encrypted_person_data",
+    "raw",
+    "captured_at",
+)
+
+SCAN_EXPORT_REDACTED_COLUMNS: tuple[str, ...] = tuple(
+    col for col in SCAN_EXPORT_COLUMNS if col not in REDACTED_SCAN_FIELDS
+)
 
 CONFIG_EXPORT_COLUMNS: tuple[str, ...] = (
     "site",
@@ -142,11 +203,7 @@ def _stdout_is_tty() -> bool:
 
 
 def sanitize_host(raw_host: object) -> tuple[str, list[str]]:
-    """Extract ONLY the hostname from `raw_host`, stripping any userinfo/scheme/port/path.
-
-    Returns `(hostname, dropped_markers)` where `dropped_markers` records if embedded
-    credentials (`user:pass@`) or URL query/fragment components were stripped.
-    """
+    """Extract ONLY the hostname from `raw_host`, stripping any userinfo/scheme/port/path."""
     dropped: list[str] = []
     if not isinstance(raw_host, str):
         return "", dropped
@@ -163,11 +220,7 @@ def sanitize_host(raw_host: object) -> tuple[str, list[str]]:
 
 
 def sanitize_target_url(raw_url: object, *, prefix: str) -> tuple[str, list[str]]:
-    """Sanitize a `push_target` or sink `url`, stripping userinfo, query and fragment.
-
-    Only `https://` and `stub://` targets are kept; any other scheme or secret-looking
-    value is dropped and recorded in `dropped_keys`.
-    """
+    """Sanitize a `push_target` or sink `url`, stripping userinfo, query and fragment."""
     dropped: list[str] = []
     if not isinstance(raw_url, str):
         return "", dropped
@@ -212,10 +265,7 @@ def _safe_ref_name(raw_ref: object, *, key_label: str, default: str = "") -> tup
 
 
 def _safe_scalar_ident(raw: object, *, key_label: str, default: str = "") -> tuple[str, list[str]]:
-    """Sanitize a non-secret identifier (`name`, `device_code`, `serial`, `isapi_user`).
-
-    Drops values that trigger `redact_b64` or look like a high-entropy bearer/secret.
-    """
+    """Sanitize a non-secret identifier (`name`, `device_code`, `serial`, `isapi_user`)."""
     if raw is None:
         return default, []
     if isinstance(raw, list | tuple):
@@ -236,7 +286,6 @@ def _safe_scalar_ident(raw: object, *, key_label: str, default: str = "") -> tup
         return default, [key_label]
     if "://" in text or "@" in text:
         return default, [key_label]
-    # High-entropy mixed-case+digit single token >= 24 chars with no separator looks like a secret
     if (
         len(text) >= 24
         and re.match(r"^[A-Za-z0-9]+$", text)
@@ -632,12 +681,7 @@ def export_config_file(
     bom: bool = False,
     is_tty: bool | None = None,
 ) -> tuple[str, str]:
-    """Run the config export and return `(stdout_payload, stderr_summary)`.
-
-    When `output_path` is None and stdout is a TTY, raises `ConfigError` (exit 2) so an
-    interactive run never dumps rows without an explicit `--output <path>` and never
-    invents a surprise file path.
-    """
+    """Run the config export and return `(stdout_payload, stderr_summary)`."""
     tty = _stdout_is_tty() if is_tty is None else is_tty
     if output_path is None and tty:
         raise ConfigError(
@@ -669,3 +713,334 @@ def export_config_file(
         return "", f"wrote {len(result.rows)} row(s) to {out_file}; {summary}"
 
     return payload, summary
+
+
+# ---------------------------------------------------------------------------
+# `gateclerk export scans` (card t_5a0f39b2)
+# ---------------------------------------------------------------------------
+
+_REDACTED_RAW_KEYS: frozenset[str] = frozenset(
+    {"employeeNoString", "employeeNo", "employee_no", "cardNo", "card_no", "name"}
+)
+
+
+def _redact_raw_dict(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _redact_raw_dict(v) for k, v in obj.items() if k not in _REDACTED_RAW_KEYS}
+    if isinstance(obj, list):
+        return [_redact_raw_dict(item) for item in obj]
+    return obj
+
+
+def _extract_card_no(raw_json: str) -> str:
+    if not raw_json:
+        return ""
+    try:
+        parsed = json.loads(raw_json)
+    except ValueError:
+        return ""
+    if not isinstance(parsed, Mapping):
+        return ""
+    for candidate in (
+        parsed.get("cardNo"),
+        parsed.get("card_no"),
+        (parsed.get("AcsEvent") or {}).get("cardNo")
+        if isinstance(parsed.get("AcsEvent"), Mapping)
+        else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            return str(candidate)
+    return ""
+
+
+def resolve_scan_store_path(
+    *,
+    config_path: Path | str = cfg.DEFAULT_SITES_FILE,
+    site: str | None = None,
+    state_root: Path | str | None = None,
+    db_path: Path | str | None = None,
+) -> tuple[str | None, str, Path]:
+    """Resolve `(site_name, site_tz, db_file)` for `gateclerk export scans`.
+
+    Rules (card t_5a0f39b2):
+      * If `db_path` is explicitly given, use it directly.
+      * Otherwise read `sites.toml`:
+          - if `> 1` site is configured and `--site` is omitted, refuse (`--site` is
+            required when more than one site is configured);
+          - if `== 1` site is configured and `--site` is omitted, use that single site;
+          - if `--site` is given, look up that site in `sites.toml` (or, if `sites.toml`
+            is absent and `state_root` is given, derive `<state_root>/gateclerk-<site>.sqlite3`).
+    """
+    if db_path is not None:
+        resolved = Path(db_path)
+        if not resolved.is_file():
+            raise ConfigError(f"scan store database {resolved} not found.")
+        return site, DEFAULT_SITE_TZ, resolved
+
+    cfg_file = Path(config_path)
+    if cfg_file.is_file():
+        sites = cfg.load_sites(cfg_file, surface="cli")
+        if site is None:
+            if len(sites) == 0:
+                raise ConfigError(f"no [[site]] blocks configured in {cfg_file}.")
+            if len(sites) > 1:
+                known = ", ".join(sorted(sites))
+                raise ConfigError(
+                    f"--site is required when more than one site is configured in {cfg_file} "
+                    f"(configured: {known})."
+                )
+            site_cfg = next(iter(sites.values()))
+        else:
+            site_cfg = cfg.find_site(sites, site)
+        raw_db = Path(site_cfg.db_path_resolved)
+        resolved = (
+            (Path(state_root) / raw_db)
+            if (state_root is not None and not raw_db.is_absolute())
+            else raw_db
+        )
+        if not resolved.is_file():
+            raise ConfigError(
+                f"scan store database {resolved} not found for site {site_cfg.name!r}."
+            )
+        return site_cfg.name, site_cfg.iana_tz or DEFAULT_SITE_TZ, resolved
+
+    if site is not None:
+        rel = Path(cfg.DEFAULT_DB_PATH_TEMPLATE.format(site=site))
+        resolved = (Path(state_root) / rel) if state_root is not None else rel
+        if resolved.is_file():
+            return site, DEFAULT_SITE_TZ, resolved
+        raise ConfigError(
+            f"sites file {cfg_file} not found and scan store {resolved} does not exist."
+        )
+
+    raise ConfigError(f"sites file {cfg_file} not found (pass --config or --site).")
+
+
+def _open_scan_cursor(conn: sqlite3.Connection, sql: str, params: Sequence[Any]) -> sqlite3.Cursor:
+    """Seam for tests to wrap the SQLite cursor and verify chunked `fetchmany` streaming."""
+    return conn.execute(sql, tuple(params))
+
+
+def _iter_scan_chunks(
+    cursor: sqlite3.Cursor, *, chunk_size: int | None = None
+) -> Iterator[Sequence[sqlite3.Row]]:
+    size = SCAN_EXPORT_CHUNK_SIZE if chunk_size is None else chunk_size
+    if size <= 0:
+        size = 1
+    while True:
+        batch = cursor.fetchmany(size)
+        if not batch:
+            break
+        yield batch
+
+
+def _format_bool_cell(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, int):
+        return "true" if val != 0 else "false"
+    return str(val)
+
+
+_BOOL_SCAN_COLS: frozenset[str] = frozenset(
+    {
+        "tz_unresolved",
+        "tz_ambiguous",
+        "tz_nonexistent",
+        "tz_offset_mismatch",
+        "unknown_code",
+        "encrypted_person_data",
+    }
+)
+
+
+def _scan_row_to_csv_cells(row: sqlite3.Row, *, columns: Sequence[str], redact: bool) -> list[str]:
+    raw_text = str(row["raw"] or "{}")
+    if redact:
+        try:
+            raw_text = json.dumps(
+                _redact_raw_dict(json.loads(raw_text)),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except ValueError:
+            raw_text = "{}"
+    card_no = "" if redact else _extract_card_no(raw_text)
+    cells: list[str] = []
+    for col in columns:
+        if col == "cardNo":
+            cells.append(card_no)
+        elif col == "raw":
+            cells.append(raw_text)
+        elif col in _BOOL_SCAN_COLS:
+            cells.append(_format_bool_cell(row[col]))
+        else:
+            val = row[col]
+            cells.append("" if val is None else str(val))
+    return cells
+
+
+def _scan_row_to_jsonl_line(row: sqlite3.Row, *, redact: bool) -> str:
+    raw_line = str(row["jsonl"] or "").strip()
+    if not redact:
+        return raw_line
+    try:
+        payload = json.loads(raw_line)
+    except ValueError:
+        payload = {}
+    if isinstance(payload, dict):
+        for k in ("employee_no", "employeeNo", "employeeNoString", "cardNo", "card_no", "name"):
+            payload.pop(k, None)
+        if "raw" in payload:
+            payload["raw"] = _redact_raw_dict(payload["raw"])
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def export_scans_stream(
+    *,
+    config_path: Path | str = cfg.DEFAULT_SITES_FILE,
+    site: str | None = None,
+    state_root: Path | str | None = None,
+    db_path: Path | str | None = None,
+    device: str | None = None,
+    employee: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    direction: str = "any",
+    fmt: str = "csv",
+    output_path: Path | str | None = None,
+    bom: bool = False,
+    redact: bool = False,
+    is_tty: bool | None = None,
+    dest_stream: TextIO | None = None,
+) -> tuple[int, str]:
+    """Stream filtered scans from the local SQLite store to `output_path` or `dest_stream`.
+
+    Returns `(row_count, stderr_message)`. Never calls `fetchall()` and never materializes
+    the result set into a list.
+    """
+    tty = _stdout_is_tty() if is_tty is None else is_tty
+    if output_path is None and tty:
+        raise ConfigError(
+            "stdout is a TTY: attendance scans are personal data — pass --output <path> "
+            "(or -o <path>) to write to a file, or pipe stdout (never invents a file path)."
+        )
+
+    norm_fmt = fmt.strip().lower()
+    if norm_fmt == "json":
+        norm_fmt = "jsonl"
+    if norm_fmt not in EXPORT_FORMATS:
+        raise ConfigError(
+            f"unsupported export format {fmt!r} (expected one of: {', '.join(EXPORT_FORMATS)})"
+        )
+
+    norm_dir = direction.strip().lower()
+    if norm_dir not in DIRECTION_CHOICES:
+        raise ConfigError(f"invalid --direction {direction!r} (expected one of: in, out, any)")
+
+    resolved_site, site_tz, resolved_db = resolve_scan_store_path(
+        config_path=config_path, site=site, state_root=state_root, db_path=db_path
+    )
+
+    since_utc: str | None = None
+    until_utc: str | None = None
+    if since is not None:
+        since_dt = parse_user_timestamp(since, site_tz=site_tz, field_name="--since").value
+        since_utc = since_dt.astimezone(UTC).isoformat()
+    if until is not None:
+        # Bare date YYYY-MM-DD for --until covers the full local day (23:59:59.999999)
+        until_text = until.strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until_text):
+            until_text = f"{until_text}T23:59:59.999999"
+        until_dt = parse_user_timestamp(until_text, site_tz=site_tz, field_name="--until").value
+        until_utc = until_dt.astimezone(UTC).isoformat()
+    if since_utc is not None and until_utc is not None and since_utc > until_utc:
+        raise EventBoundsError(
+            f"--since ({since!r}) is after --until ({until!r}) — empty or inverted window"
+        )
+
+    site_filter = resolved_site or None
+    device_filter = device.strip() if (device is not None and device.strip()) else None
+    emp_filter = employee.strip() if (employee is not None and employee.strip()) else None
+    dir_filter = None if norm_dir == "any" else norm_dir
+
+    sql = (
+        "SELECT id, jsonl, site, device_serial, serial_no, employee_no, name, "
+        "event_time_utc, event_time_local, tz_offset_min, tz_offset_min_device, "
+        "tz_source, iana_tz, tz_unresolved, tz_ambiguous, tz_nonexistent, "
+        "tz_reason, tz_offset_mismatch, direction, attendance_status, "
+        "direction_source, verify_mode, major, minor, outcome, unknown_code, "
+        "encrypted_person_data, raw, captured_at "
+        "FROM events "
+        "WHERE (? IS NULL OR site = ?) "
+        "AND (? IS NULL OR device_serial = ?) "
+        "AND (? IS NULL OR employee_no = ?) "
+        "AND (? IS NULL OR event_time_utc >= ?) "
+        "AND (? IS NULL OR event_time_utc <= ?) "
+        "AND (? IS NULL OR direction = ?) "
+        "ORDER BY event_time_utc ASC, serial_no ASC, id ASC"
+    )
+    params: list[Any] = [
+        site_filter,
+        site_filter,
+        device_filter,
+        device_filter,
+        emp_filter,
+        emp_filter,
+        since_utc,
+        since_utc,
+        until_utc,
+        until_utc,
+        dir_filter,
+        dir_filter,
+    ]
+
+    columns = SCAN_EXPORT_REDACTED_COLUMNS if redact else SCAN_EXPORT_COLUMNS
+
+    def _stream_into(writer_stream: TextIO) -> int:
+        count = 0
+        if norm_fmt == "csv" and bom:
+            writer_stream.write("\ufeff")
+        csv_writer = csv.writer(writer_stream, lineterminator="\n") if norm_fmt == "csv" else None
+        if csv_writer is not None:
+            csv_writer.writerow(columns)
+
+        conn = sqlite3.connect(str(resolved_db))
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = _open_scan_cursor(conn, sql, params)
+            for batch in _iter_scan_chunks(cursor):
+                if csv_writer is not None:
+                    for row in batch:
+                        csv_writer.writerow(
+                            _scan_row_to_csv_cells(row, columns=columns, redact=redact)
+                        )
+                        count += 1
+                else:
+                    chunk_lines = [_scan_row_to_jsonl_line(row, redact=redact) for row in batch]
+                    writer_stream.write("\n".join(chunk_lines) + "\n")
+                    count += len(batch)
+                writer_stream.flush()
+        finally:
+            conn.close()
+        return count
+
+    if output_path is not None:
+        out_file = Path(output_path)
+        try:
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            with out_file.open("w", encoding="utf-8", newline="") as fh:
+                total = _stream_into(fh)
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot write scan export file {out_file}: {exc.strerror or exc}"
+            ) from exc
+        return total, f"wrote {total} scan row(s) to {out_file}"
+
+    target_stream = sys.stdout if dest_stream is None else dest_stream
+    total = _stream_into(target_stream)
+    return total, ""
