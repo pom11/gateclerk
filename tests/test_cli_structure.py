@@ -37,10 +37,17 @@ import pytest
 SRC = Path(__file__).resolve().parents[1] / "src" / "gateclerk"
 
 #: Modules the split created. These are the ones the import law binds.
-SPLIT_MODULES = ("cli_shared.py", "agent_cmds.py", "sink_cmds.py", "demo_cmds.py", "export_cmds.py")
+SPLIT_MODULES = (
+    "cli_shared.py",
+    "agent_cmds.py",
+    "sink_cmds.py",
+    "demo_cmds.py",
+    "export_cmds.py",
+    "status_cmds.py",
+)
 
 #: Precedent modules that were already CLI-surface-adjacent and must not gain a back-edge.
-NEIGHBOUR_MODULES = ("sink_cli.py", "demo_device.py", "export_cli.py")
+NEIGHBOUR_MODULES = ("sink_cli.py", "demo_device.py", "export_cli.py", "status_cli.py")
 
 #: Group declarations that must NOT reappear in cli.py (they live in the cmd modules now).
 MOVED_GROUPS = (
@@ -50,6 +57,7 @@ MOVED_GROUPS = (
     "demo_app",
     "demo_device_app",
     "export_app",
+    "status_app",
 )
 
 
@@ -124,6 +132,7 @@ def test_each_moved_group_is_registered_from_its_module() -> None:
         ("sink_cmds.py", "sink_app"),
         ("demo_cmds.py", "demo_app"),
         ("export_cmds.py", "export_app"),
+        ("status_cmds.py", "status_app"),
     ):
         text = (SRC / module).read_text(encoding="utf-8")
         assert "def register(app: typer.Typer) -> None:" in text, module
@@ -134,6 +143,7 @@ def test_each_moved_group_is_registered_from_its_module() -> None:
         "sink_cmds.register(app)",
         "demo_cmds.register(app)",
         "export_cmds.register(app)",
+        "status_cmds.register(app)",
     ):
         assert call in cli_text, call
 

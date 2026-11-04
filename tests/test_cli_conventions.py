@@ -134,6 +134,7 @@ EXPECTED_LEAVES: set[str] = {
     "sink list",
     "sink remove",
     "sink test",
+    "status",
     "users list",
 }
 
@@ -163,8 +164,8 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 29 = 28 after EXPORT-CONFIG, plus EXPORT-SCANS's `export scans`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 29
+    # 30 = 29 after EXPORT-SCANS, plus CLI-STATUS's `status`.
+    assert len(leaves) == len(EXPECTED_LEAVES) == 30
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
@@ -228,6 +229,7 @@ READ_ONLY_LEAVES: tuple[tuple[str, ...], ...] = (
     ("creds", "explain"),
     ("sink", "list"),
     ("sink", "test"),
+    ("status",),
     ("agent", "deadletter", "list"),
     ("demo", "device", "urls"),
 )
