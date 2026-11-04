@@ -275,7 +275,7 @@ def default_device_prober(
     `IsapiAuthError`, or `IsapiError` on failure.
     """
     from gateclerk.capabilities import device_identity
-    from gateclerk.isapi import IsapiClient
+    from gateclerk.isapi_transport import IsapiClient
     from gateclerk.tz import read_system_time
 
     target = site.target()
