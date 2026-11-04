@@ -271,24 +271,38 @@ def default_device_prober(
 ) -> tuple[str, float | None]:
     """Read-only probe of `System/deviceInfo` and `System/time` (`trust_env=False` / NO_PROXY).
 
+    THE REAL PATH — the one every `doctor` test used to replace with a lambda, which is
+    why it shipped calling an API that does not exist (`IsapiClient(port=..., credentials=
+    ...)`, `client.get_xml(...)`, `device_identity(client)`). It now speaks the same
+    sanctioned surface as every other read command: `cli_shared._client_for`'s ctor shape
+    (registry names in, dicts out — no paths, no verbs) and `pipeline`'s device reads, so
+    a device that answers the CLI answers the doctor. Exactly two GETs, both in the
+    read-only registry: `device_info` and `system_time`. Nothing is written, no service is
+    restarted, no secret is printed (the summary carries model + serial only).
+
     Returns `(device_summary, skew_seconds)`. Raises `CredentialUnavailable`,
     `IsapiAuthError`, or `IsapiError` on failure.
     """
-    from gateclerk.capabilities import device_identity
+    from gateclerk import pipeline
     from gateclerk.isapi_transport import IsapiClient
-    from gateclerk.tz import read_system_time
 
     target = site.target()
-    provider = cfg.credential_provider(target, env=env)
-    with IsapiClient(
-        site.host,
-        port=site.port,
-        credentials=provider,
-        timeout_s=site.timeout_s,
-    ) as client:
-        ident = device_identity(client)
-        raw_time = client.get_xml("/ISAPI/System/time")
-        dev_time = read_system_time(raw_time)
+    # The credential resolves through the SAME ladder every command uses (flag-less here:
+    # env > keychain > file). Resolving before the socket opens keeps a missing credential
+    # a `CredentialUnavailable` (config exit 2) instead of surfacing later as an auth 401.
+    creds = cfg.resolve_credentials(target, env=env)
+    client = IsapiClient(
+        f"http://{target.host}:{target.port}",
+        creds.user,
+        creds.password.reveal(),
+        read_timeout=site.timeout_s,
+        trust_env=False,
+    )
+    try:
+        serial, _firmware, model = pipeline.read_device_identity(client)
+        dev_time, _raw = pipeline.device_time_reading(client)
+    finally:
+        client.close()
 
     tz_name = site.device_tz or site.iana_tz or DEFAULT_SITE_TZ
     skew = compute_skew(
@@ -297,7 +311,7 @@ def default_device_prober(
         site_tz=tz_name,
         warn_seconds=SKEW_WARN_SECONDS,
     )
-    summary = f"model={ident.model or '?'} serial={ident.serial_no or '?'}"
+    summary = f"model={model or '?'} serial={serial or '?'}"
     return summary, skew.skew_seconds
 
 

@@ -312,20 +312,80 @@ def _client_for(
     timeout: float,
     output: OutputFormat,
     logger: RequestLogger | None = None,
+    trust_env: bool = True,
 ) -> Any:
-    """Build the read-only client for one device, wrapped for logging when asked."""
+    """Build the read-only client for one device, wrapped for logging when asked.
+
+    `trust_env` keeps httpx's default (True) for ordinary read commands — the posture
+    demo_walkthrough.py:747 documents as deliberate — while a caller with a LAN-local
+    NO_PROXY law (doctor's device probe) opts out explicitly, so a proxy the operator's
+    shell exports can never make a healthy device read as "unreachable".
+    """
     try:
         client = IsapiClient(
             f"http://{target.host}:{target.port}",
             creds.user,
             creds.password.reveal(),
             read_timeout=timeout,
+            trust_env=trust_env,
         )
     except (ValueError, httpx.InvalidURL) as exc:
         raise _config_exit(output, str(exc)) from exc
     if logger is None:
         return client
     return pipeline.LoggedClient(client, logger)
+
+
+def default_device_prober(
+    site: cfg.SiteConfig,
+    *,
+    env: Mapping[str, str] | None = None,
+    now: datetime | None = None,
+) -> tuple[str, float | None]:
+    """Probe one site through THE SAME client the read commands build (`_client_for`).
+
+    The sanctioned seam `gateclerk doctor --probe` reaches for: `doctor_cli`'s own
+    `default_device_prober` builds its client directly, and this one builds it through
+    `_client_for`, so the check exercises the factory every read command shares instead
+    of a parallel construction that can drift from it (which is exactly how #79's
+    TypeError survived a green suite). Two read-only GETs (`device_info`, `system_time`),
+    one credential resolve, no writes, no restart, no secret in the summary.
+    """
+    from gateclerk import pipeline
+
+    target = site.target()
+    creds = _resolve_creds_plain(target, env=env)
+    client = _client_for(target, creds, timeout=site.timeout_s, output=OutputFormat.TABLE)
+    try:
+        serial, _firmware, model = pipeline.read_device_identity(client)
+        dev_time, _raw = pipeline.device_time_reading(client)
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
+
+    from gateclerk.tz import DEFAULT_SITE_TZ, SKEW_WARN_SECONDS, compute_skew
+
+    tz_name = site.device_tz or site.iana_tz or DEFAULT_SITE_TZ
+    skew = compute_skew(
+        dev_time,
+        our_now=now or datetime.now(UTC),
+        site_tz=tz_name,
+        warn_seconds=SKEW_WARN_SECONDS,
+    )
+    return f"model={model or '?'} serial={serial or '?'}", skew.skew_seconds
+
+
+def _resolve_creds_plain(
+    target: cfg.DeviceTarget, *, env: Mapping[str, str] | None = None
+) -> cfg.Credentials:
+    """Resolve credentials WITHOUT converting to an exit — the prober maps errors itself.
+
+    `_resolve_creds` raises `Exit`; a device prober must hand the doctor's own section
+    mapper a `CredentialUnavailable` so the row reads "cannot probe device (credentials
+    unavailable)", not a bare exit-2 with no section.
+    """
+    return resolve_credentials(target, env=env)
 
 
 def _iso(value: datetime | None) -> str | None:

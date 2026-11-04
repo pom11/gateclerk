@@ -42,12 +42,30 @@ def doctor_screen(
     config: AgentConfigOpt = None,
     state_root: AgentStateRootOpt = None,
     site: DoctorSiteOpt = None,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe",
+            help="Probe the device through the SAME client factory the read commands build "
+            "(cli_shared._client_for) instead of doctor's own construction. Read-only: "
+            "the same two GETs (deviceInfo + System/time), nothing written, no restart.",
+        ),
+    ] = False,
 ) -> None:
     """Run the read-only self-check across configured sites and exit with the worst failure code."""
+    prober = None
+    if probe:
+        # Imported here, not at module top: `doctor_cmds` must not grow an import edge that
+        # pulls the whole read-command surface into `doctor --help`'s cold start, and the
+        # one-way law tests/test_cli_structure.py pins stays exactly as it is.
+        from gateclerk import cli_shared
+
+        prober = cli_shared.default_device_prober
     rows, code = doctor_cli.run_doctor(
         config_path=config or cfg.DEFAULT_SITES_FILE,
         site=site,
         state_root=state_root,
+        device_prober=prober,
     )
     render(
         [r.as_dict() for r in rows],
