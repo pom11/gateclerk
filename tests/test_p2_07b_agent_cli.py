@@ -57,6 +57,13 @@ from gateclerk.cli import AUTH_TERMINAL_EXIT, CONFIG_ERROR_EXIT, app
 from gateclerk.config import ConfigSurface, site_from_args
 from gateclerk.endpoints import REGISTRY
 from gateclerk.isapi_transport import IsapiClient
+
+# CLI-SPLIT-STRUCTURE: the ONE hand-maintained leaf set lives in test_cli_conventions
+# (`EXPECTED_LEAVES`, with its len-pin + symmetric-difference message). The surface pins
+# below DERIVE from it instead of keeping a second literal tree — four cards in a row had
+# to hand-edit both. Importing it is also the drift channel: a rename that bumps the one
+# set re-derives everything here.
+from test_cli_conventions import EXPECTED_LEAVES
 from test_p2_03_scheduler import (
     AC_CAPS_PATH,
     ACS_CAPS_PATH,
@@ -856,22 +863,27 @@ def test_queue_step_never_reenqueues_a_dead_lettered_event(
 # --- DoD (4): the existing CLI surface is untouched ------------------------------------------
 
 
-#: The command tree exactly as it was at 89e10d1 (pre-P2-07b main), written out longhand so a
-#: rename, a removal or a silently added command fails here rather than in an operator's shell.
+#: The command tree exactly as it was at 89e10d1 (pre-P2-07b main).
+#:
+#: CLI-SPLIT-STRUCTURE (operator instruction): this used to be a SECOND hand-maintained
+#: leaf tree, and four cards in a row had to hand-edit both it and
+#: `test_cli_conventions.EXPECTED_LEAVES` on every surface change. There is now ONE
+#: authoritative hand-maintained set — `EXPECTED_LEAVES` — and this dict is DERIVED from
+#: it: take the four p1-08-era heads (`device`, `users`, `creds`, `events`), keep each
+#: leaf that belongs to one, and subtract the per-group additions a later card explicitly
+#: authorized (below). The drift property PREVIOUS_SURFACE exists for is preserved, not
+#: weakened: a rename/removal no card admits fails the `EXPECTED_LEAVES`
+#: symmetric-difference + len pin first, and an honest bump of that one set re-derives
+#: this dict — one reviewable edit where there used to be two coordinated ones.
 #:
 #: CLI-VERBS-HELP moved two entries to the canonical verb spelling — `creds check` ->
 #: `creds test`, `deadletter delete` -> `deadletter remove` (docs/CLI-CONVENTIONS.md). The
-#: sets below are the DECLARED surface, which is one spelling per operation on purpose: the
+#: sets are the DECLARED surface, which is one spelling per operation on purpose: the
 #: superseded spellings resolve through `cli_conventions.ALIASES` in `Group.get_command`
 #: and are deliberately absent from `Group.commands`, so they neither show in `--help` nor
 #: widen this allow-list. `test_superseded_verb_spellings_still_execute` is what pins that
 #: the old commands still RUN; this dict is what pins that nothing else appeared.
-PREVIOUS_SURFACE: dict[str, Any] = {
-    "device": {"info", "time", "capabilities"},
-    "users": {"list"},
-    "creds": {"test", "explain"},
-    "events": None,  # a command, not a group (p1-08's naming decision)
-}
+_HISTORICAL_HEADS: tuple[str, ...] = ("device", "users", "creds", "events")
 
 #: Commands CREDSTORE-LINUX added to an EXISTING group, with the card that authorized each.
 #: A dict of additions rather than a widened `PREVIOUS_SURFACE` entry on purpose: the entry
@@ -886,6 +898,44 @@ PREVIOUS_SURFACE: dict[str, Any] = {
 AUTHORISED_GROUP_ADDITIONS: dict[str, set[str]] = {
     "creds": {"set", "get", "remove"},
 }
+
+
+def _derived_previous_surface() -> dict[str, Any]:
+    """Project the historical four-head tree out of the authoritative `EXPECTED_LEAVES`."""
+    out: dict[str, Any] = {}
+    for leaf in EXPECTED_LEAVES:
+        parts = leaf.split(" ")
+        head = parts[0]
+        if head not in _HISTORICAL_HEADS:
+            continue
+        if head == "events":
+            out[head] = None  # a command, not a group (p1-08's naming decision)
+            continue
+        if len(parts) >= 2 and parts[-1] in AUTHORISED_GROUP_ADDITIONS.get(head, set()):
+            continue  # an authorized later addition, not part of the historical shape
+        out.setdefault(head, set()).add(parts[-1])
+    return out
+
+
+PREVIOUS_SURFACE: dict[str, Any] = _derived_previous_surface()
+
+
+def _derived_children(head: str) -> set[str]:
+    """Direct child command names `EXPECTED_LEAVES` declares under `head`."""
+    return {
+        parts[1]
+        for leaf in EXPECTED_LEAVES
+        if (parts := leaf.split(" ")) and parts[0] == head and len(parts) >= 2
+    }
+
+
+def _derived_subgroup_children(head: str, child: str) -> set[str]:
+    """Grandchild command names `EXPECTED_LEAVES` declares under `head child`."""
+    return {
+        parts[2]
+        for leaf in EXPECTED_LEAVES
+        if (parts := leaf.split(" ")) and len(parts) == 3 and parts[:2] == [head, child]
+    }
 
 
 def _tree() -> dict[str, Any]:
@@ -929,26 +979,32 @@ def test_existing_cli_surface_is_unchanged_and_agent_is_the_only_addition() -> N
     # above, and each group's own shape is pinned by its own test
     # (test_migrate_group_shape_is_the_section7_surface,
     # tests/test_sinks_cli.py::test_sink_group_exposes_exactly_the_four_commands).
-    assert set(tree) - set(PREVIOUS_SURFACE) == {"agent", "migrate", "demo", "sink"}, (
-        f"unexpected commands: {set(tree)}"
-    )
+    #
+    # CLI-SPLIT-STRUCTURE: the allowed-extra set is DERIVED from `EXPECTED_LEAVES` (every
+    # head that is not one of the four historical ones), so adding a group bumps the one
+    # authoritative set and this allowance follows — instead of a fifth literal to edit.
+    # An UNANNOUNCED command still fails, because it has to enter `EXPECTED_LEAVES` first
+    # (test_every_leaf_command_declares_output_json compares the live walk against it).
+    assert set(tree) - set(PREVIOUS_SURFACE) == (
+        {leaf.split(" ")[0] for leaf in EXPECTED_LEAVES} - set(_HISTORICAL_HEADS)
+    ), f"unexpected commands: {set(tree)}"
 
 
 def test_migrate_group_shape_is_the_section7_surface() -> None:
-    """E1-07's §7 commands, and no sixth smuggled in."""
-    assert _tree()["migrate"] == {"probe", "export", "diff", "apply", "undo"}
+    """E1-07's §7 commands, and no sixth smuggled in (derived from the one leaf set)."""
+    assert _tree()["migrate"] == _derived_children("migrate")
 
 
 def test_agent_group_shape_is_run_ack_deadletter() -> None:
-    """The three commands the card names, and no fourth smuggled in."""
-    assert _tree()["agent"] == {"run", "ack", "deadletter"}
+    """The three commands the card names, and no fourth smuggled in (derived likewise)."""
+    assert _tree()["agent"] == _derived_children("agent")
     import typer
 
     deadletter = typer.main.get_command(app).commands["agent"].commands["deadletter"]
     # CLI-VERBS-HELP: `delete` is now the hidden alias and `remove` the declared command
     # (docs/CLI-CONVENTIONS.md). The declared set stays exactly two entries — the alias is
     # resolved in `get_command` and never enters `Group.commands`.
-    assert set(deadletter.commands) == {"list", "remove"}
+    assert set(deadletter.commands) == _derived_subgroup_children("agent", "deadletter")
 
 
 def test_agent_run_requires_a_site_and_cannot_be_pointed_at_a_host() -> None:
