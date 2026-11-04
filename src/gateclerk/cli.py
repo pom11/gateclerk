@@ -48,6 +48,7 @@ from gateclerk import (
     export_cmds,
     pipeline,
     sink_cmds,
+    status_cmds,
 )
 from gateclerk import config as cfg
 from gateclerk.capabilities import device_identity
@@ -2208,6 +2209,7 @@ def migrate_undo(
 sink_cmds.register(app)  # the `sink` group (SINKS-CLI), moved out of this file
 demo_cmds.register(app)  # the `demo` group, moved out of this file
 export_cmds.register(app)  # the `export` group (EXPORT-CONFIG / EXPORT-SCANS)
+status_cmds.register(app)  # `gateclerk status` (CLI-STATUS)
 
 # --- `gateclerk init` — the group lives in gateclerk.init_cli, and so does every handler ---------
 #
