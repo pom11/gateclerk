@@ -139,7 +139,9 @@ lookup.
 
 Mutation check (why these arms are not decoration): checking out `main`'s
 `doctor_cli.py` over the fix makes **7 of the 15 fail**; the fix restored, 15/15 pass. The
-offline suite at large is 2539 passed / 5 skipped (the pre-existing baseline plus these 15),
-`ruff check` + `ruff format --check` clean, `tests/test_public_audit.py` green (no LAN
+offline suite at large is 2523 passed / 5 skipped on `origin/main` (measured on a throwaway
+worktree) → **2539 passed / 5 skipped** on this branch: the 15 arms plus one new parameter of
+the existing per-file hygiene scan, nothing else moved. `ruff check` + `ruff format --check`
+clean, `tests/test_public_audit.py` green (no LAN
 addresses, serials, legacy names or attribution lines in any tracked file — the real values
 appear only in this report as `[REDACTED-*]`).
