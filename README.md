@@ -105,7 +105,7 @@ answering with no re-typing.
 `--credentials-file`; the literal `off`/`none`/empty disables the rung) holds
 `{"refs": {"<name>": "<value>"}}`.
 
-**Mode `0600` is required, not preferred.** Gateclerk refuses to *read* or *write* the file
+**Mode `0600` is required, not preferred.** GateClerk refuses to *read* or *write* the file
 when any group or other bit is set — the message names the path and the `chmod 600` to run,
 and refuses even on the write path, because augmenting a leaky store is itself a leak. The
 invariant is "owner-only", so `0700` is accepted; the directory is likewise `0700`. Writes

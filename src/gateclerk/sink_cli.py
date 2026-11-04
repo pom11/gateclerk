@@ -1060,7 +1060,7 @@ def probe_sink(
     fake employee into a payroll archive, and the ingest's idempotency key is a fingerprint
     of the payload, so a second probe with the same fake line would be *replayed* and the
     test would report a success nobody earned. An empty batch still exercises the URL, TLS,
-    the bearer, `Content-Type: application/jsonl` and the `X-Gateclerk-Site` confirmation —
+    the bearer, `Content-Type: application/jsonl` and the `X-GateClerk-Site` confirmation —
     which is everything the operator got wrong when the sink was configured.
 
     A file sink is probed by creating `<path>.probe` with `xb` (exclusive) then removing it:

@@ -42,9 +42,10 @@ Parsing only: nothing here touches the network. `read_system_time()` takes the b
 — OBSERVED.md endpoint table) so the caller owns the transport.
 
 The XML safety guard is NOT owned here: `parse_isapi_xml` is imported from
-`gateclerk.isapi_response` (p1-03, merged as 5df152b) and re-exported so `gateclerk.tz.parse_isapi_xml`
-keeps working for existing callers. One package = one XML security policy; the size cap and
-the whole-payload DTD/entity refusal live in that module and its tests.
+`gateclerk.isapi_response` (p1-03, merged as 5df152b) and re-exported so
+`gateclerk.tz.parse_isapi_xml` keeps working for existing callers. One package = one XML
+security policy; the size cap and the whole-payload DTD/entity refusal live in that module
+and its tests.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from gateclerk.exceptions import IsapiPayloadError, GateclerkError
+from gateclerk.exceptions import GateClerkError, IsapiPayloadError
 from gateclerk.isapi_response import parse_isapi_xml
 
 __all__ = [
@@ -96,7 +97,7 @@ SKEW_WARN_SECONDS = 120.0
 #: instant is UTC — is visible at each call site.
 
 
-class TimestampInputError(GateclerkError):
+class TimestampInputError(GateClerkError):
     """A `--since`/`--until` value the operator typed that we cannot interpret."""
 
 

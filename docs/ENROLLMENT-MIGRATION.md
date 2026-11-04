@@ -498,7 +498,7 @@ Findings (filed on card E1-08, fixes = small cards):
     through the CLI paging at maxResults=30) — noted, not a defect.
 2c. **the journal's repo-out refusal disagreed with itself across commands** — found
     while auditing `t_0d635ee2`'s callers: `migrate_write._refuse_repo_path` raised a
-    bare `JournalError` (a plain `GateclerkError`), so `undo` mapped the refusal to exit 2
+    bare `JournalError` (a plain `GateClerkError`), so `undo` mapped the refusal to exit 2
     through its own try/except while `apply --apply` — where journals open inside the
     composer, under `_Guard`/`_fail` — landed it on exit 4, the DEVICE class ("the box
     said no") for a run that never contacted a box.

@@ -519,7 +519,7 @@ def build_https_sink_transport(
 
     A sink's extra `headers` ride on the request through a thin wrapper rather than by editing
     the transport: the two headers the wire contract owns (`Authorization`,
-    `X-Gateclerk-Site`) stay the transport's, and `token_available` passes through so the
+    `X-GateClerk-Site`) stay the transport's, and `token_available` passes through so the
     agent's "no token -> skip this cycle, keep the rows queued" law still applies.
     """
     from gateclerk.agent_push import https_transport

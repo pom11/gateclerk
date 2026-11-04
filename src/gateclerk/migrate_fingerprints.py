@@ -70,7 +70,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from gateclerk.exceptions import GateclerkError
+from gateclerk.exceptions import GateClerkError
 from gateclerk.migrate_bundle import (
     FingerprintIndex,
     FingerprintTemplate,
@@ -199,7 +199,7 @@ FP_CAPACITY_WORDS: frozenset[str] = frozenset({"noFP", "notSupport"})
 # --- errors -------------------------------------------------------------------------------
 
 
-class FpShapeError(GateclerkError):
+class FpShapeError(GateClerkError):
     """We were asked to build a FingerPrintDownload body the capture does not authorise.
 
     Raised before any request leaves the process (§9: a shape absent from the fixtures
@@ -207,7 +207,7 @@ class FpShapeError(GateclerkError):
     """
 
 
-class FpReadError(GateclerkError):
+class FpReadError(GateClerkError):
     """A one-shot FP read answered something this card has no device truth for.
 
     §0.7: a failed or unrecognised read is an ERROR, never "the person has no finger".
@@ -218,7 +218,7 @@ class FpReadError(GateclerkError):
     """
 
 
-class FpAbortedError(GateclerkError):
+class FpAbortedError(GateClerkError):
     """The FP phase aborted. Carries the result so the caller can print what landed.
 
     §5 step 4: never a silent partial write. The abort reason is always either a device

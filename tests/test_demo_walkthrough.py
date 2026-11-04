@@ -217,7 +217,7 @@ def test_demo_csv_carries_the_frozen_columns_verbatim(
 
 
 def test_demo_mock_sink_sees_the_contract_headers(scratch_root: Path, socket_allow: None) -> None:
-    """`Authorization` PRESENCE (never the value), `X-Gateclerk-Site`, `application/jsonl`."""
+    """`Authorization` PRESENCE (never the value), `X-GateClerk-Site`, `application/jsonl`."""
     report = _run_inprocess(scratch_root).report
     assert report.batches, "the mock ingest received nothing"
     for batch in report.batches:

@@ -53,8 +53,8 @@ from gateclerk.capabilities import device_identity
 from gateclerk.endpoints import SEARCH_ENDPOINTS
 from gateclerk.exceptions import (
     EnrollmentReadAborted,
+    GateClerkError,
     IsapiError,
-    GateclerkError,
 )
 from gateclerk.migrate_bundle import (
     PHOTO_BYTES_ABSENT_REASON,
@@ -248,12 +248,12 @@ def _walk(
             records.extend(dict(record) for record in page.records)
     except EnrollmentReadAborted:
         raise
-    except GateclerkError as exc:
+    except GateClerkError as exc:
         # Every typed device/paging failure (IsapiError, SearchProtocolError,
         # SearchRunawayError, IsapiPayloadError…) funnels into one export-abort type
         # with the original as `cause`: callers (E1-07 CLI) map one exception to
         # "exit 4, no bundle", and the specific reason stays inspectable. Catching
-        # the whole GateclerkError family is deliberate — the fail-closed rule is "ANY
+        # the whole GateClerkError family is deliberate — the fail-closed rule is "ANY
         # device/paging failure aborts", and an allowlist of error classes would fail
         # OPEN the day a new typed error appears.
         raise _abort(endpoint, str(exc), cause=exc) from exc
@@ -590,7 +590,7 @@ def export_fingerprints(
         last_seen = pacing_clock()
         try:
             response = read(body)
-        except GateclerkError as exc:
+        except GateClerkError as exc:
             # Includes the 400 MessageParametersLack family: if the wrapper we
             # send stops being accepted, that is a protocol break, not "no FP".
             raise _abort(

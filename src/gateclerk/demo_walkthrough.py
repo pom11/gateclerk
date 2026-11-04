@@ -21,7 +21,7 @@ Real (the whole point — a demo of a fake path teaches nothing):
   `CSV_COLUMNS` header, the production fsync-then-mark-acked law;
 * the https leg is `agent_push.HttpsIngestTransport` built by
   `sink_writers.build_https_sink_transport` — the production bearer transport, so the
-  `Authorization` / `X-Gateclerk-Site` / `Content-Type: application/jsonl` contract the
+  `Authorization` / `X-GateClerk-Site` / `Content-Type: application/jsonl` contract the
   demo prints is the contract that runs against the real ingest.
 
 Staged (and loud about it):
@@ -186,7 +186,7 @@ class ReceivedBatch:
         auth = "present" if self.authorization_present else "MISSING"
         return (
             f"  batch  lines={self.lines}  Authorization={auth}  "
-            f"X-Gateclerk-Site={self.gateclerk_site or '-'}  "
+            f"X-GateClerk-Site={self.gateclerk_site or '-'}  "
             f"Content-Type={self.content_type or '-'}"
         )
 
@@ -229,7 +229,7 @@ class MockIngestSink:
 
     It exists so the demo can SHOW the frozen wire contract instead of describing it: the
     batches arrive through the production `HttpsIngestTransport`, over a real socket, with
-    the real `Authorization` / `X-Gateclerk-Site` / `Content-Type` headers, and the evidence
+    the real `Authorization` / `X-GateClerk-Site` / `Content-Type` headers, and the evidence
     of that is what the developer sees on the terminal.
 
     Loopback-only by construction (the bind host is a module constant, not a parameter),

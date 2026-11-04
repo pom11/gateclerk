@@ -478,7 +478,9 @@ def test_a_torn_line_is_reported_never_guessed(tmp_path: Path) -> None:
             "classification": "add",
         }
     )
-    path.write_text(good + "\n" + '{"schema": "gateclerk-migrate-journal/1", "seq": 2, "st', "utf-8")
+    path.write_text(
+        good + "\n" + '{"schema": "gateclerk-migrate-journal/1", "seq": 2, "st', "utf-8"
+    )
     resumed = WriteJournal.open(path, phase="users")
     assert len(resumed.truncated) == 1
     assert "line 2" in resumed.truncated[0]

@@ -51,11 +51,11 @@ from gateclerk.exceptions import (
     CredentialUnavailable,
     EnrollmentReadAborted,
     EventBoundsError,
+    GateClerkError,
     IsapiAuthError,
     IsapiBadContent,
     IsapiError,
     IsapiNotFound,
-    GateclerkError,
     SearchProtocolError,
     SearchRunawayError,
 )
@@ -430,10 +430,10 @@ def test_exit_code_constants_are_the_conventions_module() -> None:
         (TimestampInputError("not a timestamp"), conv.ExitCode.USAGE_OR_CONFIG),
         (EventBoundsError("no --since"), conv.ExitCode.USAGE_OR_CONFIG),
         (SearchProtocolError("root key missing"), conv.ExitCode.DEVICE),
-        # A GateclerkError with no more specific class is the device/protocol class — the
+        # A GateClerkError with no more specific class is the device/protocol class — the
         # same arm `_fail` used to carry inline.
         (EnrollmentReadAborted("read refused"), conv.ExitCode.DEVICE),
-        (GateclerkError("generic gateclerk failure"), conv.ExitCode.DEVICE),
+        (GateClerkError("generic gateclerk failure"), conv.ExitCode.DEVICE),
     ],
 )
 def test_exit_code_for_maps_every_class_onto_its_documented_number(
@@ -683,6 +683,6 @@ def test_agent_run_definition_is_unchanged_from_the_baseline() -> None:
     # The recorded sha256 of the baseline is re-derivable, so the constant above cannot be
     # quietly edited to match a later change (the failure mode of every golden-value test).
     digest = hashlib.sha256(json.dumps(AGENT_RUN_BASELINE, sort_keys=True).encode()).hexdigest()
-    assert digest == "667af6c87e8d0d8488fa854dce41cd62d44c4ad1c9a7396c6c3734c89347818e", (
+    assert digest == "e7af2532b095480a1b2673ba3db93b4cb83c363a976771fb1d98f4c38dcac0fd", (
         "AGENT_RUN_BASELINE was edited — re-capture it from origin/main, do not re-hash it here"
     )

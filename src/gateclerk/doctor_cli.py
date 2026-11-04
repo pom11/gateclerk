@@ -51,9 +51,9 @@ from gateclerk.cli_conventions import (
 from gateclerk.exceptions import (
     ConfigError,
     CredentialUnavailable,
+    GateClerkError,
     IsapiAuthError,
     IsapiError,
-    GateclerkError,
     redact_b64,
 )
 from gateclerk.tz import DEFAULT_SITE_TZ, SKEW_WARN_SECONDS, compute_skew
@@ -327,7 +327,7 @@ def _check_device_section(
             exit_code=AUTH_TERMINAL_EXIT,
             detail=f"device authentication failed (401 / circuit open): {redact_b64(str(exc))}",
         )
-    except (IsapiError, GateclerkError, OSError) as exc:
+    except (IsapiError, GateClerkError, OSError) as exc:
         return DoctorRow(
             site=site.name,
             section="device",

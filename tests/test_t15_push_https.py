@@ -7,7 +7,7 @@ here invents an endpoint, a header name, or a line shape:
 
   POST <push_target>            Content-Type: application/jsonl
   Authorization: Bearer <per-site ingest token>     401 absent/unknown/revoked
-  X-Gateclerk-Site: <SITE>                            CONFIRMS the token's site only;
+  X-GateClerk-Site: <SITE>                            CONFIRMS the token's site only;
                                                     a contradicting claim is 403
                                                     site_token_mismatch, zero BC traffic
 

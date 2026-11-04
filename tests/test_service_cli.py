@@ -1019,7 +1019,8 @@ def test_platform_defaults_are_derived_from_the_root_they_are_given() -> None:
         == "/etc/systemd/system"
     )
     assert (
-        svc.default_config_path(home=Path("/opt/fake-home")) == "/opt/fake-home/gateclerk/sites.toml"
+        svc.default_config_path(home=Path("/opt/fake-home"))
+        == "/opt/fake-home/gateclerk/sites.toml"
     )
 
 

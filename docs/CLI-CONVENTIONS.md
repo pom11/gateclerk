@@ -90,7 +90,7 @@ Two decisions worth stating plainly:
 Mapping is one function — `cli_conventions.exit_code_for` — and `cli._fail` delegates
 to it, so a command body cannot pick a different number for the same failure. The
 order inside it matters: `IsapiAuthError` *is an* `IsapiError`, and the search errors
-*are* `GateclerkError`s, so specific classes are tested before general ones.
+*are* `GateClerkError`s, so specific classes are tested before general ones.
 
 ## `-o json`
 
@@ -125,7 +125,7 @@ prints the pair, which is what `README.md` documents copying into `sites.toml`.
 
 1. Take `output: OutputOpt = OutputFormat.TABLE` and render through `render(...)` — do
    not print JSON by hand.
-2. Raise a `GateclerkError` subclass; let `_Guard`/`_fail` map it. Do not raise
+2. Raise a `GateClerkError` subclass; let `_Guard`/`_fail` map it. Do not raise
    `typer.Exit(code=N)` with a literal number — add the class to
    `cli_conventions.exit_code_for` instead.
 3. Name it with a verb from the table, or add the verb to the table *and this page* in

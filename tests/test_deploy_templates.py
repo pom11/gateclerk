@@ -544,9 +544,9 @@ def test_readme_documents_the_drop_in_credential_placement(readme: str) -> None:
     placement, all documented. Pinned as *shapes an operator can copy*, not as prose: a
     drop-in whose directory is renamed, or a LoadCredential= line that does not follow the
     §2d naming, both leave an operator with a unit that silently has no credential."""
-    assert "gateclerk-agent@<site>.service.d/" in readme or "gateclerk-agent@.service.d/" in readme, (
-        "the drop-in directory must be named in its real systemd form"
-    )
+    assert (
+        "gateclerk-agent@<site>.service.d/" in readme or "gateclerk-agent@.service.d/" in readme
+    ), "the drop-in directory must be named in its real systemd form"
     assert "LoadCredential=gateclerk-" in readme, "the credential line shape must be shown"
     # ...and at least one fully rendered instance of it, naming site AND host the way
     # credential_ref does, because that is what an operator actually pastes.

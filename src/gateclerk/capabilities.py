@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from gateclerk.exceptions import IsapiError, IsapiNotFound, GateclerkError
+from gateclerk.exceptions import GateClerkError, IsapiError, IsapiNotFound
 from gateclerk.isapi_response import parse_body, parse_isapi_xml, strip_ns
 
 __all__ = [
@@ -587,7 +587,7 @@ def capability_cache() -> CapabilityCache:
     return _capability_cache
 
 
-class CapabilityDiscoveryError(GateclerkError):
+class CapabilityDiscoveryError(GateClerkError):
     """The AcsEvent capability endpoint — the important one — could not be read.
 
     Not a subclass of IsapiError: this is our verdict ("we refuse to guess codes

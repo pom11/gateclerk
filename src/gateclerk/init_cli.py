@@ -62,7 +62,7 @@ import typer
 
 from gateclerk import config as cfg
 from gateclerk.cli_conventions import ExitCode, exit_code_for
-from gateclerk.exceptions import ConfigError, CredentialUnavailable, GateclerkError
+from gateclerk.exceptions import ConfigError, CredentialUnavailable, GateClerkError
 from gateclerk.output import OutputFormat, make_console, render
 from gateclerk.secrets import Secret
 from gateclerk.sink_cli import keychain_item_exists, token_ref_problem
@@ -898,7 +898,7 @@ def init_command(
             timeout_s=plan.site.timeout_s,
             site=plan.site.name,
         )
-    except (InitError, ConfigError, CredentialUnavailable, GateclerkError) as exc:
+    except (InitError, ConfigError, CredentialUnavailable, GateClerkError) as exc:
         raise _classify(output, exc) from exc
     except (ValueError, httpx.InvalidURL) as exc:
         # The pair `_client_for` catches for the same reason: httpx's InvalidURL is NOT a

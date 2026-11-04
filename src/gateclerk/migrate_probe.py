@@ -73,12 +73,12 @@ from typing import Any
 from gateclerk import migrate_bundle
 from gateclerk.capabilities import CapabilityCache, DeviceCapabilities, discover
 from gateclerk.exceptions import (
+    GateClerkError,
     IsapiAuthError,
     IsapiBadContent,
     IsapiError,
     IsapiNotFound,
     IsapiPayloadError,
-    GateclerkError,
 )
 from gateclerk.pipeline import device_time_reading
 from gateclerk.tz import DEFAULT_SITE_TZ, TimestampInputError, compute_skew
@@ -131,7 +131,7 @@ class Verdict(StrEnum):
     ERROR = "error"
 
 
-class ProbeStaleError(GateclerkError):
+class ProbeStaleError(GateClerkError):
     """The freshness gate (§4) refused: no probe, unreadable probe, or too old.
 
     This is the error E1-02 (diff) and E1-04 (apply) see when they call
@@ -140,7 +140,7 @@ class ProbeStaleError(GateclerkError):
     """
 
 
-class ProbeAbortedError(GateclerkError):
+class ProbeAbortedError(GateClerkError):
     """The probe could not run at all (auth refused us). Fail-closed abort (§0.5)."""
 
 
@@ -405,7 +405,7 @@ def probe_device(
             f"refused our credentials ({exc}); not retrying — lockout accounting "
             "(docs/ENROLLMENT-MIGRATION.md §0.5)"
         ) from exc
-    except GateclerkError as exc:
+    except GateClerkError as exc:
         raise ProbeAbortedError(
             f"capability probe aborted: deviceInfo/capabilities unreadable ({exc}); "
             "refusing to size or shape searches by guess"

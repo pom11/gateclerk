@@ -78,7 +78,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from gateclerk.exceptions import ConfigError, GateclerkError
+from gateclerk.exceptions import ConfigError, GateClerkError
 from gateclerk.migrate_bundle import (
     COMPARE_EXEMPT_FIELDS,
     BundleData,
@@ -229,7 +229,7 @@ def _monotonic() -> float:
 # --- errors -------------------------------------------------------------------------------
 
 
-class JournalError(GateclerkError):
+class JournalError(GateClerkError):
     """The journal could not be opened, appended, or replayed.
 
     A journal we cannot trust is a run we must not start: an entry that may be lost to
@@ -244,7 +244,7 @@ class JournalRepoOutError(JournalError, ConfigError):
     the journal/run root under a repo is the operator's unusable input — the run never
     touched a device — so it belongs on p1-08's config class (exit 2) and `cli._fail`'s
     ONE documented mapping converts it there. Before this class the guard raised a bare
-    `JournalError`, and `_fail`'s catch-all `GateclerkError` arm filed it under exit 4
+    `JournalError`, and `_fail`'s catch-all `GateClerkError` arm filed it under exit 4
     ("the box said no") on the `apply --apply` path while `undo`'s own try/except mapped
     the identical refusal to exit 2 — two commands, one refusal, two exit codes.
 
@@ -258,7 +258,7 @@ class JournalRepoOutError(JournalError, ConfigError):
     """
 
 
-class WriteShapeError(GateclerkError):
+class WriteShapeError(GateClerkError):
     """We were asked to build a write body the capture does not authorise.
 
     Raised BEFORE any request: a shape absent from the fixtures has no device truth, so
@@ -266,7 +266,7 @@ class WriteShapeError(GateclerkError):
     """
 
 
-class WriteRejectedError(GateclerkError):
+class WriteRejectedError(GateClerkError):
     """The device answered a write with a non-OK envelope.
 
     Carries the envelope's own words so the journal and the report name the reason
@@ -320,7 +320,7 @@ class RejectKind(StrEnum):
     TEMPLATE_REJECTED = "template_rejected"
 
 
-class WriteAbortedError(GateclerkError):
+class WriteAbortedError(GateClerkError):
     """A write phase aborted: nothing further may be written until a human reads why.
 
     Carries the phase's result object so the caller can still print which records
@@ -336,7 +336,7 @@ class WriteAbortedError(GateclerkError):
         super().__init__(message)
 
 
-class ApplyAbortedError(GateclerkError):
+class ApplyAbortedError(GateClerkError):
     """The apply refused to start or continue (stale probe, clock skew, drifted plan).
 
     §5 step 1 and §4's freshness contract: an unverified target, a stale probe, or a
@@ -344,7 +344,7 @@ class ApplyAbortedError(GateclerkError):
     """
 
 
-class VerifyAbortedError(GateclerkError):
+class VerifyAbortedError(GateClerkError):
     """The verify read itself failed. §0.7: a failed read is never read as "missing".
 
     Verdicts come from records the device actually returned. When the read errored —
@@ -353,7 +353,7 @@ class VerifyAbortedError(GateclerkError):
     """
 
 
-class TransportClosedError(GateclerkError):
+class TransportClosedError(GateClerkError):
     """A closed (re-bootstrapped) transport was used again — a budget bookkeeping bug.
 
     Silence here would let a phase keep writing on a client whose budget was already
@@ -772,7 +772,7 @@ def _refuse_repo_path(path: Path) -> None:
     Raises the CONFIG-class subclass (card t_cf2ad3c5): pointing `--run-dir` (or the
     bundles root the run dir derives from) under a repo is unusable operator input —
     no device was contacted — so `apply --apply` must exit 2 like `undo` already did,
-    not 4 through `_fail`'s bare-GateclerkError arm.
+    not 4 through `_fail`'s bare-GateClerkError arm.
     """
     resolved = Path(path).resolve()
     root = repo_root(start=resolved.parent if resolved.parent.exists() else None)

@@ -24,13 +24,13 @@ from fakedevice import (
 )
 from gateclerk.endpoints import REGISTRY, SEARCH_ENDPOINTS
 from gateclerk.exceptions import (
+    GateClerkError,
     IsapiAuthError,
     IsapiBadContent,
     IsapiBusy,
     IsapiError,
     IsapiLocalNetworkError,
     IsapiNotFound,
-    GateclerkError,
 )
 from gateclerk.isapi_transport import (
     DEFAULT_CONNECT_TIMEOUT,
@@ -356,7 +356,7 @@ def test_unicode_error_is_not_a_transport_error() -> None:
 
 def test_host_that_cannot_be_idna_encoded_becomes_isapi_error_not_a_crash() -> None:
     """The reviewer's `.localhost`: a UnicodeError out of the socket layer must arrive as
-    a typed IsapiError, so `except GateclerkError` in the CLI can map it to an exit code."""
+    a typed IsapiError, so `except GateClerkError` in the CLI can map it to an exit code."""
     device = FakeDevice()
     err = UnicodeError("label empty or too long")
     device.add_raw("GET", DEVICE_INFO, err, err)  # twice: proves it is not retried
@@ -364,7 +364,7 @@ def test_host_that_cannot_be_idna_encoded_becomes_isapi_error_not_a_crash() -> N
     with pytest.raises(IsapiError, match="failed before it left the process") as raised:
         client.get("device_info")
     assert "label empty or too long" in str(raised.value)
-    assert isinstance(raised.value, GateclerkError), "the CLI's except GateclerkError must catch it"
+    assert isinstance(raised.value, GateClerkError), "the CLI's except GateClerkError must catch it"
 
 
 def test_invalid_idna_a_label_is_wrapped_too() -> None:
@@ -645,14 +645,14 @@ def test_notsupport_surfaces_as_not_found() -> None:
 
 def test_client_cannot_issue_a_write_even_if_asked() -> None:
     """The registry is closed, and the client double-checks: asking to POST a GET-only
-    endpoint (or GET a POST-only one) is a hard GateclerkError BEFORE any request."""
+    endpoint (or GET a POST-only one) is a hard GateClerkError BEFORE any request."""
     from gateclerk.endpoints import HttpMethod
 
     device = FakeDevice()
     client = make_client(device)
-    with pytest.raises(GateclerkError, match="registered as GET"):
+    with pytest.raises(GateClerkError, match="registered as GET"):
         client._call("user_info_count", HttpMethod.POST, payload={})
-    with pytest.raises(GateclerkError, match="registered as POST"):
+    with pytest.raises(GateClerkError, match="registered as POST"):
         client.get("acs_event_search")
     assert device.served == [], "refused calls must never reach the transport"
 
@@ -718,7 +718,7 @@ def test_shared_client_refuses_a_second_thread() -> None:
     thread = threading.Thread(target=intruder)
     thread.start()
     thread.join()
-    assert len(errors) == 1 and isinstance(errors[0], GateclerkError)
+    assert len(errors) == 1 and isinstance(errors[0], GateClerkError)
     assert "thread" in str(errors[0])
     # The guard refused BEFORE the transport: only the owner-thread call was served.
     assert len(device.served) == 2

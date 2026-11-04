@@ -91,7 +91,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from gateclerk.exceptions import GateclerkError
+from gateclerk.exceptions import GateClerkError
 from gateclerk.migrate_bundle import (
     FacesIndex,
     FaceTemplate,
@@ -314,7 +314,7 @@ def reject_kind_for(exc: WriteRejectedError) -> RejectKind:
 # --- errors ---------------------------------------------------------------------------------
 
 
-class FaceShapeError(GateclerkError):
+class FaceShapeError(GateClerkError):
     """Asked to build a face request the capture does not authorise.
 
     Raised before any request leaves the process: a shape absent from the fixtures has no
@@ -322,7 +322,7 @@ class FaceShapeError(GateclerkError):
     """
 
 
-class FaceReadError(GateclerkError):
+class FaceReadError(GateClerkError):
     """A required face read failed or answered a shape this module cannot trust.
 
     §0.7's fail-closed rule pointed at the face axis: a rejected/malformed FDSearch is
@@ -330,7 +330,7 @@ class FaceReadError(GateclerkError):
     """
 
 
-class FacePhaseAbortedError(GateclerkError):
+class FacePhaseAbortedError(GateClerkError):
     """The faces phase aborted: nothing further may be written until a human reads why.
 
     Carries the :class:`FacesPhaseResult` so the caller still reports which persons
@@ -343,7 +343,7 @@ class FacePhaseAbortedError(GateclerkError):
         super().__init__(message)
 
 
-class FaceUndoIncidentError(GateclerkError):
+class FaceUndoIncidentError(GateClerkError):
     """The §5b count-delta guard fired: the delete removed MORE than it was told to.
 
     For faces this is not expected — the captured shape is targeted and bench A verified
