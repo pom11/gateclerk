@@ -45,8 +45,11 @@ contract it embeds:
 * then EVERY key of `model.RECORD_JSON_KEYS`, in the contract's own order. The record
   contract is append-only (renaming a key is a spec discussion), so a reader's column
   index for any named field is stable forever. `raw` is the device dict as JSON text and
-  carries commas and quotes: it is a quoted CSV field and MUST stay the LAST column, so a
-  naive splitter that stops at the first unquoted comma still reads the named fields.
+  carries commas and quotes: it is a quoted CSV field and MUST stay the LAST field that
+  can contain a comma or a quote — the tuple puts `captured_at` after it (`raw` is
+  second-to-last, being record field order with `captured_at` the final EventRecord
+  field), so a naive splitter that stops at the first unquoted comma still reads the
+  named fields.
 
 Backward compat (the law this module exists to obey)
 ----------------------------------------------------
@@ -476,9 +479,12 @@ csv sink columns (stable, append-only, in this order):
   event_id     events.id this line was pushed for (the join back to the store)
   sink_name    which sink wrote the row (attribution without re-reading the config)
   enqueued_at  when the queue buffered it (UTC ISO, seconds) — queue lag vs event time
-  ...then every key of model.RECORD_JSON_KEYS in the contract's own order, `raw` last
-               (raw is the device dict as JSON text: quoted, and last so a naive
-               splitter still reads every named field before it reaches it)
+  ...then every key of model.RECORD_JSON_KEYS in the contract's own order, ending
+               `..., raw, captured_at` — `raw` is SECOND-TO-LAST because the tuple IS the
+               record's field order and `captured_at` is the final field of EventRecord.
+               (raw is the device dict as JSON text: quoted, and the LAST field that can
+               contain a comma or a quote, so a naive splitter still reads every named
+               field before it reaches it)
 """
 
 

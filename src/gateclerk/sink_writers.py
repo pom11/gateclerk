@@ -196,7 +196,8 @@ def csv_line_for(*, payload: str, row_meta: Mapping[str, str] | None, roster: bo
     contract's own order. A key the payload does not carry becomes an empty field — the
     contract is append-only at the FRONT, a missing key is a value the record genuinely
     lacks, and `event_id`/`sink_name` still trace the row back to the queue row and the
-    store. `raw` is JSON text: quoted by the writer, and last, so a naive splitter that stops
+    store. `raw` is JSON text: quoted by the writer, and the LAST field that can carry a
+    comma or a quote — `captured_at` follows it — so a naive splitter that stops
     at the first unquoted comma still reads every named field.
 
     `roster=True` renders the companion table instead (`ROSTER_CSV_COLUMNS`).

@@ -154,8 +154,10 @@ first FAILED line the unfiltered run prints.
 
 ## What P2-05 / P2-06 / P2-07 consume
 
-- `drain(conn, endpoint=…, transport=…, now=…, rng=…, dead_letter_after_s=…)` →
-  `DrainResult` with `.push_ok` / `.push_failed` / `.dead_lettered` (§2e names these).
+- `drain(conn, endpoint=…, transport=…, now=…, rng=…, dead_letter_after_s=…, sink_name=…, row_meta=…)`
+  → `DrainResult` with `.push_ok` / `.push_failed` / `.dead_lettered` (§2e names these).
+  `sink_name` and `row_meta` are SINKS-CORE/SINKS-WIRING additions (see the per-sink section
+  at the end); both default, so every caller in this file's own era still reads correctly.
 - `queue_depth` / `dead_letter_depth` (gauges), `pending_rows` (no payloads),
   `dead_letter_rows` (with payloads).
 - `replay_dead_letter` + `delete_dead_letter` are the functions P2-07's CLI subcommands
@@ -168,7 +170,61 @@ first FAILED line the unfiltered run prints.
   `(url, body) -> status`, raising is "not accepted". The §3 law is untouched by the
   second transport: the **endpoint** is still never invented or defaulted — absence of
   `push_target` still means the pusher is off, and a scheme outside
-  `config.PUSH_TARGET_SCHEMES` is still a `PushTargetError`.
+  `config.PUSH_TARGET_SCHEMES` is still a `PushTargetError`. Since SINKS-WIRING that law
+  is generalised to the sink set: a site with ZERO sinks (neither `push_target` nor any
+  `[[site.sink]]`) keeps the pusher off and says so loudly at startup — one warn line
+  naming the site, queuing nothing, losing nothing
+  (`SiteAgent.__init__` in `src/gateclerk/agent_cli.py`; the refusal to *default* a target
+  is unchanged).
 - `stub_transport` and the queue/backoff/dead-letter machinery stay socket-free; `httpx`
   is imported only *inside* `HttpsIngestTransport.__init__`, so a run that never aims at
   an `https://` target never loads it and never opens a socket.
+
+## Per-sink delivery (SINKS-CORE + SINKS-WIRING — what changed after this note was written)
+
+Everything above predates named sinks. The queue's shape survived intact — one transport
+per drain, the same ladder, the same dead-letter posture — but it is now **per sink**.
+The code to read is `src/gateclerk/sink_writers.py` (the writers and the https factory) and
+`tests/test_sinks_wiring.py` (every claim below is pinned there).
+
+- **One `drain` call serves one sink.** `drain(conn, endpoint=…, transport=…, …,
+  sink_name=…, row_meta=…)` matches rows on `(sink_name, endpoint)`, and the per-sink
+  facts ride along: `sink_name` defaults to the implicit `legacy` sink so a pre-sinks
+  caller is byte-identical, and `row_meta` (from `agent_push.default_row_meta`) carries
+  the queue row's own `event_id` / `sink_name` / `enqueued_at` to any transport that
+  declares `renders_rows = True` + `render(payload, row_meta)`. The queue stays
+  type-blind: it has no branch for "csv" or "jsonl" anywhere, which is what lets a new
+  sink type ship as one registry entry plus a writer.
+- **The ladder and the dead-letter key are per sink.** `push_queue`/`dead_letter` are
+  keyed `UNIQUE (event_id, sink_name)` (migrations v5/v6 rebuild the v3/v4 tables;
+  `endpoint` survives as provenance). So one event can be delivered to three sinks, fail
+  at the https sink while succeeding at csv and jsonl, and dead-letter ONLY against the
+  sink that failed — `(event_id, sink_name)`. Backoff is that sink's ladder alone; a
+  sink at its batch cap claims only its own rows.
+- **The agent drain fans out; a broken sink starves nobody.** `SiteAgent._push`
+  (`src/gateclerk/agent_cli.py`) loops the site's sinks and gives each its own
+  queue-step + `drain` in the same pass, wrapped per sink: an https outage, a full disk,
+  or a mis-wired writer becomes a loud per-sink warn while csv and jsonl keep receiving
+  their rows (DoD (a)/(b) in `tests/test_sinks_wiring.py`; the counters land per sink in
+  the tick report).
+- **File sinks: fsync-then-mark-acked.** `sink_writers.FileSinkWriter` answers 200 only
+  after `append + flush + os.fsync` — the DELETE of the queue row follows the fsync, never
+  precedes it, so a kill between the two re-delivers (at-least-once, the ingest-side
+  idempotency key still the dedupe) and a kill before the write loses nothing. A write
+  that cannot land RAISES (missing dir, permissions, disk full) — drain turns that into a
+  failed row with its own backoff and eventual dead-letter; returning 200 for a line that
+  never reached storage is the one outcome this module may never produce. Rotation is
+  `daily` → `<stem>-YYYY-MM-DD<suffix>`, `monthly` → `<stem>-YYYY-MM<suffix>` (UTC date
+  of the line written; `rotated_path`, and a pass's lines all land in one file).
+- **The roster fan-out is separate and never dead-letters.** `agent_loop`'s hourly
+  `push_device_users` walks the sinks in config order and delivers to each whose
+  `accepts_roster` is true (a sink may decline); each leg is wrapped so a failing https
+  leg cannot stop the file sinks. A roster NEVER enters the queue tables and never
+  dead-letters — `push_queue.event_id` is an FK to a stored event and a roster is not an
+  event; a roster the ingest missed is re-derivable from the device next hour, while a
+  punch nobody received is payroll data nothing else can re-create. Warn-and-retry-next-
+  hour is the whole failure model (`test_roster_never_dead_letters_even_against_a_real_db`).
+- **A zero-sink site keeps the pusher off** — the `push_target`-absent law above,
+  generalised to the sink set (startup warn, §3's no-defaulting rule untouched). A
+  `push_target`-only site is upgrade-inert: it gets the implicit `legacy` sink and its
+  report shape, ledger and keychain behaviour are unchanged.
