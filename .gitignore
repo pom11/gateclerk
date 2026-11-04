@@ -29,3 +29,4 @@ htmlcov/
 
 # local-only sites config (real device hosts never in the public repo; P2 decision 2026-10-19)
 sites.toml
+!examples/sites.toml
