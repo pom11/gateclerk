@@ -123,6 +123,7 @@ EXPECTED_LEAVES: set[str] = {
     "device time",
     "events",
     "export config",
+    "export scans",
     "init",
     "migrate apply",
     "migrate diff",
@@ -162,8 +163,8 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 28 = the 27 after CLI-INIT + DEMO-WALKTHROUGH, plus EXPORT-CONFIG's `export config`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 28
+    # 29 = 28 after EXPORT-CONFIG, plus EXPORT-SCANS's `export scans`.
+    assert len(leaves) == len(EXPECTED_LEAVES) == 29
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
