@@ -30,6 +30,8 @@ because the card names them as groups (`users list`, `device info`).
 
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,7 +41,7 @@ import httpx
 import typer
 from typer.core import TyperGroup
 
-from gateclerk import __version__, pipeline, sink_cli
+from gateclerk import __version__, credentials, pipeline, sink_cli
 from gateclerk import config as cfg
 from gateclerk import demo_device as demo
 from gateclerk.capabilities import device_identity
@@ -1520,6 +1522,218 @@ def creds_test(
     )
 
 
+# --- creds set/get/remove (card CREDSTORE-LINUX): the FILE backend's own surface ------
+#
+# These three commands work on ONE backend — the 0600 credential file — and say so in
+# every column they print. They do not resolve: resolving is `creds check`'s job (and the
+# resolver's, and soon `doctor`'s). The reason they are separate rather than "make `check`
+# write things" is the reason p1-02 kept `explain` apart from `check`: a diagnostic that
+# also mutates is a diagnostic you cannot run on a live box to see what is wrong.
+#
+# No interactive prompt exists here on purpose. `--file -` (stdin) covers the two real
+# non-interactive shapes — a heredoc/pipe from a secret manager, and a deploy script — and
+# a prompt would put a secret in a terminal scrollback, which is the shell-history problem
+# again in a different hat.
+
+
+CredentialsFileOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--credentials-file",
+        help="Credential file to operate on (default: $GATECLERK_CREDENTIALS_FILE, else "
+        "~/.config/gateclerk/credentials.json). Refused unless the file is mode 0600.",
+    ),
+]
+
+CredsRefArg = Annotated[
+    str,
+    typer.Argument(
+        help="Credential REF NAME — the portable address, e.g. gateclerk-site-a-192.0.2.10 "
+        "for a device or gateclerk-ingest-site-a for an ingest bearer. The same name means "
+        "the same secret on macOS and Linux; only the backend differs."
+    ),
+]
+
+
+def _file_store_for(path: str | None, output: OutputFormat) -> Any:
+    """The file store a creds write/remove command was pointed at (exit 2 on a bad one)."""
+    try:
+        return credentials.resolve_file_store(path=path)
+    except (CredentialUnavailable, ConfigError) as exc:
+        raise _config_exit(output, str(exc)) from exc
+
+
+@creds_app.command("set")
+def creds_set(
+    ref: CredsRefArg,
+    file: Annotated[
+        str | None,
+        typer.Option(
+            "--file",
+            help="Read the VALUE from this file (non-interactive, as the card requires). "
+            "`--file -` reads it from stdin, for a pipe from a secret manager. The value "
+            "is never an argv value, so it never lands in shell history.",
+        ),
+    ] = None,
+    credentials_file: CredentialsFileOpt = None,
+    output: OutputOpt = OutputFormat.TABLE,
+) -> None:
+    """Store one credential ref in the 0600 credential file. Non-interactive only.
+
+    The only writer this repo has for `~/.config/gateclerk/credentials.json`, which is the
+    file backend a Linux host uses in place of the macOS Keychain. Writing is atomic and
+    the file is created 0600; an existing file with looser permissions is REFUSED rather
+    than quietly augmented, because augmenting a world-readable secret store is the
+    accident, not the fix. Nothing here contacts a device and nothing prints the value:
+    the row says `ref / backend / path / mode`, which is the whole safe answer.
+    """
+    if file is None:
+        raise _config_exit(
+            output,
+            "creds set is non-interactive by design: pass --file <path> (or --file - to "
+            "read the value from stdin). A prompt would put the secret in terminal "
+            "scrollback, and an argv value puts it in shell history — the two places "
+            "DESIGN.md's credential rules say a value must not be.\n"
+            f"    example: my-secret-manager get {ref} | gateclerk creds set {ref} --file -",
+        )
+    value = _read_secret_argument(file, ref=ref, output=output)
+    store = _file_store_for(credentials_file, output)
+    try:
+        existed = store.exists()
+        store.write(ref, value)
+    except (CredentialUnavailable, ConfigError) as exc:
+        raise _config_exit(output, str(exc)) from exc
+    render(
+        [
+            {
+                "ref": ref,
+                "backend": "file",
+                "path": str(store.path),
+                "mode": f"{store.mode():04o}" if store.mode() is not None else "?",
+                "status": "updated" if existed else "created",
+                "value": "***",
+            }
+        ],
+        fmt=output.value,
+        columns=("ref", "backend", "path", "mode", "status", "value"),
+    )
+
+
+def _read_secret_argument(spec: str, *, ref: str, output: OutputFormat) -> str:
+    """The value behind `--file <path>` / `--file -`.
+
+    Trailing newlines are trimmed and nothing else: `agent_cli.credential_file_value`
+    established the rule that a credential carrying a newline is a DIFFERENT credential,
+    and a pipe from a secret manager always ends in one. Leading/embedded spaces survive —
+    they may be part of the value.
+    """
+    try:
+        if spec == "-":
+            raw = sys.stdin.read()
+        else:
+            raw = Path(spec).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _config_exit(
+            output, f"cannot read the value for {ref!r} from {spec!r}: {exc.strerror or exc}"
+        ) from exc
+    value = raw.rstrip("\r\n")
+    if not value:
+        raise _config_exit(
+            output,
+            f"the value read from {spec!r} is empty for {ref!r}. An empty credential is "
+            "never valid — it would shadow the env and platform rungs with a blank.",
+        )
+    return value
+
+
+@creds_app.command("get")
+def creds_get(
+    names: Annotated[
+        list[str],
+        typer.Argument(
+            help="Ref name(s) to report. With no name, every ref the file carries. Only "
+            "names are printed — never a value."
+        ),
+    ] = (),
+    credentials_file: CredentialsFileOpt = None,
+    output: OutputOpt = OutputFormat.TABLE,
+) -> None:
+    """Report which refs EXIST and which backend answers. Prints no value, ever.
+
+    A read of the file backend only — deliberately not a resolution: resolution goes to
+    the macOS Keychain, and every `security` invocation can raise an ACL prompt, so a
+    command whose whole job is "what is installed?" must not be able to pop a dialog.
+    `creds check --host …` is the command that runs the real ladder and prints the source
+    that won.
+
+    Columns are ref / status / env-var / detail, where status is `present`, `absent` or
+    `empty` — the third one because a ref stored with an empty value reads as absent to the
+    resolver (an empty variable counts as unset everywhere here), and an operator told
+    simply "no" has no way to discover they typed it wrong.
+    """
+    store = _file_store_for(credentials_file, output)
+    try:
+        wanted = list(names) if names else list(store.names())
+        rows = [_cred_status(store, name) for name in wanted]
+    except (CredentialUnavailable, ConfigError) as exc:
+        raise _config_exit(output, str(exc)) from exc
+    render(rows, fmt=output.value, columns=("ref", "status", "env_var", "detail"))
+
+
+def _cred_status(store: Any, name: str) -> dict[str, str]:
+    """One `creds get` row: existence, the env rung that would satisfy it, no value."""
+    status = store.source_for(name)
+    candidates = credentials.env_var_candidates(name)
+    env_set = next((var for var in candidates if os.environ.get(var)), None)
+    if env_set is not None:
+        detail = f"{env_set} is set, so it wins the rung above the file"
+    elif len(candidates) > 1:
+        detail = f"none of {len(candidates)} possible env rungs is set (site/host split ambiguous)"
+    elif candidates:
+        detail = f"env rung {candidates[0]} is unset"
+    else:
+        detail = "no env rung names this ref"
+    return {
+        "ref": name,
+        "status": status,
+        "env_var": credentials.env_var_summary(name),
+        "detail": detail,
+        "value": "***",
+    }
+
+
+@creds_app.command("remove")
+def creds_remove(
+    ref: CredsRefArg,
+    credentials_file: CredentialsFileOpt = None,
+    output: OutputOpt = OutputFormat.TABLE,
+) -> None:
+    """Drop one ref from the 0600 credential file. Idempotent; never a device write.
+
+    Removing the last ref leaves an empty `{"refs": {}}` file rather than deleting it, so a
+    deploy that expects the path to exist keeps working and `creds get` still reports the
+    truth. An absent ref is `status=absent` with exit 0 — a re-runnable cleanup step should
+    not fail a pipeline because it ran twice.
+    """
+    store = _file_store_for(credentials_file, output)
+    try:
+        removed = store.remove(ref)
+    except (CredentialUnavailable, ConfigError) as exc:
+        raise _config_exit(output, str(exc)) from exc
+    render(
+        [
+            {
+                "ref": ref,
+                "backend": "file",
+                "path": str(store.path),
+                "status": "removed" if removed else "absent",
+            }
+        ],
+        fmt=output.value,
+        columns=("ref", "backend", "path", "status"),
+    )
+
+
 @creds_app.command("explain")
 def creds_explain(
     host: str,
@@ -1527,6 +1741,7 @@ def creds_explain(
     output: OutputOpt = OutputFormat.TABLE,
 ) -> None:
     """Print where this host's credential WOULD be looked for. Reads nothing, resolves nothing."""
+    target = cfg.DeviceTarget(host=host, port=port)
     rows = [
         {
             "rung": 1,
@@ -1549,14 +1764,23 @@ def creds_explain(
         {
             "rung": 4,
             "source": "keychain",
-            "where": cfg.DeviceTarget(host=host, port=port).find_command(),
+            "where": target.find_command(),
             "detail": "comment field carries user=<isapi_user>",
         },
         {
             "rung": 5,
             "source": "keychain",
-            "where": cfg.DeviceTarget(host=host, port=port).add_command(),
+            "where": target.add_command(),
             "detail": "creates the item; -w last so the password is prompted, not argv",
+        },
+        {
+            "rung": 6,
+            "source": str(credentials.CredentialSource.FILE.value),
+            "where": str(credentials.default_credential_file()),
+            "detail": (
+                f"mode 0600 required, ref {credentials.device_ref(None, host)!r}; the Linux "
+                "answer where there is no Keychain — write it with `gateclerk creds set`"
+            ),
         },
     ]
     render(rows, fmt=output.value, columns=("rung", "source", "where", "detail"))

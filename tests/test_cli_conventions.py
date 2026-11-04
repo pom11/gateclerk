@@ -111,6 +111,9 @@ EXPECTED_LEAVES: set[str] = {
     "agent deadletter remove",
     "agent run",
     "creds explain",
+    "creds get",
+    "creds remove",
+    "creds set",
     "creds test",
     "demo device serve",
     "demo device urls",
@@ -156,7 +159,7 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    assert len(leaves) == len(EXPECTED_LEAVES) == 22
+    assert len(leaves) == len(EXPECTED_LEAVES) == 25
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"

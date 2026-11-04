@@ -873,6 +873,20 @@ PREVIOUS_SURFACE: dict[str, Any] = {
     "events": None,  # a command, not a group (p1-08's naming decision)
 }
 
+#: Commands CREDSTORE-LINUX added to an EXISTING group, with the card that authorized each.
+#: A dict of additions rather than a widened `PREVIOUS_SURFACE` entry on purpose: the entry
+#: above stays the pinned historical shape, so a rename or removal of `test`/`explain` still
+#: fails, and the new names are only allowed exactly where they were authorized.
+#:
+#: `set` is not the vocabulary's canonical verb for "create a record" (`add` is), and the
+#: card names it: `creds set` writes a REF->value mapping into the credential file, which is
+#: a store operation on a name the operator picks, not the creation of an enumerated record
+#: `sink add` creates. It stays because the card names the command; the deviation is
+#: recorded rather than silently normalized.
+AUTHORISED_GROUP_ADDITIONS: dict[str, set[str]] = {
+    "creds": {"set", "get", "remove"},
+}
+
 
 def _tree() -> dict[str, Any]:
     import typer
@@ -891,11 +905,22 @@ def test_existing_cli_surface_is_unchanged_and_agent_is_the_only_addition() -> N
     Shape-level (names + grouping), which is what a caller depends on; the full-suite gate
     covers the flag and behaviour level, because every p1-08/p1-09 CLI test still passes
     untouched.
+
+    CREDSTORE-LINUX is the first card to add commands to an EXISTING group (`creds
+    set|get|remove`), so the per-group comparison subtracts only the names that card
+    authorized (`AUTHORISED_GROUP_ADDITIONS`) — every historical name is still required to
+    be present and unchanged, and an unannounced fourth `creds` verb still fails here.
     """
     tree = _tree()
     for name, sub in PREVIOUS_SURFACE.items():
         assert name in tree, f"{name} disappeared from the CLI"
-        assert tree[name] == sub, f"{name} changed shape: {tree[name]} != {sub}"
+        added = AUTHORISED_GROUP_ADDITIONS.get(name, set())
+        if sub is None:
+            # A top-level COMMAND (p1-08's `events`), not a group: nothing to subtract.
+            assert tree[name] is None, f"{name} changed shape: {tree[name]} != {sub}"
+        else:
+            assert tree[name] - added == sub, f"{name} changed shape: {tree[name]} != {sub}"
+            assert added <= set(tree[name]), f"{name} lost an authorized command: {tree[name]}"
     # E1-07 (docs/ENROLLMENT-MIGRATION.md §7) added the `migrate` group on top of the
     # agent card's addition, t_ce142a14 the `demo` group (offline fake device), and
     # SINKS-CLI (docs/SINKS plan) the `sink` group — each appended to this enumerated

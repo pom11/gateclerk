@@ -85,6 +85,36 @@ The canonical verb is `test`; `creds check` is the pre-vocabulary spelling and s
 hidden from `--help` (docs/CLI-CONVENTIONS.md has the verb list, the alias table, and the
 exit-code table every command obeys).
 
+### The credential file (Linux, and any host with no platform store)
+
+The Keychain is macOS-only, so the last rung is a plain file that works everywhere:
+
+```bash
+# The value arrives from a file or a pipe, never as argv, so it never lands in shell history.
+uv run gateclerk creds set gateclerk-site-a-192.0.2.10 --file - < /run/secrets/device_pw
+uv run gateclerk creds get gateclerk-site-a-192.0.2.10  # existence + which backend answers; no value
+uv run gateclerk creds remove gateclerk-site-a-192.0.2.10   # idempotent; never a device write
+```
+
+The name is `gateclerk-<site>-<host>` — the same string `sites.toml` implies and systemd's
+`LoadCredential=` carries. A bare `--host 192.0.2.10` run (no site block) stores under the
+host alone, which is also what today's Keychain account already is, so p1-02's items keep
+answering with no re-typing.
+
+`~/.config/gateclerk/credentials.json` (override with `GATECLERK_CREDENTIALS_FILE`, or
+`--credentials-file`; the literal `off`/`none`/empty disables the rung) holds
+`{"refs": {"<name>": "<value>"}}`.
+
+**Mode `0600` is required, not preferred.** Gateclerk refuses to *read* or *write* the file
+when any group or other bit is set — the message names the path and the `chmod 600` to run,
+and refuses even on the write path, because augmenting a leaky store is itself a leak. The
+invariant is "owner-only", so `0700` is accepted; the directory is likewise `0700`. Writes
+are atomic (`O_CREAT` at `0600` then `rename`), so the file is never briefly world-readable.
+
+Ref **names** are the same on every platform — that is what makes one `sites.toml` portable
+between a mac and a Linux box: only the backend differs. A name that is not a keychain
+service on macOS is looked up verbatim in the file, and vice versa.
+
 ## Site config
 
 `sites.toml` (see `sites.toml.example`) holds the non-secret half of a connection — hosts

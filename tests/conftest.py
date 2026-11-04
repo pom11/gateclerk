@@ -77,6 +77,20 @@ def netoff(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> N
         monkeypatch.setattr(socket, name, _blocked, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_ambient_credential_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turn the credential FILE rung off for every offline test unless the test opts in.
+
+    The file backend resolves from `$GATECLERK_CREDENTIALS_FILE` else
+    `~/.config/gateclerk/credentials.json`, so without this an operator's own credential
+    store could answer a resolution in a test that believed it was testing the Keychain
+    rung — a green suite that is really reading the developer's laptop. Tests that exercise
+    the file rung point it at a tmp path (`--credentials-file`, or
+    `store=CredentialFileStore(tmp_path / …)`), which this fixture does not touch.
+    """
+    monkeypatch.setenv("GATECLERK_CREDENTIALS_FILE", "off")
+
+
 @pytest.fixture
 def live_opt_in() -> None:
     """Live tests depend on this: hard gate on an explicit human opt-in."""

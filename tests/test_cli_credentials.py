@@ -336,13 +336,29 @@ def test_creds_explain_lists_the_resolution_plan_in_order() -> None:
     code, out = run(["creds", "explain", HOST, "-o", "json"])
     assert code == 0, clean(out)
     rows = json_rows(out)
-    assert [r["source"] for r in rows] == ["flag", "env", "env", "keychain", "keychain"]
+    # Card CREDSTORE-LINUX appended the FILE rung: `explain` is the command that answers
+    # "where would this credential be looked for", and on a Linux release host the answer
+    # IS the file — a plan that stopped at `keychain` would be a lie exactly where the
+    # resolver now succeeds. The first five rungs are unchanged in order and content.
+    assert [r["source"] for r in rows] == [
+        "flag",
+        "env",
+        "env",
+        "keychain",
+        "keychain",
+        "file",
+    ]
     where = " ".join(str(r["where"]) for r in rows)
     assert PER_HOST_PW_VAR in where, "per-host var must be named before the global one"
     assert "GATECLERK_PASSWORD" in where
     assert "find-generic-password" in where
     assert "add-generic-password" in where
     assert int(str(rows[0]["rung"])) < int(str(rows[-1]["rung"])), "rung order IS the precedence"
+    # The last rung must be actionable: a path, the required mode, and how to write it.
+    file_row = str(rows[-1]["where"]) + " " + str(rows[-1]["detail"])
+    assert "credentials.json" in file_row or "GATECLERK_CREDENTIALS_FILE" in file_row
+    assert "0600" in file_row, "the plan that names the file must also name its required mode"
+    assert "creds set" in file_row, "and the one command that writes it"
 
 
 def test_creds_explain_touches_no_process_and_resolves_no_secret() -> None:
@@ -385,16 +401,40 @@ def test_creds_group_appears_in_root_help() -> None:
 
 @pytest.mark.parametrize("args", [["creds"], ["creds", "check"], ["creds", "explain"]])
 def test_creds_help_never_advertises_a_device_write(args: list[str]) -> None:
-    """Hard rule from DESIGN.md: this connector must not grow a write surface.
+    """Hard rule from DESIGN.md: this connector must not grow a *device* write surface.
 
     Whole-word match: a naive `"put " in text` trips over "out**put** format", which is
     in every command's help — a tripwire that fires on the word "output" is a tripwire
     nobody keeps.
+
+    Card CREDSTORE-LINUX scopes the ban, and the scope is the whole point: the verbs here
+    are the ones that would change a DOOR (PUT/DELETE/reboot/shutdown/update on ISAPI).
+    The `creds` group now also carries `set`/`remove`, which write and prune a local 0600
+    file and cannot reach a device — `creds set` is a config-install command with the same
+    name shape as `git config set`, and the ban on it would mean the card's own DoD cannot
+    be spelled in help text. The device-safety half of the rule is NOT loosened: it still
+    applies unchanged to every device-facing command
+    (`test_no_help_text_advertises_a_write` in test_cli_commands.py), `creds` gains no
+    host/port/device flag, and `test_creds_set_writes_no_device_and_prints_no_value` below
+    pins that a `creds set` run serves zero requests.
     """
     code, out = run([*args, "--help"])
     assert code == 0
     lowered = clean(out).lower()
-    for verb in ("put", "delete", "reboot", "shutdown", "update", "set "):
-        assert not re.search(rf"\b{re.escape(verb.strip())}\b", lowered), (
-            f"{args} mentions {verb!r}"
-        )
+    for verb in ("put", "delete", "reboot", "shutdown", "update"):
+        assert not re.search(rf"\b{re.escape(verb)}\b", lowered), f"{args} mentions {verb!r}"
+
+
+@pytest.mark.parametrize(
+    "args", [["creds", "check"], ["creds", "explain"], ["device", "info"], ["users", "list"]]
+)
+def test_creds_file_backend_verbs_are_confined_to_the_file_commands(args: list[str]) -> None:
+    """`set`/`remove` appear in the `creds` GROUP listing and in their own help — nowhere else.
+
+    The complement of the test above: scoping the ban is only safe if the new verbs cannot
+    leak onto a device-facing screen, where "set" really would mean a write.
+    """
+    code, out = run([*args, "--help"])
+    assert code == 0
+    lowered = clean(out).lower()
+    assert not re.search(r"\bset\b", lowered), f"{args} advertises the file-only `set` verb"

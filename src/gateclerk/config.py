@@ -131,6 +131,14 @@ SINK_REF_SCHEMES = (*PUSH_TARGET_SCHEMES, "file://")
 ENV_PREFIX = "GATECLERK"
 SECURITY_BIN = "/usr/bin/security"
 
+#: Sentinel: "no explicit file store was passed — consult the ambient one" (an injected
+#: `None` for `store=` means the opposite: "no file backend in this resolution at all").
+#: It lives in `config` rather than in `gateclerk.credentials` because `credentials` imports
+#: this module (for `DeviceTarget` and the env-name helpers), so this is the one module
+#: either side can name at def time without an import cycle; `gateclerk.credentials`
+#: re-exports it and every call site refers to the same object.
+AMBIENT = object()
+
 #: What `security` exits when the item simply is not in the keychain (VERIFIED, above).
 KEYCHAIN_EXIT_NOT_FOUND = 44
 
@@ -175,11 +183,17 @@ def explicit_iana_tz_required() -> Iterator[None]:
 
 
 class CredentialSource(StrEnum):
-    """Where a resolved credential came from. Safe to print; never the secret."""
+    """Where a resolved credential came from. Safe to print; never the secret.
+
+    FILE is the card CREDSTORE-LINUX rung: the owner-only JSON file, which is the answer
+    on a Linux release host (no Keychain) and sits BELOW the Keychain on macOS so an
+    existing keychain item is never shadowed by a stray file.
+    """
 
     FLAG = "flag"
     ENV = "env"
     KEYCHAIN = "keychain"
+    FILE = "file"
 
 
 @dataclass(frozen=True, slots=True)
@@ -814,34 +828,51 @@ def resolve_credentials(
     password: str | None = None,
     env: Mapping[str, str] | None = None,
     keychain: KeychainReader | None = None,
+    store: Any = AMBIENT,
+    platform_name: str | None = None,
 ) -> Credentials:
-    """Resolve (user, password) for a device. **flag > env > keychain**, nothing else.
+    """Resolve (user, password) for a device through THE resolver:
+    **flag > env > platform store (macOS Keychain) > credential file**, nothing else.
 
     `user`/`password` are the CLI flag values (None when the flag was not given). The
     *user* has extra rungs after env — `sites.toml`'s `isapi_user`, then the keychain
     item's `user=` comment, then `admin` — because DESIGN.md calls the comment a hint
     ("overridable ... unless overridden"), not an authority.
 
+    The password ladder itself lives in `gateclerk.credentials.resolve_device_password`, so
+    this function, the agent's ingest bearer and (once CLI-DOCTOR merges) `doctor` all ask
+    the same ladder — which is the whole point of card CREDSTORE-LINUX: a Linux host has no
+    Keychain, and a second ladder that only knows the Keychain is how it gets configured by
+    accident. `store`/`platform_name` are pass-through seams for a caller (or a test) that
+    names the file backend or the platform explicitly.
+
+    The *user* half is unchanged, including the rule that decides whether the keychain's
+    second (`icmt`) `security` call is worth making: nothing else can name the user.
+
     Raises `CredentialUnavailable` naming the source and the exact command/variable that
     would fix it. No password in any message, including on the failure path.
     """
     environ: Mapping[str, str] = os.environ if env is None else env
-    host_user, host_password, global_user, global_password = env_var_names(target.host)
+    # Local import: `gateclerk.credentials` imports this module for DeviceTarget/env names,
+    # so a module-level import would be a cycle (same reason `load_sites` imports
+    # `make_console` locally). The resolver is still the repo's only password ladder.
+    from gateclerk.credentials import resolve_device_password
 
-    keychain_user: str | None = None
-    if password is not None:
-        secret: Secret = Secret(password, label=f"flag:{target.host}")
-        source = CredentialSource.FLAG
-    elif (env_pw := _first_set(environ, host_password, global_password)) is not None:
-        secret = Secret(env_pw, label=f"env:{target.host}")
-        source = CredentialSource.ENV
-    else:
-        # Only pay for the second (`icmt`) security call if nothing else can name the user.
-        need_user = not (user or _first_set(environ, host_user, global_user) or target.config_user)
-        item = (keychain or KeychainReader()).read(target, with_comment=need_user)
-        secret = item.password
-        source = CredentialSource.KEYCHAIN
-        keychain_user = item.user_hint() if need_user else None
+    # First, and deliberately before any resolution: a host that sanitizes to an empty env
+    # var name is a ConfigError on the CLI's config path (exit 2), not a credential miss.
+    host_user, _, global_user, _ = env_var_names(target.host)
+
+    # Only pay for the second (`icmt`) security call if nothing else can name the user.
+    need_user = not (user or _first_set(environ, host_user, global_user) or target.config_user)
+    resolved = resolve_device_password(
+        target,
+        password=password,
+        env=environ,
+        keychain=keychain,
+        store=store,
+        with_comment=need_user,
+        platform_name=platform_name,
+    )
 
     resolved_user = _resolve_user(
         target,
@@ -849,12 +880,16 @@ def resolve_credentials(
         environ=environ,
         host_user=host_user,
         global_user=global_user,
-        keychain_user=keychain_user,
+        keychain_user=resolved.user_hint()
+        if resolved.source is CredentialSource.KEYCHAIN
+        else None,
     )
-    creds = Credentials(user=resolved_user, password=secret, source=source, host=target.host)
+    creds = Credentials(
+        user=resolved_user, password=resolved.secret, source=resolved.source, host=target.host
+    )
     if not creds.password.reveal():
         raise CredentialUnavailable(
-            f"resolved an EMPTY password for {target.host!r} from {source.value}. "
+            f"resolved an EMPTY password for {target.host!r} from {resolved.source.value}. "
             "An empty password is never a valid ISAPI credential; unset the variable or "
             "re-enter the keychain item."
         )

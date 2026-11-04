@@ -64,7 +64,6 @@ letter queue for reasons the owner could have fixed at install time.
 
 from __future__ import annotations
 
-import os
 import re
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -78,6 +77,11 @@ from gateclerk.config import (
     SINK_REF_SCHEMES,
     DeviceTarget,
     KeychainReader,
+)
+from gateclerk.credentials import (
+    INGEST_REF_PREFIX,
+    INGEST_TOKEN_ENV_PREFIX,
+    resolve_ingest_token,
 )
 from gateclerk.exceptions import CredentialUnavailable
 from gateclerk.isapi_transport import DEFAULT_BUSY_BACKOFF_BASE, DEFAULT_BUSY_BACKOFF_CAP
@@ -996,13 +1000,16 @@ INGEST_SCHEME = "https://"
 
 #: The env rung mirrors the function's OWN variable name (`_GATECLERK_INGEST_SECRET_PREFIX`
 #: in functions/main.py): one name per site works in the agent's environment and in the
-#: Cloud Run runtime, so an operator sets exactly one thing per site either way.
-INGEST_TOKEN_ENV_PREFIX = "GATECLERK_INGEST_TOKEN_"  # noqa: S105 — a variable-NAME prefix
+#: Cloud Run runtime, so an operator sets exactly one thing per site either way. The
+#: spelling lives in `gateclerk.credentials` (the resolver owns the ref names and the inverse
+#: ref -> env-var mapping) and is imported by name above, so `agent_push.INGEST_TOKEN_ENV_PREFIX`
+#: and the resolver's are the same object rather than two strings that happen to match.
 
 #: The keychain service holding one site's ingest token. The account is the site (the
 #: device credential's account is the host — different item, different purpose, both
-#: macOS-managed: device creds and the ingest token never enter sites.toml).
-INGEST_KEYCHAIN_SERVICE_PREFIX = "gateclerk-ingest-"
+#: macOS-managed: device creds and the ingest token never enter sites.toml). Same string
+#: as the resolver's `ingest_ref(site)`: one name, backend chosen by the resolver.
+INGEST_KEYCHAIN_SERVICE_PREFIX = INGEST_REF_PREFIX
 
 #: Wall-clock ceilings for one push. The connect budget is short because a dead
 #: endpoint should fail fast into P2-04's backoff, not stall the tick; the read budget
@@ -1204,35 +1211,60 @@ class HttpsIngestTransport:
         return True
 
     def _resolve_token(self) -> Secret:
-        """flag > env > keychain — per site, no global fallback rung, then refuse.
+        """flag > env > platform store (macOS Keychain) > credential file — per site, then refuse.
 
-        No shared "one ingest token" rung exists ON PURPOSE: the function's contract is
-        that the token DETERMINES the site, so a resolver that fell back to some other
-        site's token would either 403 (site_token_mismatch, zero BC traffic) or — the
-        bad case — authenticate fine and attribute one site's punches to another.
+        The ladder itself is `credentials.resolve_ingest_token`, the same one a device
+        password walks, so a Linux release host (no Keychain) resolves the bearer from the
+        env rung or the 0600 credential file with no other change. What stays specific to
+        this transport:
+
+        * no global fallback rung ON PURPOSE — the function's contract is that the token
+          DETERMINES the site, so a resolver that fell back to another site's token would
+          either 403 (site_token_mismatch, zero BC traffic) or, the bad case, authenticate
+          fine and attribute one site's punches to another;
+        * the failure is `IngestTokenUnavailableError`, this module's class, so the pusher's
+          error column reads "install step", not "outage";
+        * the resolution is cached, because every `security` call can raise a macOS ACL
+          prompt and a drain must not re-ask per row.
         """
         if self._token is not None:
             return self._token
-        resolved: Secret | None = None
-        if self._explicit is not None:
-            resolved = self._explicit
-        else:
-            environ: Mapping[str, str] = os.environ if self._env is None else self._env
-            name = ingest_token_env_var(self.site)
-            value = environ.get(name)
-            resolved = Secret(value, label=f"env:{name}") if value else self._read_keychain()
-        if resolved is None or not resolved.reveal():
-            raise IngestTokenUnavailableError(
-                f"no ingest bearer token for site {self.site!r}: set "
-                f"{ingest_token_env_var(self.site)} or add the keychain item with\n"
-                f"    {_add_token_command(self.site)}\n"
-                "Refusing to send unauthenticated: the ingest answers 401 and the "
-                "punch would dead-letter for a reason install-time config could fix."
+        try:
+            resolved = resolve_ingest_token(
+                self.site,
+                token=self._explicit,
+                env=self._env,
+                # Resolved HERE, not left to the resolver's own default: this module's
+                # `KeychainReader` name is the seam three tests monkeypatch to simulate a
+                # missing item, and letting `gateclerk.credentials` build the reader instead
+                # would silently route past the patch (a fake that is never called reads as
+                # a pass, which is the worst direction for a credential test to fail in).
+                keychain=self._keychain if self._keychain is not None else KeychainReader(),
+                env_var=ingest_token_env_var(self.site),
+                keychain_service=ingest_keychain_service(self.site),
             )
-        self._token = resolved
-        return resolved
+        except CredentialUnavailable as exc:
+            # The resolver's own text already opens with "no ingest bearer token for site
+            # …" (`what` is worded for it) and names the service, never a value; this adds
+            # this module's class — so the pusher's error column reads "install step", not
+            # "outage" — plus the paste-away `security` line on every platform, and
+            # `redact` is belt-and-braces against a future reader echoing a value.
+            raise IngestTokenUnavailableError(
+                redact(
+                    f"{exc}\n    add it with: {_add_token_command(self.site)}",
+                    self._token,
+                )
+            ) from None
+        self._token = resolved.secret
+        return self._token
 
     def _read_keychain(self) -> Secret | None:
+        """The Keychain rung, kept as the documented seam p1-02/Task-15 tests reach for.
+
+        `resolve_ingest_token` is what calls it now (via `store_target`); this is the
+        single-site, single-service form and stays because a caller outside the transport
+        (a future `creds check --target ingest`) wants exactly that.
+        """
         target = DeviceTarget(
             host=self.site,  # the keychain ACCOUNT is the site (device creds: the host)
             site=self.site,
