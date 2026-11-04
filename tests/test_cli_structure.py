@@ -45,6 +45,7 @@ SPLIT_MODULES = (
     "export_cmds.py",
     "status_cmds.py",
     "service_cmds.py",
+    "doctor_cmds.py",
 )
 
 #: Precedent modules that were already CLI-surface-adjacent and must not gain a back-edge.
@@ -54,6 +55,7 @@ NEIGHBOUR_MODULES = (
     "export_cli.py",
     "status_cli.py",
     "service_cli.py",
+    "doctor_cli.py",
 )
 
 #: Group declarations that must NOT reappear in cli.py (they live in the cmd modules now).
@@ -66,6 +68,7 @@ MOVED_GROUPS = (
     "export_app",
     "status_app",
     "service_app",
+    "doctor_app",
 )
 
 
@@ -142,6 +145,7 @@ def test_each_moved_group_is_registered_from_its_module() -> None:
         ("export_cmds.py", "export_app"),
         ("status_cmds.py", "status_app"),
         ("service_cmds.py", "service_app"),
+        ("doctor_cmds.py", "doctor_app"),
     ):
         text = (SRC / module).read_text(encoding="utf-8")
         assert "def register(app: typer.Typer) -> None:" in text, module
@@ -154,6 +158,7 @@ def test_each_moved_group_is_registered_from_its_module() -> None:
         "export_cmds.register(app)",
         "status_cmds.register(app)",
         "service_cmds.register(app)",
+        "doctor_cmds.register(app)",
     ):
         assert call in cli_text, call
 

@@ -45,6 +45,7 @@ from gateclerk import (
     agent_cmds,
     credentials,
     demo_cmds,
+    doctor_cmds,
     export_cmds,
     pipeline,
     service_cmds,
@@ -2212,6 +2213,7 @@ demo_cmds.register(app)  # the `demo` group, moved out of this file
 export_cmds.register(app)  # the `export` group (EXPORT-CONFIG / EXPORT-SCANS)
 status_cmds.register(app)  # `gateclerk status` (CLI-STATUS)
 service_cmds.register(app)  # the `service` group (SERVICE-CMD)
+doctor_cmds.register(app)  # `gateclerk doctor` (CLI-DOCTOR)
 
 # --- `gateclerk init` — the group lives in gateclerk.init_cli, and so does every handler ---------
 #

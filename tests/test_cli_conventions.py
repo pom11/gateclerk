@@ -121,6 +121,7 @@ EXPECTED_LEAVES: set[str] = {
     "device capabilities",
     "device info",
     "device time",
+    "doctor",
     "events",
     "export config",
     "export scans",
@@ -167,8 +168,8 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 33 = 30 after CLI-STATUS, plus SERVICE-CMD's 3 (`service install|uninstall|logs`).
-    assert len(leaves) == len(EXPECTED_LEAVES) == 33
+    # 34 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`.
+    assert len(leaves) == len(EXPECTED_LEAVES) == 34
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
@@ -226,6 +227,7 @@ READ_ONLY_LEAVES: tuple[tuple[str, ...], ...] = (
     ("device", "info"),
     ("device", "time"),
     ("device", "capabilities"),
+    ("doctor",),
     ("users", "list"),
     ("events",),
     ("creds", "test"),
