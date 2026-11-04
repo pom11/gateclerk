@@ -86,15 +86,17 @@ from typing import ClassVar
 
 import httpx
 
+from gateclerk.demo_device import DEMO_REALM as REALM  # single masked-realm home
+
 #: What site-a's clock claims year-round (OBSERVED.md "time/offset bug": `+02:00`
 #: even in +03:00 summer, its DST rule never engages). `FakeDevice.claimed_offset_min`
 #: defaults to this so a store-mode fake behaves like the box the A/B measured;
 #: tests flip it to model a correct device (site offset), a winter day, or a UTC box.
 SITE_A_CLAIM_MIN = 120
 
-# The masked fixture's challenge values verbatim (already masked — see
-# tests/fixtures/README). Nothing device-real lives in this file.
-REALM = "DS-39DED0D1"
+# The realm is imported above, NOT redefined here: `gateclerk.demo_device` is its single
+# home, so the offline fake and the demo box cannot drift into two realms (pinned by
+# tests/test_demo_device.py — one masked realm, two homes would drift).
 NONCE = "MASKED-NONCE"
 FAKE_HOST = "192.0.2.10"  # TEST-NET (tests/test_repo_hygiene.py allowlist)
 BASE_URL = f"http://{FAKE_HOST}"

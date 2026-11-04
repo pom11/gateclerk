@@ -20,9 +20,16 @@ re-enrollment on the target — `migrate diff` says so up front as a report-only
 ```bash
 uv sync --extra fast            # python 3.12 is fetched by uv, not your system python
 uv run gateclerk --version        # gateclerk 0.1.0
-uv run gateclerk --help           # device | users | events | creds | agent | migrate
+uv run gateclerk --help           # device | users | events | creds | agent | migrate | demo
 uv run ruff check . && uv run pytest          # both offline, both must stay green
 ```
+
+No device on your desk? `uv run gateclerk demo device serve` runs a loopback fake of the
+`webs` server — same ISAPI envelope shapes the client reads (digest challenge, XML
+System/*, silent maxResults clamp, recorded rejections), SYNTHETIC values only (RFC 5737
+addresses, `Demo*` identities, `DEMO-*` serials/cards): point `--host 127.0.0.1` at it
+and the whole read path runs offline. `demo device urls` prints the URLs and the
+placeholder credential pair.
 
 Against a real controller on the site LAN, with credentials resolved as below:
 

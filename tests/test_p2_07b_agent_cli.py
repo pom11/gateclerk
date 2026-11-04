@@ -889,10 +889,11 @@ def test_existing_cli_surface_is_unchanged_and_agent_is_the_only_addition() -> N
         assert name in tree, f"{name} disappeared from the CLI"
         assert tree[name] == sub, f"{name} changed shape: {tree[name]} != {sub}"
     # E1-07 (docs/ENROLLMENT-MIGRATION.md §7) added the `migrate` group on top of the
-    # agent card's addition — an enumerated allow-list, so a FIFTH unannounced command
-    # still fails here. The card's binding rule ("nothing existing moves") holds: every
-    # PREVIOUS_SURFACE entry is pinned unchanged above.
-    assert set(tree) - set(PREVIOUS_SURFACE) == {"agent", "migrate"}, (
+    # agent card's addition, and t_ce142a14 the `demo` group (offline fake device) —
+    # an enumerated allow-list, so an unannounced command still fails here. The card's
+    # binding rule ("nothing existing moves") holds: every PREVIOUS_SURFACE entry is
+    # pinned unchanged above.
+    assert set(tree) - set(PREVIOUS_SURFACE) == {"agent", "migrate", "demo"}, (
         f"unexpected commands: {set(tree)}"
     )
 

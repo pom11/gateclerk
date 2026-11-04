@@ -39,6 +39,7 @@ import typer
 
 from gateclerk import __version__, pipeline
 from gateclerk import config as cfg
+from gateclerk import demo_device as demo
 from gateclerk.capabilities import device_identity
 from gateclerk.config import KeychainReader, resolve_credentials, site_from_args
 from gateclerk.exceptions import (
@@ -2437,6 +2438,86 @@ def migrate_undo(
     else:
         render([report.as_dict()], fmt=fmt.value)
     raise typer.Exit(code=report.exit_code)
+
+
+demo_app = typer.Typer(
+    name="demo",
+    help="Offline demo surfaces (SYNTHETIC-ONLY data) — `demo device` runs a fake device.",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+demo_device_app = typer.Typer(
+    name="device",
+    help="A local fake ISAPI device: loopback-only, digest-auth, synthetic fixtures only.",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(demo_app)
+demo_app.add_typer(demo_device_app)
+
+
+@demo_device_app.command("serve")
+def demo_device_serve(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind host. Loopback only (SYNTHETIC-ONLY LAW)."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Bind port. 0 (default) picks a free ephemeral port."),
+    ] = 0,
+    seconds: Annotated[
+        float | None,
+        typer.Option(
+            "--seconds",
+            help="Stop after this many seconds (default: run until Ctrl-C).",
+        ),
+    ] = None,
+    user: Annotated[
+        str, typer.Option("--user", help="Digest username the box accepts.")
+    ] = demo.DEMO_DEFAULT_USER,
+    password: Annotated[
+        str, typer.Option("--password", help="Digest password the box accepts.")
+    ] = demo.DEMO_DEFAULT_PASSWORD,
+) -> None:
+    """Serve a fake device on loopback so `gateclerk` works with NO real hardware.
+
+    Everything it answers is synthetic (RFC 5737 addresses, `Demo*` identities,
+    `DEMO-*` serials/cards); the envelope SHAPES are the recorded device's, so the
+    client path a developer exercises here is the path that runs on real hardware.
+    """
+    try:
+        box = demo.DemoDevice(username=user, password=password, host=host, port=port)
+    except ValueError as exc:  # the loopback-only rule, surfaced as a CLI refusal
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    box.start()
+    demo.report_served_url(box.base_url)
+    typer.echo(
+        f"demo device on {box.base_url} (digest user={user} password={password!r}; "
+        f"serial={demo.DEMO_SERIAL}; Ctrl-C to stop)"
+    )
+    try:
+        box.wait(seconds)
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        pass
+    finally:
+        box.stop()
+
+
+@demo_device_app.command("urls")
+def demo_device_urls(
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Port to show in the printed URLs."),
+    ] = 80,
+) -> None:
+    """Print the showcase ISAPI URLs (and the demo credential pair) for a site config."""
+    base_url = f"http://{demo.DEMO_BIND_HOST}:{port}"
+    typer.echo(base_url)
+    for name, url in demo.demo_endpoint_urls(base_url):
+        typer.echo(f"  {name}: {url}")
+    typer.echo(f"  digest: user={demo.DEMO_DEFAULT_USER} password={demo.DEMO_DEFAULT_PASSWORD!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
