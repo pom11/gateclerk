@@ -1,6 +1,6 @@
 """Card T15 (plan Task 15): the agent's real push target — HTTPS + keychain bearer.
 
-BINDING CONTRACT: the merged `gateclerk_ingest` function (example `functions/main.py`,
+BINDING CONTRACT: the merged `gateclerk_ingest` function (upstream `functions/main.py`,
 commit c9f93fa) and its own frozen test docstring (`functions/test_gateclerk_ingest.py`),
 plus the orch comment on this card. This file codes against THAT text verbatim; nothing
 here invents an endpoint, a header name, or a line shape:

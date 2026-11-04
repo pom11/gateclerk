@@ -2,7 +2,7 @@
 
 Everything here was captured from the real device with read-only calls only
 (GETs + the two stateless search POSTs). Recorded via `curl --digest` against
-`http://100.64.0.1`-style documented placeholder — the real site-a host lives only in
+`http://192.0.2.10`-style documented placeholder — the real site-a host lives only in
 the gitignored local `sites.toml` and the keychain account (`site-a`). Nothing on the
 device was changed. This file is
 the reference card p1-04/p1-05/p1-06/p1-07 implement against; recorded masked
