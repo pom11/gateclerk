@@ -47,6 +47,7 @@ from gateclerk import (
     demo_cmds,
     export_cmds,
     pipeline,
+    service_cmds,
     sink_cmds,
     status_cmds,
 )
@@ -2210,6 +2211,7 @@ sink_cmds.register(app)  # the `sink` group (SINKS-CLI), moved out of this file
 demo_cmds.register(app)  # the `demo` group, moved out of this file
 export_cmds.register(app)  # the `export` group (EXPORT-CONFIG / EXPORT-SCANS)
 status_cmds.register(app)  # `gateclerk status` (CLI-STATUS)
+service_cmds.register(app)  # the `service` group (SERVICE-CMD)
 
 # --- `gateclerk init` — the group lives in gateclerk.init_cli, and so does every handler ---------
 #
