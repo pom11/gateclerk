@@ -50,7 +50,7 @@ from gateclerk.isapi_transport import IsapiClient
 from gateclerk.paging import PagedSearch, PagingLimits, build_event_cond
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CAPTURE_FILES = sorted((REPO_ROOT / "docs").glob("OBSERVED*.md"))
+CAPTURE_FILES = sorted((REPO_ROOT / "docs" / "internal").glob("OBSERVED*.md"))
 FIXTURE_FILES = sorted(
     p
     for p in (REPO_ROOT / "tests" / "fixtures").rglob("*")

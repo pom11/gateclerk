@@ -82,10 +82,39 @@ def test_sample_scans_csv_jsonl_and_roster_match_contracts() -> None:
 
 def test_examples_are_strictly_synthetic_and_absent_from_observed_docs() -> None:
     observed_text = "\n".join(
-        p.read_text(encoding="utf-8") for p in sorted((REPO_ROOT / "docs").glob("OBSERVED*.md"))
+        p.read_text(encoding="utf-8")
+        for p in sorted((REPO_ROOT / "docs" / "internal").glob("OBSERVED*.md"))
     )
     for token in ("DEMO-SN-001", "DEMO-CARD-01", "DEMO-CARD-02", "Demo Alpha", "Demo Beta"):
         assert token not in observed_text
+
+
+def test_internal_docs_moved_to_docs_internal_and_readme_has_eli5_sections() -> None:
+    internal = REPO_ROOT / "docs" / "internal"
+    for name in (
+        "DESIGN.md",
+        "ENROLLMENT-MIGRATION.md",
+        "OBSERVED.md",
+        "OBSERVED-site-B.md",
+        "P2-SITE-AGENT.md",
+        "PROGRESS.md",
+    ):
+        assert (internal / name).is_file(), f"docs/internal/{name} missing"
+        assert not (REPO_ROOT / "docs" / name).exists(), f"docs/{name} should have moved"
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    for heading in (
+        "## What it is",
+        "## What it is NOT",
+        "## Install",
+        "## 5-minute quickstart",
+        "## Common commands",
+        "### Delivery sinks decision table",
+        "## Exit codes",
+        "## FAQ",
+        "## Privacy & data ownership",
+    ):
+        assert heading in readme, f"README.md missing heading {heading!r}"
 
 
 def test_mock_receiver_contract_statuses() -> None:
@@ -154,7 +183,7 @@ def test_mock_receiver_contract_statuses() -> None:
 
 def test_readme_starts_quickstart_with_demo_and_has_sinks_decision_table() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    qs_idx = readme.index("## Quickstart")
+    qs_idx = readme.lower().index("quickstart")
     demo_idx = readme.index("gateclerk demo demo", qs_idx)
     real_idx = readme.index("gateclerk device info", qs_idx)
     assert demo_idx < real_idx, "Quickstart must introduce `gateclerk demo demo` before real device"
