@@ -20,6 +20,7 @@ Distribution decision (documented in PR body & module docstring):
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import io
 import re
@@ -87,7 +88,7 @@ def build_source_tarball(repo_dir: Path, version: str, out_path: Path) -> Path:
     prefix = f"gateclerk-{version}"
 
     files_to_pack: list[Path] = []
-    for rel in ("pyproject.toml", "README.md", "CHANGELOG.md"):
+    for rel in ("pyproject.toml", "README.md", "CHANGELOG.md", "LICENSE"):
         candidate = repo_dir / rel
         if candidate.is_file():
             files_to_pack.append(candidate)
@@ -104,7 +105,8 @@ def build_source_tarball(repo_dir: Path, version: str, out_path: Path) -> Path:
 
     with (
         out_path.open("wb") as raw_fh,
-        tarfile.open(fileobj=raw_fh, mode="w:gz", format=tarfile.PAX_FORMAT) as tar,
+        gzip.GzipFile(filename="", mode="wb", fileobj=raw_fh, mtime=0) as gz_fh,
+        tarfile.open(fileobj=gz_fh, mode="w", format=tarfile.PAX_FORMAT) as tar,
     ):
         for file_path in sorted(files_to_pack):
             rel_name = file_path.relative_to(repo_dir).as_posix()
