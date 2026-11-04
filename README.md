@@ -73,13 +73,17 @@ device or printing a secret:
 
 ```bash
 uv run gateclerk creds explain 192.0.2.10          # the resolution plan for this host
-uv run gateclerk creds check --host 192.0.2.10     # resolve + print the SOURCE, never the pw
+uv run gateclerk creds test --host 192.0.2.10      # resolve + print the SOURCE, never the pw
 ```
 
-`creds check` exits `2` and prints the exact `security` command to run when nothing
+`creds test` exits `2` and prints the exact `security` command to run when nothing
 resolves. A password never appears in a repr, a log line, or an error message: it lives in
 a `Secret` whose `repr` is `Secret(***)`, and the ISAPI client is handed a *callable* that
 returns one rather than a password attribute.
+
+The canonical verb is `test`; `creds check` is the pre-vocabulary spelling and still works,
+hidden from `--help` (docs/CLI-CONVENTIONS.md has the verb list, the alias table, and the
+exit-code table every command obeys).
 
 ## Site config
 

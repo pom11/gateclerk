@@ -858,10 +858,18 @@ def test_queue_step_never_reenqueues_a_dead_lettered_event(
 
 #: The command tree exactly as it was at 89e10d1 (pre-P2-07b main), written out longhand so a
 #: rename, a removal or a silently added command fails here rather than in an operator's shell.
+#:
+#: CLI-VERBS-HELP moved two entries to the canonical verb spelling — `creds check` ->
+#: `creds test`, `deadletter delete` -> `deadletter remove` (docs/CLI-CONVENTIONS.md). The
+#: sets below are the DECLARED surface, which is one spelling per operation on purpose: the
+#: superseded spellings resolve through `cli_conventions.ALIASES` in `Group.get_command`
+#: and are deliberately absent from `Group.commands`, so they neither show in `--help` nor
+#: widen this allow-list. `test_superseded_verb_spellings_still_execute` is what pins that
+#: the old commands still RUN; this dict is what pins that nothing else appeared.
 PREVIOUS_SURFACE: dict[str, Any] = {
     "device": {"info", "time", "capabilities"},
     "users": {"list"},
-    "creds": {"check", "explain"},
+    "creds": {"test", "explain"},
     "events": None,  # a command, not a group (p1-08's naming decision)
 }
 
@@ -912,7 +920,10 @@ def test_agent_group_shape_is_run_ack_deadletter() -> None:
     import typer
 
     deadletter = typer.main.get_command(app).commands["agent"].commands["deadletter"]
-    assert set(deadletter.commands) == {"list", "delete"}
+    # CLI-VERBS-HELP: `delete` is now the hidden alias and `remove` the declared command
+    # (docs/CLI-CONVENTIONS.md). The declared set stays exactly two entries — the alias is
+    # resolved in `get_command` and never enters `Group.commands`.
+    assert set(deadletter.commands) == {"list", "remove"}
 
 
 def test_agent_run_requires_a_site_and_cannot_be_pointed_at_a_host() -> None:

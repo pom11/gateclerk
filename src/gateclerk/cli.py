@@ -6,16 +6,17 @@ Four device-reading commands, all wired end to end against `gateclerk.paging`,
     gateclerk device info | time | capabilities
     gateclerk users list
     gateclerk events --since --until
-    gateclerk creds check | explain
+    gateclerk creds test | explain
 
-Exit codes are the card's contract and are stable per class of failure:
-
-    0  ok
-    2  config / credential error (also: a malformed flag value — "you have not told me
-       how to reach it", or what you told me is not usable)
-    3  terminal auth failure (the transport circuit-opened to avoid a lockout)
-    4  device / protocol error (the box answered and it was not usable)
-    5  runaway paging cap (the device kept saying MORE past 10k pages)
+The verb vocabulary, the hidden aliases, and the exit-code contract are CLI-VERBS-HELP's
+conventions and live in ONE place: `gateclerk.cli_conventions` (operator-facing copy:
+docs/CLI-CONVENTIONS.md). Read that before naming a new command or raising a new exception
+class. In short — verbs: `list` / `get` / `status` / `test` / `add` / `remove`, with
+`creds check` and `deadletter delete` kept as hidden aliases of `creds test` and `agent
+deadletter remove`; exit codes: `0` ok, `1` reserved-and-never-returned, `2` usage/config/
+credential/bad-input, `3` terminal auth, `4` device/protocol, `5` runaway paging, `6`
+reserved for the push lane. `tests/test_cli_conventions.py` fails if this paragraph, the
+module, and the docs page stop agreeing.
 
 Nothing here contacts a device by itself; `IsapiClient` is constructed in `_client_for`
 and every endpoint name reaching it is a registry entry (see `gateclerk.endpoints`).
@@ -36,21 +37,22 @@ from typing import Annotated, Any
 
 import httpx
 import typer
+from typer.core import TyperGroup
 
 from gateclerk import __version__, pipeline, sink_cli
 from gateclerk import config as cfg
 from gateclerk import demo_device as demo
 from gateclerk.capabilities import device_identity
-from gateclerk.config import KeychainReader, resolve_credentials, site_from_args
-from gateclerk.exceptions import (
-    ConfigError,
-    CredentialUnavailable,
-    EventBoundsError,
-    IsapiAuthError,
-    GateclerkError,
-    SearchProtocolError,
-    SearchRunawayError,
+from gateclerk.cli_conventions import (
+    AUTH_TERMINAL_EXIT,
+    CONFIG_ERROR_EXIT,
+    DEVICE_ERROR_EXIT,
+    RUNAWAY_EXIT,
+    resolve_alias,
 )
+from gateclerk.cli_conventions import exit_code_for as _exit_code_for
+from gateclerk.config import KeychainReader, resolve_credentials, site_from_args
+from gateclerk.exceptions import ConfigError, CredentialUnavailable
 from gateclerk.isapi_transport import IsapiClient
 from gateclerk.output import CHOICES as OUTPUT_CHOICES
 from gateclerk.output import OutputFormat, make_console, render
@@ -75,6 +77,37 @@ __all__ = [
     "app",
     "main",
 ]
+
+
+#: The click class for a group whose verb vocabulary was normalized by CLI-VERBS-HELP: it
+#: accepts the superseded spellings declared in ``cli_conventions.ALIASES`` on the command
+#: line WITHOUT declaring them.
+#:
+#: Why a subclass rather than a second ``@creds_app.command("check")`` on the same
+#: function: a registered alias lands in ``Group.commands``, so it shows up in ``--help``
+#: and in every "the surface is exactly these commands" test. Two spellings printed side by
+#: side teach the operator nothing about which one to type, and a surface test that has to
+#: allow both stops catching real additions. Resolving in ``get_command`` keeps the DECLARED
+#: surface at one spelling per operation while every existing script, cron wrapper and
+#: muscle memory keeps working.
+#:
+#: A subclass per group, not one class with a mutable attribute: two groups sharing a class
+#: would share whichever path was assigned last, so `creds`'s aliases would silently apply
+#: inside `agent deadletter`. A closure over `path` cannot drift.
+def _alias_group(path: tuple[str, ...]) -> type[TyperGroup]:
+    class _Group(TyperGroup):
+        def get_command(self, ctx: Any, cmd_name: str) -> Any:
+            command = super().get_command(ctx, cmd_name)
+            if command is not None:
+                return command
+            # Consulted only after the real lookup missed, so an alias can never shadow a
+            # real command and an unknown name still reaches click and exits 2 (usage).
+            canonical = resolve_alias(path, cmd_name)
+            return super().get_command(ctx, canonical) if canonical is not None else None
+
+    _Group.__name__ = f"AliasGroup_{'_'.join(path)}"
+    return _Group
+
 
 app = typer.Typer(
     name="gateclerk",
@@ -105,38 +138,20 @@ creds_app = typer.Typer(
     help="Credential/config diagnostics. Never contacts the device.",
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
+    # CLI-VERBS-HELP: `check` was the pre-vocabulary spelling of the canonical `test`
+    # verb. `cls=` keeps it working without declaring it (see `_alias_group`).
+    cls=_alias_group(("creds",)),
 )
 
 app.add_typer(device_app)
 app.add_typer(users_app)
 app.add_typer(creds_app)
 
-#: p1-08's exit-code contract, declared here because other cards' tests import them:
-#: a config or credential failure is a different class of "you have not told me how to
-#: reach it" from a device error.
-CONFIG_ERROR_EXIT = 2
-
-#: Also from p1-08's contract, declared here because p1-04's `device capabilities` needs
-#: it now: the read failed at the protocol/transport boundary rather than in the request —
-#: the box answered and said no (or said something we refused to parse), or the host name
-#: never made it to the resolver at all (unresolvable, or unencodable: `[Errno 8]`,
-#: `UnicodeError`/`idna.IDNAError` from the idna step). Distinct from 2 so a script can
-#: tell "fix your config" from "the box, its firmware, or the name you gave me".
-DEVICE_ERROR_EXIT = 4
-
-#: A terminal 401 (circuit open / lockout risk) is its own class — the transport already
-#: refused to retry, and a human has to intervene.
-#:
-#: RESOLVED at this card (p1-08's own contract asked for the renumber): p1-01's
-#: NOT_IMPLEMENTED_EXIT was also 3, which made "not built yet" and "authenticated and
-#: refused" the same number. Every scaffold stub is now implemented, so the stub code is
-#: gone and 3 means terminal-auth and nothing else.
-AUTH_TERMINAL_EXIT = 3
-
-#: The runaway paging cap (p1-08: "5 runaway-cap"). p1-05 raises
-#: `SearchRunawayError` rather than loop forever; this is the number a cron wrapper reads
-#: to distinguish "the device is misbehaving" from "my network is down".
-RUNAWAY_EXIT = 5
+#: The exit-code contract is p1-08's and lives in `gateclerk.cli_conventions` (one source —
+#: CLI-VERBS-HELP). These four names are re-exported from there rather than re-declared:
+#: other cards' tests import them from `gateclerk.cli`, and a number defined twice is a
+#: number that can drift out of one test's expectations and into a production wrapper.
+#: See the conventions module's table for what each class means.
 
 # Port / timeout / tz come from gateclerk.config so the CLI default and the config default
 # cannot drift apart.
@@ -288,7 +303,7 @@ def _auth_exit(fmt: OutputFormat, message: str) -> typer.Exit:
     """
     hint = (
         " (the transport circuit-opened to protect against a terminal account lockout — "
-        "verify the credential before retrying; see gateclerk creds check)"
+        "verify the credential before retrying; see gateclerk creds test)"
     )
     _error_payload(fmt, message + hint, AUTH_TERMINAL_EXIT)
     return typer.Exit(code=AUTH_TERMINAL_EXIT)
@@ -305,34 +320,49 @@ def _runaway_exit(fmt: OutputFormat, message: str) -> typer.Exit:
     return typer.Exit(code=RUNAWAY_EXIT)
 
 
+def _classify(exc: BaseException) -> int:
+    """`cli_conventions.exit_code_for`, with unclassified exceptions re-raising THEMSELVES.
+
+    `exit_code_for` reports an unknown class as a `KeyError` naming it — right for a
+    lookup, wrong here: p1-08's `_fail` ended in `raise exc` so the traceback shows the
+    module that actually has the bug, and a `KeyError` substituting for it would hide it.
+    `from None` drops the KeyError from the chain so the traceback reads as it did before.
+
+    Exit 1 is deliberately NOT a catch-all: an unclassified crash must not read as an
+    expected, branchable failure (see the conventions module's table, code 1).
+    """
+    try:
+        return _exit_code_for(exc)
+    except KeyError:
+        raise exc from None
+
+
 def _fail(fmt: OutputFormat, exc: BaseException) -> typer.Exit:
     """Map any exception escaping a command body onto the documented exit code.
 
-    One function, so a command body cannot pick a different mapping for the same failure
-    and so a new exception class has exactly one place to be added. The order matters:
-    `IsapiAuthError` is an `IsapiError`, and `SearchRunawayError`/`SearchProtocolError`
-    are `GateclerkError`s, so the specific classes must be tested before the general ones.
+    The CLASSIFICATION lives in `gateclerk.cli_conventions.exit_code_for` — the one place a
+    new exception class can be added — and this function owns only the per-class message
+    and payload. That split is what keeps the numbers from drifting: the mapping is not
+    restated here, so a command body cannot pick a different code for the same failure and
+    the conventions module's table stays the truth a reviewer can read.
 
     `TimestampInputError` and `EventBoundsError` land on 2 on purpose: both mean a value
     the operator typed was unusable, which is the "fix your input" class, not "the box is
     broken". `SearchProtocolError` lands on 4: the device changed shape on us.
     """
-    if isinstance(exc, IsapiAuthError):
+    code = _classify(exc)
+    if code == AUTH_TERMINAL_EXIT:
         return _auth_exit(fmt, str(exc))
-    if isinstance(exc, SearchRunawayError):
+    if code == RUNAWAY_EXIT:
         return _runaway_exit(fmt, str(exc))
-    if isinstance(exc, (ConfigError, CredentialUnavailable, TimestampInputError, EventBoundsError)):
+    if code == CONFIG_ERROR_EXIT:
         return _config_exit(fmt, str(exc))
-    if isinstance(exc, (SearchProtocolError, IsapiError)):
-        return _device_exit(fmt, str(exc))
-    if isinstance(exc, GateclerkError):
-        return _device_exit(fmt, str(exc))
-    raise exc
+    return _device_exit(fmt, str(exc))
 
 
-#: `IsapiError` is imported for the isinstance check above; the name is bound here so the
-#: import block at the top stays the single list of what this module depends on.
-from gateclerk.exceptions import IsapiError  # noqa: E402  (after _fail's definition reads better)
+#: `IsapiError` and the other classes in the import block above were used by the inline
+#: isinstance chain that `_fail` carried; the chain now lives in
+#: `gateclerk.cli_conventions.exit_code_for`, so the classes are no longer named here.
 
 
 class _Guard:
@@ -1450,8 +1480,8 @@ def _warn_tz_mismatch(records: Sequence[Any], *, mapping_declared: bool = False)
 # --- creds (p1-02): diagnostics that never open a socket ------------------------------
 
 
-@creds_app.command("check")
-def creds_check(
+@creds_app.command("test")
+def creds_test(
     host: HostArg = None,
     site: SiteOpt = None,
     config: ConfigOpt = None,
@@ -1466,6 +1496,9 @@ def creds_check(
     (card p1-02 DoD): it exercises flags, env and `security find-generic-password`,
     prints `admin@host via keychain`, and never prints the password. Exit 2 with the exact
     `security` command to run when resolution fails.
+
+    CLI-VERBS-HELP: the canonical verb is `test` (it answers "does this resolve", with no
+    side effect); the old spelling `creds check` remains as a hidden alias.
     """
     target = _resolve_site(
         host=host, site=site, port=port, sites_file=config, output=output
@@ -1579,6 +1612,10 @@ deadletter_app = typer.Typer(
     help="Dead-letter triage (P2-04): the pushes that failed past the 24h bound.",
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
+    # CLI-VERBS-HELP: `delete` was the pre-vocabulary spelling of the canonical `remove`
+    # verb (docs/CLI-CONVENTIONS.md). The hidden alias means `agent deadletter delete` in
+    # the operator's scripts, agent_cli's docstrings and deploy/ docs keeps working.
+    cls=_alias_group(("agent", "deadletter")),
 )
 app.add_typer(agent_app)
 agent_app.add_typer(deadletter_app)
@@ -1803,8 +1840,8 @@ def deadletter_list(
     )
 
 
-@deadletter_app.command("delete")
-def deadletter_delete(
+@deadletter_app.command("remove")
+def deadletter_remove(
     id_: Annotated[int, typer.Argument(help="dead_letter row id (from `agent deadletter list`).")],
     site: AgentSiteOpt,
     config: AgentConfigOpt = None,
@@ -1813,13 +1850,17 @@ def deadletter_delete(
 ) -> None:
     """Remove ONE dead-letter row — the only code path that ever deletes one (§2b).
 
-    Deleting is a human call: the payload is the only copy of a punch that never reached the
-    ingest, and a dead letter is never retried again once it is removed. An id that does not
-    exist exits 2 — a typo must not read as a deletion.
+    Removing is a human call: the payload is the only copy of a punch that never reached the
+    ingest, and a dead letter is never retried again once it is gone. An id that does not
+    exist exits 2 — a typo must not read as a removal.
 
     The removal is recorded in the site's push ledger (`agent_cli.discard_dead_letter`):
     without that line the event row — still in the store, now unexcluded — would be re-queued
     and RE-PUSHED on the next pass, which would undo the owner's decision (§2b).
+
+    CLI-VERBS-HELP: the canonical verb is `remove`; the old spelling `deadletter delete`
+    remains as a hidden alias, and the exit-2 wording below keeps the word "deleted" so an
+    operator reading a failed run sees the command they typed.
     """
     from gateclerk import agent_cli
 
@@ -2886,13 +2927,44 @@ def demo_device_urls(
         int,
         typer.Option("--port", help="Port to show in the printed URLs."),
     ] = 80,
+    output: OutputOpt = OutputFormat.TABLE,
 ) -> None:
-    """Print the showcase ISAPI URLs (and the demo credential pair) for a site config."""
+    """Print the showcase ISAPI URLs (and the demo credential pair) for a site config.
+
+    CLI-VERBS-HELP added `-o json` (docs/CLI-CONVENTIONS.md): the URL list is what a
+    `sites.toml`-writing script needs, and it renders through the shared renderer. The digest
+    PASSWORD is masked in the machine form — the CLI-wide `-o json` law is that JSON carries
+    no credential value, and a script that learns to read `password` here will paste a real
+    one in somewhere else. The human-facing table still shows the placeholder pair, because
+    that is the screen README documents for pointing `--host 127.0.0.1` at the fake device.
+    """
     base_url = f"http://{demo.DEMO_BIND_HOST}:{port}"
-    typer.echo(base_url)
-    for name, url in demo.demo_endpoint_urls(base_url):
-        typer.echo(f"  {name}: {url}")
-    typer.echo(f"  digest: user={demo.DEMO_DEFAULT_USER} password={demo.DEMO_DEFAULT_PASSWORD!r}")
+    urls = list(demo.demo_endpoint_urls(base_url))
+    if output is OutputFormat.TABLE:
+        typer.echo(base_url)
+        for name, url in urls:
+            typer.echo(f"  {name}: {url}")
+        typer.echo(
+            f"  digest: user={demo.DEMO_DEFAULT_USER} password={demo.DEMO_DEFAULT_PASSWORD!r}"
+        )
+        return
+    render(
+        [
+            *[
+                {"kind": "endpoint", "name": name, "url": url, "user": "", "password": ""}
+                for name, url in urls
+            ],
+            {
+                "kind": "credential",
+                "name": "digest",
+                "url": "",
+                "user": demo.DEMO_DEFAULT_USER,
+                "password": "***",
+            },
+        ],
+        fmt=output.value,
+        columns=("kind", "name", "url", "user", "password"),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
