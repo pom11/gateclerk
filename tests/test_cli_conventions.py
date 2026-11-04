@@ -130,6 +130,9 @@ EXPECTED_LEAVES: set[str] = {
     "migrate export",
     "migrate probe",
     "migrate undo",
+    "service install",
+    "service logs",
+    "service uninstall",
     "sink add",
     "sink list",
     "sink remove",
@@ -164,8 +167,8 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 30 = 29 after EXPORT-SCANS, plus CLI-STATUS's `status`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 30
+    # 33 = 30 after CLI-STATUS, plus SERVICE-CMD's 3 (`service install|uninstall|logs`).
+    assert len(leaves) == len(EXPECTED_LEAVES) == 33
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
