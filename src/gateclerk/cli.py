@@ -40,7 +40,15 @@ from typing import Annotated, Any
 import httpx
 import typer
 
-from gateclerk import __version__, agent_cmds, credentials, demo_cmds, pipeline, sink_cmds
+from gateclerk import (
+    __version__,
+    agent_cmds,
+    credentials,
+    demo_cmds,
+    export_cmds,
+    pipeline,
+    sink_cmds,
+)
 from gateclerk import config as cfg
 from gateclerk.capabilities import device_identity
 from gateclerk.cli_conventions import (
@@ -2199,6 +2207,7 @@ def migrate_undo(
 
 sink_cmds.register(app)  # the `sink` group (SINKS-CLI), moved out of this file
 demo_cmds.register(app)  # the `demo` group, moved out of this file
+export_cmds.register(app)  # the `export` group (EXPORT-CONFIG / EXPORT-SCANS)
 
 # --- `gateclerk init` — the group lives in gateclerk.init_cli, and so does every handler ---------
 #
