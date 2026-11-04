@@ -17,21 +17,31 @@ re-enrollment on the target — `migrate diff` says so up front as a report-only
 
 ## Quickstart
 
+### 1. Run the offline end-to-end demo first (no hardware, no Keychain)
+
 ```bash
-uv sync --extra fast            # python 3.12 is fetched by uv, not your system python
-uv run gateclerk --version        # gateclerk 0.1.0
-uv run gateclerk --help           # device | users | events | creds | agent | migrate | demo
-uv run ruff check . && uv run pytest          # both offline, both must stay green
+uv sync --extra fast                  # Python 3.12 is provisioned by uv
+uv run gateclerk --version            # gateclerk 0.1.0
+uv run gateclerk demo demo            # fake Hikvision terminal -> SQLite store -> mock HTTPS + CSV sinks
 ```
 
-No device on your desk? `uv run gateclerk demo device serve` runs a loopback fake of the
-`webs` server — same ISAPI envelope shapes the client reads (digest challenge, XML
-System/*, silent maxResults clamp, recorded rejections), SYNTHETIC values only (RFC 5737
-addresses, `Demo*` identities, `DEMO-*` serials/cards): point `--host 127.0.0.1` at it
-and the whole read path runs offline. `demo device urls` prints the URLs and the
-placeholder credential pair.
+`gateclerk demo demo` spins up an in-process loopback fake of a Hikvision ISAPI controller
+plus a mock HTTPS ingest receiver, polls synthetic events + device users, drains them to
+both an `https` sink and a `csv` sink, and prints the resulting files (`examples/` holds
+ready-to-inspect sample outputs: `examples/sites.toml`, `examples/sample_scans.csv`,
+`examples/sample_scans.jsonl`, `examples/sample_roster_line.json`, and the standalone
+`examples/mock_receiver.py` reference server).
 
-Against a real controller on the site LAN, with credentials resolved as below:
+Want to point individual CLI commands at the loopback fake device?
+
+```bash
+uv run gateclerk demo device urls     # prints loopback URLs + placeholder digest credentials
+uv run gateclerk demo device serve    # runs the loopback ISAPI server until Ctrl-C
+```
+
+### 2. Against a real controller on the site LAN
+
+With credentials resolved as in [Credentials](#credentials) below:
 
 ```bash
 uv run gateclerk device info  --host 192.0.2.10                 # model, serial, firmware
@@ -143,18 +153,33 @@ device, because the wrongness is declared and accepted; record provenance
 no longer what made the run's zone. Omit the key for a device whose clock is not
 known-bad; absent it, behaviour is byte-for-byte the previous one.
 
-P2 (site agent) keys are already part of the schema — every one is read by the agent,
-optional for the CLI, and documented in `sites.toml.example`: `cadence_s`/`overlap_s`
-(5-min poll + 5-min gap-healing window), `db_path` (defaults to `./gateclerk-<site>.sqlite3`),
-`db_warn_bytes` (2 GiB store watermark), `push_target` (`stub://` or `https://` ref,
-never a default endpoint) and `push_dead_letter_after_s` (24 h). One rule changes with
-the agent surface: **`iana_tz` becomes REQUIRED** — the P2 agent refuses a block without
-an explicit zone (site tz is payroll truth, never defaulted; docs/P2-SITE-AGENT.md §2d).
-The P1 CLI keeps working on a zoneless block byte-for-byte but prints one `warning:`
-line naming the site, because its fallback is a compiled-in site-a value. Credential
-*references* follow the name `gateclerk-<site>-<host>` (the systemd `LoadCredential=`
-name; macOS keeps the keychain scheme unchanged) — password values remain refused in
-every config surface, unknown-key style.
+P2 (site agent) keys are part of the schema — every one is read by the agent, optional for
+the CLI, and documented in `sites.toml.example` and `examples/sites.toml`:
+`cadence_s`/`overlap_s` (5-min poll + 5-min gap-healing window), `db_path` (defaults to
+`./gateclerk-<site>.sqlite3`), `db_warn_bytes` (2 GiB store watermark), named delivery
+`[[site.sink]]` blocks (or legacy single-target `push_target`), and
+`push_dead_letter_after_s` (24 h). One rule changes with the agent surface:
+**`iana_tz` becomes REQUIRED** — the P2 agent refuses a block without an explicit zone
+(site tz is payroll truth, never defaulted; docs/P2-SITE-AGENT.md §2d). The P1 CLI keeps
+working on a zoneless block byte-for-byte but prints one `warning:` line naming the site,
+because its fallback is a compiled-in site-a value. Credential *references* follow the name
+`gateclerk-<site>-<host>` (the systemd `LoadCredential=` name; macOS keeps the keychain
+scheme unchanged) — password values remain refused in every config surface, unknown-key
+style.
+
+### Delivery sinks decision table (`[[site.sink]]` vs `push_target`)
+
+A site can fan out every stored punch to multiple named sinks (`[[site.sink]]`), or use a
+single legacy `push_target` (which maps to one implicit `https` sink named `legacy`). See
+[`examples/sites.toml`](examples/sites.toml) for a complete annotated example and
+[`examples/mock_receiver.py`](examples/mock_receiver.py) for the HTTPS ingest contract.
+
+| Sink type | What it is | Config snippet (`examples/sites.toml`) | Token / credentials | Rotation | Failure behavior | When to use |
+|---|---|---|---|---|---|---|
+| `https` | POSTs JSONL batches + hourly device-user rosters to an HTTPS ingest (`https://` or `stub://`) | `[[site.sink]]`<br>`name = "cloud_ingest"`<br>`type = "https"`<br>`url = "https://..."` | Bearer token **reference** (`token_env` / `token_keychain`, or default `GATECLERK_INGEST_TOKEN_<SITE>` / `gateclerk-ingest-<site>`) | N/A (remote endpoint) | Independent per-sink `push_queue` retry backoff + `dead_letter` after `push_dead_letter_after_s` (24 h) | Production cloud / ERP ingest (`examples/mock_receiver.py` contract) |
+| `csv` | Appends stable-header UTF-8 CSV rows + `.roster.csv` companion to a local absolute path | `[[site.sink]]`<br>`name = "daily_csv"`<br>`type = "csv"`<br>`path = "/abs/path/events.csv"` | None (local filesystem permissions) | `daily` (default, `<stem>-YYYY-MM-DD.csv`) or `monthly` (`<stem>-YYYY-MM.csv`) | Independent per-sink `push_queue` + `dead_letter` if disk/dir is unwritable | Local spreadsheet / HR share / daily file drop |
+| `jsonl` | Appends one self-describing JSONL record per line to a local absolute path | `[[site.sink]]`<br>`name = "monthly_jsonl"`<br>`type = "jsonl"`<br>`path = "/abs/path/events.jsonl"` | None (local filesystem permissions) | `daily` (default) or `monthly` | Independent per-sink `push_queue` + `dead_letter` | Local log shipper, SIEM, or audit archive |
+| Legacy `push_target` | Single top-level key on `[[site]]`; creates one implicit sink named `legacy` (cannot be combined with `[[site.sink]]` on the same site) | `push_target = "https://..."` (or `"stub:///abs/path"`) | Default site rungs (`GATECLERK_INGEST_TOKEN_<SITE>` / `gateclerk-ingest-<site>`) | N/A | Queues and dead-letters under `sink_name = "legacy"` | Backward compatibility with single-target configs |
 
 `--site site-a --config sites.toml` resolves host/port/user/service in one step. The tool
 never picks a site for you: `--host` or `--site` is required, even when the file holds

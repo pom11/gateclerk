@@ -1,0 +1,63 @@
+# examples/sites.toml — annotated multi-site configuration (SYNTHETIC values only).
+#
+# Credentials NEVER live in this file:
+#   - Device passwords resolve via: flag > GATECLERK_<HOST>_PASSWORD env >
+#     macOS Keychain (service `gateclerk-hikvision`, account = host) >
+#     ~/.config/gateclerk/credentials.json (mode 0600, ref `gateclerk-<site>-<host>`).
+#   - HTTPS sink bearer tokens resolve via the reference named in `token_env` /
+#     `token_keychain` (or default `GATECLERK_INGEST_TOKEN_<SITE>` /
+#     `gateclerk-ingest-<site>`).
+
+# ---------------------------------------------------------------------------
+# Site 1: Named sinks (`[[site.sink]]`) — fan-out to HTTPS + local CSV + JSONL
+# ---------------------------------------------------------------------------
+[[site]]
+name = "demo-site-a"
+host = "192.0.2.10"
+port = 80
+iana_tz = "Europe/Bucharest"
+device_tz = "Europe/Bucharest"
+isapi_user = "admin"
+keychain_service = "gateclerk-hikvision"
+device_code = "DEMO-A-1"
+cadence_s = 300
+overlap_s = 300
+db_path = "./gateclerk-demo-site-a.sqlite3"
+db_warn_bytes = 2147483648
+push_dead_letter_after_s = 86400
+
+  # 1a. Remote HTTPS ingest sink (bearer token referenced by name, never value)
+  [[site.sink]]
+  name = "cloud_ingest"
+  type = "https"
+  url = "https://ingest.example.test/v1/ingest"
+  token_env = "GATECLERK_INGEST_TOKEN_DEMO_SITE_A"
+  token_keychain = "gateclerk-ingest-demo-site-a"
+
+  # 1b. Local CSV archive sink (rotates daily: events-YYYY-MM-DD.csv + .roster.csv)
+  [[site.sink]]
+  name = "daily_csv"
+  type = "csv"
+  path = "/opt/gateclerk-demo/events.csv"
+  rotation = "daily"
+
+  # 1c. Local JSONL archive sink (rotates monthly: events-YYYY-MM.jsonl)
+  [[site.sink]]
+  name = "monthly_jsonl"
+  type = "jsonl"
+  path = "/opt/gateclerk-demo/events.jsonl"
+  rotation = "monthly"
+
+# ---------------------------------------------------------------------------
+# Site 2: Legacy single-target `push_target` (equivalent to one implicit sink
+# named `legacy`; cannot be combined with `[[site.sink]]` on the same site)
+# ---------------------------------------------------------------------------
+[[site]]
+name = "demo-site-b"
+host = "198.51.100.20"
+port = 80
+iana_tz = "Europe/Bucharest"
+isapi_user = "admin"
+keychain_service = "gateclerk-hikvision"
+device_code = "DEMO-B-1"
+push_target = "https://ingest.example.test/v1/ingest"
