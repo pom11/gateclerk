@@ -363,7 +363,7 @@ def test_classification_is_serialisable_for_downstream_storage() -> None:
 # (info + unknown_code + kept).
 
 VENDOR = Path(__file__).parent / "fixtures/vendor"
-REFERENCE_DOC = Path(__file__).resolve().parents[1] / "docs/references/acs-event-codes.md"
+REFERENCE_DOC = Path(__file__).resolve().parents[1] / "docs/internal/references/acs-event-codes.md"
 
 _DOC_ROW = re.compile(
     r"^\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([a-z]+)\s*\|\s*([A-Z0-9_]+)\s*\|\s*([a-z]+)\s*\|\s*`([^`]+)`\s*\|"

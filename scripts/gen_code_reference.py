@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from gateclerk.event_codes import EVENT_CODE_TABLE  # noqa: E402
 
 VENDOR = ROOT / "tests/fixtures/vendor"
-DOC = ROOT / "docs/references/acs-event-codes.md"
+DOC = ROOT / "docs/internal/references/acs-event-codes.md"
 
 START = "<!-- BEGIN GENERATED 3.1 (scripts/gen_code_reference.py) -->"
 END = "<!-- END GENERATED 3.1 -->"
