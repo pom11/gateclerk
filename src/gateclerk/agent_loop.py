@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -75,6 +75,7 @@ from gateclerk.pipeline import (
     paging_limits_from_caps,
     read_capabilities,
 )
+from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
 from gateclerk.tz import TimeResolver, offset_hhmm
 
 __all__ = [
@@ -148,6 +149,23 @@ DEFAULT_DEVICE_USERS_INTERVAL_S = 3600
 
 
 @dataclass(frozen=True, slots=True)
+class SinkDelivery:
+    """One sink's half of one roster push (SINKS-WIRING).
+
+    Exists so the fan-out can report per-destination truth while `DeviceUsersResult` keeps
+    the single-destination shape Task 15 shipped: a roster that reached the archive but not
+    the ingest is a state an operator has to be able to see, and one blended status cannot
+    say it. `error` is the exception CLASS plus a redacted message — never a payload, never
+    a header (the bearer lives in the transport).
+    """
+
+    sink_name: str
+    ok: bool
+    status: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceUsersResult:
     """One roster push attempt (Task 15). Returned as DATA, like TickResult.
 
@@ -155,12 +173,20 @@ class DeviceUsersResult:
     is why this leg deliberately does NOT go through `push_queue`/`dead_letter` (whose
     `event_id` is an FK to a stored event — a roster row has no event to point at) and
     why a failure is a warning plus a retry at the NEXT hourly slot, never a dead-letter.
+    That law is now per sink too (SINKS-WIRING): one sink refusing the roster can never
+    move a roster row into the queue tables.
+
+    `ok`/`status` are Task 15's single-target shape and keep their meaning: `ok` is now
+    "every sink that should have taken it did" and `status` is the first leg's answer (the
+    site's own ingest), so pre-sinks readers see exactly what they saw before. `per_sink`
+    is the fan-out's truth, in the config's declaration order.
     """
 
     ok: bool
     status: int | None
     users: int
     error: str | None = None
+    per_sink: tuple[SinkDelivery, ...] = ()
 
 
 class DeviceLoop:
@@ -197,6 +223,9 @@ class DeviceLoop:
         device_users_interval_s: int = DEFAULT_DEVICE_USERS_INTERVAL_S,
         device_code: str | None = None,
         roster: Callable[[], Any] | None = None,
+        sinks: Sequence[SinkSpec] = (),
+        sink_transports: Mapping[str, PushTransport] | None = None,
+        sink_writers: Mapping[str, Any] | None = None,
     ) -> None:
         if cadence_s <= 0:
             raise ValueError(f"cadence_s {cadence_s} must be > 0 (config validated this)")
@@ -241,6 +270,17 @@ class DeviceLoop:
         #: spec §2a — the roster does not get a second session).
         self._roster = roster
         self._last_roster_push_at: datetime | None = None
+        # --- SINKS-WIRING: the roster fan-out ------------------------------------------------
+        #: The site's sinks (SINKS-CORE's specs). EMPTY for the pre-sinks shape, which is the
+        #: upgrade-inert case: `push_target` + `push_transport` alone still roster exactly as
+        #: Task 15 shipped them, through the single legacy path below.
+        self.sinks = tuple(sinks)
+        #: Per-sink transports for the https legs (injected; keyed by sink NAME).
+        self._sink_transports: dict[str, PushTransport] = dict(sink_transports or {})
+        #: Per-sink file writers for the csv/jsonl legs. A writer is not a `Transport` in the
+        #: roster's sense (the roster row goes to a companion table, not the punch stream), so
+        #: it is a separate seam rather than a value crammed into `_sink_transports`.
+        self._sink_writers: dict[str, Any] = dict(sink_writers or {})
         # Bootstrap state: read once per client, never per tick (spec §2a math).
         self.device_serial: str | None = None
         self._caps: Any = None
@@ -332,8 +372,12 @@ class DeviceLoop:
         the roster cadence (§2a's nonce-budget argument) is a separate hour-clock from
         the 5-minute punch cadence, and only `run_forever`'s per-cycle step — or an
         operator's explicit call — pulls it.
+
+        The clock gates the WHOLE fan-out, not each sink: one hour-clock per loop is the
+        request-budget promise (an hourly roster to N sinks is still one roster walk), so a
+        call inside the hour is a no-op for EVERY sink.
         """
-        if self.push_target is None or self._push_transport is None:
+        if not self._roster_wired():
             return None
         moment = self._now()
         if self._last_roster_push_at is not None:
@@ -341,6 +385,23 @@ class DeviceLoop:
             if elapsed < self.device_users_interval_s:
                 return None
         return self.push_device_users()
+
+    def _roster_wired(self) -> bool:
+        """Can this loop roster at all? (Both Task 15's shape and the fan-out's.)
+
+        The pre-sinks shape needs a target AND a transport; the sink shape needs at least one
+        sink the loop can actually reach (a transport for an https sink, a writer for a file
+        sink). Anything else returns False so both roster methods are honest no-ops rather
+        than crashes — a loop with no way to deliver must not burn its hour-clock pretending.
+        """
+        if self.sinks:
+            return any(
+                self._sink_transport_for(sink) is not None
+                or self._sink_writers.get(sink.name) is not None
+                for sink in self.sinks
+                if sink.accepts_roster
+            )
+        return self.push_target is not None and self._push_transport is not None
 
     def push_device_users(self) -> DeviceUsersResult | None:
         """One roster push over the site's authenticated push channel; None if not wired.
@@ -350,12 +411,19 @@ class DeviceLoop:
         asymmetry). Failure is warn-and-retry-next-hour — a roster the ingest never got
         is refreshed by the next hour's walk, while a punch that never got there is a
         payroll row nobody else can re-derive, which is why only punches dead-letter.
+        SINKS-WIRING moves that law nowhere: a roster still cannot enter the queue tables,
+        it simply reaches N destinations instead of one.
 
         Never raises: like `tick()`, everything that can go wrong comes back as data.
         The warning line carries the exception CLASS and a redacted message, never any
         header — the bearer lives in the transport and this module never sees its value.
+
+        The fan-out walks the sinks in config order and delivers to each one that accepts
+        rosters, so a file sink gets the roster even while the ingest 502s (per-sink
+        warn-and-retry, DoD (d)); `ok` is the AND across the legs and `status` is the first
+        leg's answer, keeping Task 15's shape for a single-destination site.
         """
-        if self.push_target is None or self._push_transport is None:
+        if not self._roster_wired():
             return None
         # Mark the attempt (not the success) as the clock anchor: a failing ingest must
         # not be re-hit every tick by a loop that treats "never succeeded" as "always
@@ -367,7 +435,6 @@ class DeviceLoop:
                 device_code=self.device_code or self._device_identity(),
                 users=users,
             )
-            status = self._push_transport(self.push_target, line)
         except Exception as exc:  # the leg converts everything to data, like tick()
             self._warn(
                 f"warning: device-users roster push failed ({type(exc).__name__}); "
@@ -379,10 +446,49 @@ class DeviceLoop:
                 users=0,
                 error=f"{type(exc).__name__}: {exc}",
             )
+        if not self.sinks:
+            return self._roster_legacy(line, users=len(users))
+        return self._roster_fanout(line, users=len(users))
+
+    def _roster_legacy(self, line: str, *, users: int) -> DeviceUsersResult:
+        """Task 15's single-destination roster, unchanged in shape and in its warn text.
+
+        The one remaining path for a site that declares `push_target` and no sinks, so the
+        upgrade-inert assertions (status, warn wording, keychain hint) keep applying
+        verbatim — the fan-out below reuses this for the implicit sink's own leg.
+        """
+        if self.push_target is None or self._push_transport is None:  # wiring bug, not config
+            raise RuntimeError(
+                f"site {self.site}: the legacy roster leg needs a push_target and its "
+                "transport — reach here only from the no-sinks path of push_device_users"
+            )
+        try:
+            status = self._push_transport(self.push_target, line)
+        except Exception as exc:
+            self._warn(
+                f"warning: device-users roster push failed ({type(exc).__name__}); "
+                f"site={self.site} next attempt in {self.device_users_interval_s}s"
+            )
+            return DeviceUsersResult(
+                ok=False,
+                status=None,
+                users=users,
+                error=f"{type(exc).__name__}: {exc}",
+                per_sink=(
+                    SinkDelivery(
+                        sink_name=IMPLICIT_SINK_NAME,
+                        ok=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                    ),
+                ),
+            )
         result = DeviceUsersResult(
             ok=200 <= status < 300,
             status=status,
-            users=len(users),
+            users=users,
+            per_sink=(
+                SinkDelivery(sink_name=IMPLICIT_SINK_NAME, ok=200 <= status < 300, status=status),
+            ),
         )
         if not result.ok:
             # A 401/403 here is the same keychain-shaped problem a 401 on punches is;
@@ -397,6 +503,103 @@ class DeviceLoop:
                 f"site={self.site} users={result.users}{hint}"
             )
         return result
+
+    def _roster_fanout(self, line: str, *, users: int) -> DeviceUsersResult:
+        """Deliver one roster line to every sink that accepts it — independently, loudly.
+
+        Per-sink isolation is the point (DoD (d)): each leg is wrapped, so a sink that raises
+        or answers 5xx warns with ITS name and ITS status and cannot stop the next sink's
+        write. A file sink's roster row goes to its companion table (`write_roster`), a
+        jsonl sink's is the line verbatim, and the https leg is byte-identical to Task 15's —
+        one roster, N destinations, one wire shape.
+        """
+        moment = self._now()
+        deliveries: list[SinkDelivery] = []
+        for sink in self.sinks:
+            if not sink.accepts_roster:
+                continue
+            try:
+                deliveries.append(self._roster_one(sink, line, moment=moment))
+            except Exception as exc:  # a broken sink must not stop the others
+                self._warn(
+                    f"warning: device-users roster sink={sink.name} failed "
+                    f"({type(exc).__name__}); site={self.site} next attempt in "
+                    f"{self.device_users_interval_s}s"
+                )
+                deliveries.append(
+                    SinkDelivery(
+                        sink_name=sink.name,
+                        ok=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+        if not deliveries:
+            # Nothing accepted the roster (every sink opted out, or none is reachable): the
+            # honest answer is not-ok, not an empty success.
+            return DeviceUsersResult(ok=False, status=None, users=users, per_sink=())
+        first = deliveries[0]
+        return DeviceUsersResult(
+            ok=all(d.ok for d in deliveries),
+            status=first.status,
+            users=users,
+            per_sink=tuple(deliveries),
+        )
+
+    def _roster_one(self, sink: SinkSpec, line: str, *, moment: datetime) -> SinkDelivery:
+        """One sink's roster leg (raises are the caller's to fold into a delivery)."""
+        writer = self._sink_writers.get(sink.name)
+        if writer is not None:
+            from gateclerk.sink_writers import roster_stamp  # local: sink_writers owns the stamp
+
+            if sink.type == "csv":
+                body = writer.render_roster(
+                    line,
+                    {"sink_name": sink.name, "enqueued_at": roster_stamp(moment)},
+                )
+                status = writer.write_roster(body, moment=moment)
+            else:
+                status = writer.write_line(line, moment=moment)
+            ok = 200 <= status < 300
+            if not ok:
+                self._warn(
+                    f"warning: device-users roster sink={sink.name} answered HTTP {status}; "
+                    f"site={self.site}"
+                )
+            return SinkDelivery(sink_name=sink.name, ok=ok, status=status)
+        transport = self._sink_transport_for(sink)
+        if transport is None:
+            raise IsapiError(
+                f"sink {sink.name!r} ({sink.type}) has no transport or writer wired: the "
+                "agent builds one from the sink spec, so a loop that reaches this line was "
+                "constructed without the sink's delivery seam"
+            )
+        status = transport(sink.ref, line)
+        ok = 200 <= status < 300
+        if not ok:
+            hint = (
+                f" check the ingest token keychain item gateclerk-ingest-{self.site}."
+                if status in (401, 403)
+                else ""
+            )
+            self._warn(
+                f"warning: device-users roster push answered HTTP {status}; "
+                f"sink={sink.name} site={self.site}{hint}"
+            )
+        return SinkDelivery(sink_name=sink.name, ok=ok, status=status)
+
+    def _sink_transport_for(self, sink: SinkSpec) -> PushTransport | None:
+        """The injected transport for one https sink, or the site's shared one.
+
+        Keyed by sink NAME (the identity): two sinks aimed at one ref are two delivery
+        obligations and must not silently share one leg's outcome. A file sink has no
+        transport here by design — its writer is the delivery seam.
+        """
+        injected = self._sink_transports.get(sink.name)
+        if injected is not None:
+            return injected
+        if sink.type == "https" and sink.ref == self.push_target:
+            return self._push_transport
+        return None
 
     def _device_identity(self) -> str:
         """What the roster names the device with when no `device_code` is configured.

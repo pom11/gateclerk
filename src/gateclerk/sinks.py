@@ -159,6 +159,15 @@ class SinkSpec:
     #: The declared absolute path a file sink writes (also carried inside `ref` as
     #: `file://<path>`, because `ref` is the one field the queue is allowed to read).
     path: str | None = None
+    # --- shared, and only honoured by the roster leg ----------------------------------
+    #: Whether the hourly `device_users` roster is delivered to this sink too.
+    #:
+    #: Default True: a sink an operator configured is a place site data goes, and a roster
+    #: that quietly skipped it would be a gap discovered in a review. Flipped to False for a
+    #: sink that is only ever meant to hold punches (an archive payroll reconciles against
+    #: event rows, where roster lines would be foreign rows in a documented table). It is
+    #: decided at parse time so the drain never has to re-read the config mid-pass.
+    accepts_roster: bool = True
 
 
 def sink_spec_problem(spec: SinkSpec) -> str | None:
@@ -359,6 +368,25 @@ def _token_ref(table: Mapping[str, Any], key: str, *, site: str, sink: str) -> s
 # --- the three shipped types ------------------------------------------------------------------
 
 
+def _accepts_roster(table: Mapping[str, Any], *, site: str, sink: str) -> bool:
+    """Whether this sink is a roster destination too (default: yes).
+
+    A non-boolean is refused rather than coerced: `accepts_roster = "no"` is a TOML
+    string, and a truthy string would silently switch a sink's roster OFF (or on) in a
+    payroll archive — the same class of mistake `rotation` refuses by whitelist.
+    """
+    if "accepts_roster" not in table:
+        return True
+    value = table["accepts_roster"]
+    if not isinstance(value, bool):
+        raise ConfigError(
+            f"site {site!r} sink {sink!r}: accepts_roster must be a boolean (true/false), "
+            f"got {type(value).__name__} — a roster that is silently included or excluded "
+            "is a gap in a documented file"
+        )
+    return value
+
+
 def _build_https(table: Mapping[str, Any], site: str) -> tuple[str, Mapping[str, Any]]:
     """An https sink: the url is the ref, the token stays a reference.
 
@@ -379,6 +407,7 @@ def _build_https(table: Mapping[str, Any], site: str) -> tuple[str, Mapping[str,
         "token_env": _token_ref(table, "token_env", site=site, sink=sink),
         "token_keychain": _token_ref(table, "token_keychain", site=site, sink=sink),
         "headers": _headers(table, site=site, sink=sink),
+        "accepts_roster": _accepts_roster(table, site=site, sink=sink),
     }
 
 
@@ -396,6 +425,7 @@ def _build_file(kind: str) -> Callable[[Mapping[str, Any], str], tuple[str, Mapp
         return f"file://{path}", {
             "path": path,
             "rotation": _rotation(table, site=site, sink=sink),
+            "accepts_roster": _accepts_roster(table, site=site, sink=sink),
         }
 
     return build
@@ -404,7 +434,7 @@ def _build_file(kind: str) -> Callable[[Mapping[str, Any], str], tuple[str, Mapp
 register_sink_type(
     SinkType(
         name="https",
-        keys=("url", "token_env", "token_keychain", "headers"),
+        keys=("url", "token_env", "token_keychain", "headers", "accepts_roster"),
         required=("url",),
         build=_build_https,
     )
@@ -412,7 +442,7 @@ register_sink_type(
 register_sink_type(
     SinkType(
         name="csv",
-        keys=("path", "rotation"),
+        keys=("path", "rotation", "accepts_roster"),
         required=("path",),
         build=_build_file("csv"),
     )
@@ -420,7 +450,7 @@ register_sink_type(
 register_sink_type(
     SinkType(
         name="jsonl",
-        keys=("path", "rotation"),
+        keys=("path", "rotation", "accepts_roster"),
         required=("path",),
         build=_build_file("jsonl"),
     )

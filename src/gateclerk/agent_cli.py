@@ -88,6 +88,7 @@ from gateclerk.config import (
     resolve_credentials,
 )
 from gateclerk.isapi_transport import IsapiClient
+from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
 
 __all__ = [
     "HEALTH_DIR_NAME",
@@ -161,16 +162,38 @@ class PushLedger:
         # Resolved at call time, like the SiteAgent clock: a test that monkeypatches the
         # module-level warn after construction still sees the ledger's lines.
         self._warn = warn
-        self._known: dict[str, set[int]] | None = None  # endpoint -> event ids (lazy load)
+        # (endpoint, sink name) -> event ids, lazy. The sink half is SINKS-WIRING: with N
+        # sinks per site, "already pushed" is a fact ABOUT A SINK (the other sinks have
+        # their own backlog), and one bucket per endpoint would let a successful https leg
+        # mark the same event as done for the csv archive that has not seen it yet.
+        self._known: dict[tuple[str, str | None], set[int]] | None = None
 
-    def known(self, endpoint: str) -> set[int]:
-        """Event ids already `sent` or `gone` for this endpoint (loads the file once)."""
+    def known(self, sink_name: str = IMPLICIT_SINK_NAME, *, endpoint: str) -> set[int]:
+        """Event ids already `sent` or `gone` for this (endpoint, sink) — a copy, loads once.
+
+        A line written BEFORE sinks existed carries no `s`, and is read as belonging to this
+        endpoint for EVERY sink aimed at it. That is the upgrade-inert half of the keying:
+        such a line is evidence that the endpoint has seen the event, which is exactly what
+        a sink pointing at that endpoint needs, and it is what keeps upgrade day from
+        re-pushing the whole store at a site that replaced `push_target` with a sink at the
+        same URL. The sink half only ever makes the exclusion narrower for lines written
+        WITH a sink name.
+        """
         if self._known is None:
             self._known = self._load()
-        return self._known.setdefault(endpoint, set())
+        out = set(self._known.get((endpoint, sink_name), ()))
+        # `set()` default, NOT `()`: `|=` onto a set accepts any iterable, but the tuple
+        # default blew up on the first legacy-line lookup (found by tests/test_p2_07b).
+        out |= self._known.get((endpoint, None), set())
+        return out
 
-    def _load(self) -> dict[str, set[int]]:
-        out: dict[str, set[int]] = {}
+    def _bucket(self, endpoint: str, sink_name: str) -> set[int]:
+        known = self._known if self._known is not None else self._load()
+        self._known = known
+        return known.setdefault((endpoint, sink_name), set())
+
+    def _load(self) -> dict[tuple[str, str | None], set[int]]:
+        out: dict[tuple[str, str | None], set[int]] = {}
         if not self.path.exists():
             return out
         for line in self.path.read_text(encoding="utf-8").splitlines():
@@ -178,7 +201,12 @@ class PushLedger:
                 continue
             try:
                 record = json.loads(line)
-                out.setdefault(record["t"], set()).add(int(record["e"]))
+                # `s` is SINKS-WIRING's sink name; its ABSENCE is a pre-sinks line and keys
+                # the bucket to None (read as "every sink on this endpoint" by `known`).
+                sink_name = record.get("s")
+                if sink_name is not None and not isinstance(sink_name, str):
+                    raise TypeError(f"sink name {sink_name!r} is not a string")
+                out.setdefault((record["t"], sink_name), set()).add(int(record["e"]))
             except (ValueError, KeyError, TypeError):
                 # A torn final line (killed mid-append) or corruption must not stop a poll:
                 # the worst case is one re-push the UPSERT absorbs. Warn, skip, continue.
@@ -187,23 +215,41 @@ class PushLedger:
                 )
         return out
 
-    def append(self, event_ids: Sequence[int], *, endpoint: str, kind: str = "sent") -> None:
+    def append(
+        self,
+        event_ids: Sequence[int],
+        *,
+        endpoint: str,
+        sink_name: str = IMPLICIT_SINK_NAME,
+        kind: str = "sent",
+    ) -> None:
         """Record what just happened for these events. Append-only: small lines, atomic enough.
 
         One writer per site (the unit is per-site), so appends cannot interleave with each
         other; a concurrent CLI `deadletter delete` appends its own line (O_APPEND keeps
         single small lines intact on a local filesystem — and a torn line loads as skipped).
+
+        The line gains `s` (the sink) and keeps `e`/`t`/`k` exactly as before: an older
+        reader of a newer ledger sees precisely what it saw before, which is the direction
+        of compatibility that matters on upgrade day (the file is on disk, not in a schema).
+        `sink_name` defaults to the implicit legacy sink so a pre-sinks caller keeps
+        compiling and writes a line a pre-sinks reader still understands.
         """
         if not event_ids:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
             for event_id in event_ids:
-                handle.write(json.dumps({"e": int(event_id), "t": endpoint, "k": kind}) + "\n")
-        self.known(endpoint).update(int(e) for e in event_ids)
+                handle.write(
+                    json.dumps({"e": int(event_id), "t": endpoint, "k": kind, "s": sink_name})
+                    + "\n"
+                )
+        self._bucket(endpoint, sink_name).update(int(e) for e in event_ids)
 
-    def apply_exclusion(self, conn: Any, endpoint: str) -> None:
-        """Expose `known(endpoint)` to SQL as a TEMP table (per-connection, dies with it).
+    def apply_exclusion(
+        self, conn: Any, sink_name: str = IMPLICIT_SINK_NAME, *, endpoint: str
+    ) -> None:
+        """Expose `known(sink_name, endpoint=...)` to SQL as a TEMP table (dies with it).
 
         The exclusion has to happen INSIDE the candidate query: without it, a store whose
         first N events are all ledger-known would return N candidates, filter to zero, and
@@ -212,7 +258,7 @@ class PushLedger:
         """
         conn.execute("DROP TABLE IF EXISTS temp.agent_push_ledger")
         conn.execute("CREATE TEMP TABLE agent_push_ledger (event_id INTEGER NOT NULL PRIMARY KEY)")
-        known = self.known(endpoint)
+        known = self.known(sink_name, endpoint=endpoint)
         if known:
             conn.executemany(
                 "INSERT OR IGNORE INTO temp.agent_push_ledger VALUES (?)",
@@ -227,7 +273,9 @@ def _reset_ledger_table(conn: Any) -> None:
     conn.execute("CREATE TEMP TABLE agent_push_ledger (event_id INTEGER NOT NULL PRIMARY KEY)")
 
 
-def discard_dead_letter(conn: Any, dead_letter_id: int, *, ledger: PushLedger) -> bool:
+def discard_dead_letter(
+    conn: Any, dead_letter_id: int, *, ledger: PushLedger, sink_name: str | None = None
+) -> bool:
     """The owner's `deadletter delete` path, ledger-armed: delete ONE row, remember it gone.
 
     Why this exists beside `agent_push.delete_dead_letter` (which stays exactly as shipped):
@@ -237,15 +285,25 @@ def discard_dead_letter(conn: Any, dead_letter_id: int, *, ledger: PushLedger) -
     from the other side: "deleted only by the owner's command" has to mean gone, not
     "re-pushed next tick". Recording the id as `gone` in the ledger keeps the exclusion
     without touching the schema or the pusher.
+
+    `sink_name` defaults to the row's OWN sink (read from the row being deleted): the owner
+    deleted this sink's copy of the event, and the other sinks still have their own backlog
+    to serve. A caller may pass one explicitly only to record the delete against a different
+    sink, which no shipped command does.
     """
     row = conn.execute(
-        "SELECT event_id, endpoint FROM dead_letter WHERE id = ?", (dead_letter_id,)
+        "SELECT event_id, endpoint, sink_name FROM dead_letter WHERE id = ?", (dead_letter_id,)
     ).fetchone()
     if row is None:
         return False
     if not agent_push.delete_dead_letter(conn, dead_letter_id):
         return False
-    ledger.append([row["event_id"]], endpoint=row["endpoint"], kind="gone")
+    ledger.append(
+        [row["event_id"]],
+        endpoint=row["endpoint"],
+        sink_name=sink_name or row["sink_name"] or IMPLICIT_SINK_NAME,
+        kind="gone",
+    )
     return True
 
 
@@ -256,8 +314,9 @@ def queue_new_events(
     now: datetime,
     limit: int = agent_push.DEFAULT_PUSH_BATCH_LIMIT,
     ledger: PushLedger | None = None,
+    sink_name: str = IMPLICIT_SINK_NAME,
 ) -> tuple[int, ...]:
-    """Queue every stored event that has no send buffer for `endpoint`; return queue ids.
+    """Queue every stored event that has no send buffer for this sink; return queue ids.
 
     The missing link between P2-02's store and P2-04's drain (module docstring). It lives
     here rather than in `agent_push` because it is not a push rule — the pusher stays exactly
@@ -265,42 +324,68 @@ def queue_new_events(
     year-old store must not build an unbounded queue in one transaction; the rest is still
     there, due, on the next pass.
 
-    Two exclusions, both load-bearing:
+    `sink_name` (SINKS-WIRING) is which sink this pass is queueing FOR: every exclusion is
+    per (event, sink), because an event the ingest has already accepted still has to reach
+    the csv archive that has never seen it. It defaults to the implicit legacy sink, so the
+    pre-sinks call shape (`endpoint=site.push_target`, no sink) is unchanged.
+
+    Three exclusions, all load-bearing:
+    * `push_queue` — this sink already has a buffer for the event (plus, for the legacy sink
+      only, any `legacy+<n>` row: see the note on `legacy_wild` below);
     * `dead_letter` — a dead-lettered row's queue buffer was DELETED *because* the 24 h
       bound expired; re-queuing it would re-push a poison payload every tick forever, which
       is the opposite of §2b ("a dead letter leaves the table only through the owner's
       command");
-    * the ledger's TEMP table — what THIS poller already pushed (see `PushLedger`). Without
-      it, every process restart re-queues and re-pushes the whole store. The exclusion is
-      inside the query (not a post-filter) so a store whose oldest N rows are all known
-      still reaches the unsent rows behind them.
+    * the ledger's TEMP table — what THIS poller already pushed for this sink (see
+      `PushLedger`). Without it, every process restart re-queues and re-pushes the whole
+      store. The exclusion is inside the query (not a post-filter) so a store whose oldest N
+      rows are all known still reaches the unsent rows behind them.
     """
     if ledger is not None:
-        ledger.apply_exclusion(conn, endpoint)
+        ledger.apply_exclusion(conn, sink_name, endpoint=endpoint)
     else:
         _reset_ledger_table(conn)
+    # The `legacy+<n>` arm of each clause is dead for a named sink: those rows are what the
+    # v5/v6 migration mints when a pre-upgrade event had been buffered against two targets
+    # (the operator moved `push_target` mid-backlog) — the oldest keeps `legacy`, the rest get
+    # `legacy+<id>`. They carry a `+`, which config's identifier rule rejects, so no configured
+    # sink can ever drain them; for the IMPLICIT sink they are the same push's history and
+    # re-queueing would re-push a punch the legacy target already took. A newly configured sink
+    # has genuinely never seen the event, so excluding it there would be silent loss, not
+    # dedupe. The gate is a BOUND 0/1 — the query text stays a literal.
+    legacy_wild = 1 if sink_name == IMPLICIT_SINK_NAME else 0
     rows = conn.execute(
         """
         SELECT e.id AS id
           FROM events AS e
          WHERE NOT EXISTS (
                  SELECT 1 FROM push_queue AS q
-                  WHERE q.event_id = e.id AND q.endpoint = ?)
+                  WHERE q.event_id = e.id AND q.endpoint = ?
+                    AND (q.sink_name = ? OR (? = 1 AND substr(q.sink_name, 1, 7) = 'legacy+')))
            AND NOT EXISTS (
                  SELECT 1 FROM dead_letter AS d
-                  WHERE d.event_id = e.id AND d.endpoint = ?)
+                  WHERE d.event_id = e.id AND d.endpoint = ?
+                    AND (d.sink_name = ? OR (? = 1 AND substr(d.sink_name, 1, 7) = 'legacy+')))
            AND NOT EXISTS (
                  SELECT 1 FROM temp.agent_push_ledger AS l
                   WHERE l.event_id = e.id)
          ORDER BY e.id
          LIMIT ?
         """,
-        (endpoint, endpoint, max(1, int(limit))),
+        (
+            endpoint,
+            sink_name,
+            legacy_wild,
+            endpoint,
+            sink_name,
+            legacy_wild,
+            max(1, int(limit)),
+        ),
     ).fetchall()
     ids = [row["id"] for row in rows]
     if not ids:
         return ()
-    return agent_push.enqueue_events(conn, ids, endpoint=endpoint, now=now)
+    return agent_push.enqueue_events(conn, ids, endpoint=endpoint, now=now, sink_name=sink_name)
 
 
 # --- the reports `agent run` prints ---------------------------------------------------------
@@ -329,9 +414,15 @@ class SiteTickReport:
     push_failed: int = 0
     dead_lettered: int = 0
     parked: tuple[str, ...] = ()
+    #: Per-sink counters for this pass (SINKS-WIRING): sink name -> `pushed`/`push_failed`/
+    #: `dead_lettered`/`queued`. The scalars above stay the SUM across sinks (so every
+    #: existing reader keeps its meaning), but one blended number would hide "the ingest leg
+    #: failed while the archive succeeded" — the outage an operator has to see. Counters
+    #: only: never a payload, a host, or a token.
+    sinks: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "at": self.at,
             "ticks_ok": self.ticks_ok,
             "ticks_failed": self.ticks_failed,
@@ -348,6 +439,12 @@ class SiteTickReport:
             "dead_lettered": self.dead_lettered,
             "parked": list(self.parked),
         }
+        # Emitted whenever the pass touched any sink (including the implicit legacy one), so
+        # a single-sink site's JSON has the same shape as an N-sink site's and a reader never
+        # has to special-case the legacy form.
+        if self.sinks:
+            out["sinks"] = {name: dict(counts) for name, counts in self.sinks.items()}
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +532,7 @@ class SiteAgent:
         health_path: Path | None = None,
         push_transport: agent_push.Transport | None = None,
         ledger: PushLedger | None = None,
+        sink_transports: Mapping[str, agent_push.Transport] | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] | None = None,
         monotonic: Callable[[], float] | None = None,
@@ -463,6 +561,32 @@ class SiteAgent:
         self._warn = warn if warn is not None else _stderr_warn
         self.push_target = site.push_target
         self._push_transport = push_transport
+        # --- SINKS-WIRING: the fan-out ------------------------------------------------------
+        # `effective_sinks` is the whole upgrade story in one property: a site that declares
+        # `[[site.sink]]` blocks gets those, a site with only `push_target` gets the single
+        # implicit `legacy` sink aimed at exactly that ref, and a site with neither is the
+        # pusher being off. Nothing below branches on "is this the legacy case" — the legacy
+        # site is one sink in a list of one, which is why the pre-sinks behaviour is unchanged
+        # rather than duplicated.
+        self.sinks: tuple[SinkSpec, ...] = site.effective_sinks
+        #: Injected per-sink transports (tests, owner-wired); an injected one always wins over
+        #: what `_sink_transport` would build. Keyed by sink NAME — the identity — never by
+        #: ref, because two sinks may share one ref and must not share one transport object.
+        self._sink_transports: dict[str, agent_push.Transport] = dict(sink_transports or {})
+        #: Lazily built transports, keyed by name (the same cache `build_site_agent` avoids
+        #: by building once: every `security` invocation can be a macOS ACL prompt).
+        self._built_sink_transports: dict[str, agent_push.Transport] = {}
+        if not self.sinks:
+            # Absence is loud, mirroring the push_target-absent law Task 15 states for a
+            # missing bearer: an operator who removed the last sink (or never wrote one)
+            # learns it from this line at startup, not from a payroll gap in three months.
+            # This is a warn, not a refusal — §3 forbids defaulting an endpoint, and "no
+            # push" is a legitimate configuration the operator is entitled to choose.
+            self._warn(
+                f"warning: site {self.site.name!r} has no sinks: neither push_target nor "
+                "[[site.sink]] is declared, so nothing this site polls will be pushed. "
+                "Queued events stay queued (and nothing gets queued)."
+            )
         # The poller's sent/gone ledger (class docstring on `PushLedger`). None means "no
         # ledger" — the pure-API shape tests use when they want the raw P2-04 behaviour.
         self.ledger = ledger
@@ -522,7 +646,11 @@ class SiteAgent:
             # Nelegati view, never through the punch counters P2-05/P2-06 read.
             loop.push_device_users_if_due()
         report.alerts.extend(self._observe_watermark())
-        if self.push_target is not None:
+        # The pusher is on when the site HAS sinks. For a pre-sinks site that is the single
+        # implicit legacy sink aimed at `push_target`, so this is the same condition the
+        # card shipped (`push_target is not None`) — just expressed through the one property
+        # that knows both forms.
+        if self.sinks:
             self._push(moment, report)
         report.parked = self.parked_keys()
         self._write_health()
@@ -633,49 +761,122 @@ class SiteAgent:
         cadence = float(max(loop.cadence_s for loop in self.loops))
         return max(0.0, cadence - (time.monotonic() - self._cycle_started))
 
-    def _push(self, moment: datetime, report: _TickBuilder) -> None:
-        target = self.push_target
-        if target is None:  # tick() only calls this when a target is configured
-            return
-        transport = self._push_transport
-        if transport is None:
-            if target.startswith("stub://"):
-                transport = agent_push.stub_transport(target)
-            elif target.startswith("https://"):
-                # Task 15: the real ingest leg exists now. A SiteAgent built directly
-                # (not through `build_site_agent`) resolves the bearer on the rungs the
-                # transport owns — env `GATECLERK_INGEST_TOKEN_<SITE>`, then the keychain
-                # item `gateclerk-ingest-<site>`.
-                transport = agent_push.https_transport(self.site.name)
-                self._push_transport = transport
+    # --- the fan-out: one queue step, one drain per sink ------------------------------------
+
+    def _sink_transport(self, sink: SinkSpec) -> agent_push.Transport:
+        """The transport one sink drains through — built from the sink's own config alone.
+
+        Resolution order: an injected one (tests, owner-wired) wins; then a cached lazily
+        built one; then build it here:
+
+        * `csv` / `jsonl` -> a `FileSinkWriter` for that spec. No injected transport is
+          needed for a file sink at all, which is the point: a site that configures an
+          archive gets an archive written, and a csv sink that silently never wrote would be
+          payroll loss discovered at audit time.
+        * `https` with the site's shared transport available -> that object (the T15 leg,
+          unchanged: same client, same bearer, same wire bytes). A site that declared sinks
+          has no `push_target`, so the shared transport is the one `build_site_agent` built
+          from the first https sink or that the caller injected.
+        * `https` otherwise (per-sink token refs/headers, or no shared transport) ->
+          `sink_writers.build_https_sink_transport`, which is Task 15's transport addressed
+          from THIS sink's token ref.
+
+        Built lazily for the same reason the bearer is resolved lazily: every `security`
+        invocation can be a macOS ACL prompt, and a sink with nothing queued has no reason to
+        ask. The result is cached per name so one sink never builds two.
+        """
+        injected = self._sink_transports.get(sink.name)
+        if injected is not None:
+            return injected
+        built = self._built_sink_transports.get(sink.name)
+        if built is not None:
+            return built
+        if sink.type in ("csv", "jsonl"):
+            from gateclerk.sink_writers import FileSinkWriter
+
+            # The agent's OWN clock stamps the rotation: a frozen test clock must freeze the
+            # file name (the rotation stamp is part of what a deterministic run controls), and
+            # in production the two clocks are the same object anyway.
+            transport: agent_push.Transport = FileSinkWriter(sink, now=self.now)
+        elif sink.type == "https":
+            if sink.ref.startswith("stub://"):
+                # `stub://` stays lazy and per-sink, exactly as the pre-sinks card had it:
+                # the path is resolved at call time by `stub_transport`, which is what keeps a
+                # `push_target = stub://` site byte-identical at upgrade (its implicit sink IS
+                # an https sink with a stub ref). It also cannot be shared: two stub sinks are
+                # two different files.
+                transport = agent_push.stub_transport(sink.ref)
             else:
-                raise ConfigError(
-                    f"push_target {target!r} has no transport: this repo serves "
-                    "`stub://` and `https://` only and never invents an endpoint "
-                    "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at one "
-                    "of those."
+                shared = self._push_transport
+                needs_own_wiring = bool(sink.token_env or sink.token_keychain or sink.headers)
+                if shared is not None and not needs_own_wiring:
+                    transport = shared
+                else:
+                    from gateclerk.sink_writers import build_https_sink_transport
+
+                    transport = build_https_sink_transport(self.site.name, sink)
+        else:
+            raise ConfigError(
+                f"sink {sink.name!r} has type {sink.type!r}, which this repo cannot send to: "
+                "the registry knows https, csv and jsonl (a new type needs a writer in "
+                "gateclerk.sink_writers, never a silent skip)"
+            )
+        self._built_sink_transports[sink.name] = transport
+        return transport
+
+    def _push(self, moment: datetime, report: _TickBuilder) -> None:
+        """Queue once, then drain EVERY sink independently — one pass, N backoffs.
+
+        The order is the card's law: for each sink, queue the events that sink has not seen
+        (per-(event, sink) exclusions) and drain what is due for that sink. Each `drain` call
+        is its own transaction batch with its own ladder and its own 24 h bound, so a sink at
+        its batch cap stops claiming only ITS rows and an https outage never starves a file
+        sink (DoD (a)); a poison row dead-letters in the one sink that could not take it and
+        survives every other sink's success (DoD (b)).
+
+        One sink's whole step is wrapped, so an exception escaping it — a transport blowing up
+        outside its contract, a writer wired wrong — becomes a loud per-sink warn and the
+        remaining sinks still get their drain in the SAME pass. That is not papering over a
+        bug: the alternative is one mis-configured sink stopping the delivery of payroll data
+        to every other destination the operator declared.
+        """
+        for sink in self.sinks:
+            try:
+                self._push_one(sink, moment, report)
+            except Exception as exc:  # a broken sink must not stop the others
+                self._warn(
+                    f"warning: sink {sink.name!r} pass failed "
+                    f"({type(exc).__name__}: {exc}); the site's other sinks are unaffected"
                 )
-        report.queued = len(
-            queue_new_events(self.conn, endpoint=target, now=moment, ledger=self.ledger)
+
+    def _push_one(self, sink: SinkSpec, moment: datetime, report: _TickBuilder) -> None:
+        """One sink's half of the pass: queue step, bearer gate, drain, ledger, counters."""
+        target = sink.ref
+        transport = self._sink_transport(sink)
+        queued = len(
+            queue_new_events(
+                self.conn,
+                endpoint=target,
+                now=moment,
+                ledger=self.ledger,
+                sink_name=sink.name,
+            )
         )
-        # Task 15: a bearer transport with no token skips THIS cycle's drain, loudly.
-        # The alternative — draining anyway — fails every row with the same error until
-        # the 24 h bound dead-letters the site's whole backlog for a missing keychain
-        # item, which §2c's outage clock was never meant to measure. The rows stay
-        # queued; installing the token fixes the run without owner replay. The probe
-        # runs only when something is actually pending: an idle cycle must not spend a
-        # `security` invocation (each can be a macOS ACL prompt), and once a token IS
-        # resolvable the transport caches it and every later probe is free.
-        pending = report.queued or agent_push.queue_depth(self.conn)
+        report.sink_counts(sink.name, queued=queued)
+        # Task 15: a bearer transport with no token skips THIS cycle's drain, loudly — and
+        # the same law now applies per sink, because a sink whose token ref is wrong would
+        # otherwise burn its whole backlog into dead letters for an install-time mistake.
+        pending = queued or agent_push.queue_depth(self.conn, sink_name=sink.name)
         probe = getattr(transport, "token_available", None)
         if pending and probe is not None and not probe():
             self._warn(
-                f"warning: push target {target!r} has no ingest bearer token for site "
-                f"{self.site.name!r}: set "
-                f"{agent_push.ingest_token_env_var(self.site.name)} or add the keychain "
-                f"item with security add-generic-password -U -s gateclerk-ingest-"
-                f"{self.site.name} -a {self.site.name} -w. Queued events stay queued "
-                "until then (no attempts burned, no dead-letters)."
+                f"warning: sink {sink.name!r} at target {target!r} has no ingest bearer "
+                f"token for site {self.site.name!r}: set "
+                f"{agent_push.ingest_token_env_var(self.site.name)} (or the sink's own "
+                f"token_env / token_keychain) or add the keychain item with security "
+                f"add-generic-password -U -s gateclerk-ingest-{self.site.name} -a "
+                f"{self.site.name} -w. Queued events stay queued until then (no attempts "
+                "burned, no dead-letters)."
             )
             return
         result = agent_push.drain(
@@ -686,15 +887,47 @@ class SiteAgent:
             rng=random.random,
             dead_letter_after_s=self.site.push_dead_letter_after_s,
             log=self._observe_push,
+            sink_name=sink.name,
         )
-        report.pushed = result.push_ok
-        report.push_failed = result.push_failed
-        report.dead_lettered = len(result.dead_lettered)
-        # Record what left the building (PushLedger docstring). Only successes need a line:
-        # a row the drain dead-lettered stays excluded through the `dead_letter` arm of the
-        # queue query until the owner's `delete` records it as `gone`.
+        report.sink_push_result(
+            sink.name,
+            pushed=result.push_ok,
+            failed=result.push_failed,
+            dead_lettered=len(result.dead_lettered),
+        )
+        self._warn_file_sink_failures(sink, result)
+        # Record what left the building (PushLedger docstring), for THIS sink. Only successes
+        # need a line: a row the drain dead-lettered stays excluded through the `dead_letter`
+        # arm of the queue query until the owner's `delete` records it as `gone`.
         if self.ledger is not None:
-            self.ledger.append(result.sent, endpoint=target, kind="sent")
+            self.ledger.append(result.sent, endpoint=target, sink_name=sink.name, kind="sent")
+
+    def _warn_file_sink_failures(self, sink: SinkSpec, result: agent_push.DrainResult) -> None:
+        """A file sink that could not write says so, naming the sink and the failure class.
+
+        `drain`'s own log line counts rows (the health parser partitions on it) but carries no
+        reason, and for an https sink the reason is in the row's `HttpStatus503`-style class
+        that an operator reads off the dead-letter table. A file sink's failure is different:
+        the usual cause is a path the site cannot write (a data directory on an unmounted
+        volume, a permission change, `path` pointing at a directory), and every row of the
+        backlog fails the SAME way, so a silent retry loop looks like a healthy agent that
+        simply never delivers. Name the sink, name the class, keep the rows queued.
+        """
+        if sink.type not in ("csv", "jsonl") or result.push_failed == 0:
+            return
+        classes: list[str] = []
+        for row in agent_push.pending_rows(self.conn, sink_name=sink.name):
+            if row.last_error_class and row.last_error_class not in classes:
+                classes.append(row.last_error_class)
+        for row in agent_push.dead_letter_rows(self.conn, sink_name=sink.name):
+            if row.error_class not in classes:
+                classes.append(row.error_class)
+        named = ", ".join(classes) if classes else "unknown"
+        self._warn(
+            f"warning: sink {sink.name!r} ({sink.type}) could not write to {sink.ref!r}: "
+            f"{result.push_failed} row(s) failed ({named}); the rows stay queued and will be "
+            "retried on the sink's own backoff ladder"
+        )
 
     def _observe_push(self, line: str) -> None:
         """drain's OWN log line, routed to the health collector (its push counters parse it)."""
@@ -752,6 +985,29 @@ class _TickBuilder:
         self.push_failed = 0
         self.dead_lettered = 0
         self.parked: tuple[str, ...] = ()
+        #: sink name -> counters, in insertion order (the config's declaration order, because
+        #: the fan-out walks the sinks in that order). Counters only, never content.
+        self.sink_counters: dict[str, dict[str, int]] = {}
+
+    def sink_counts(self, sink_name: str, *, queued: int) -> None:
+        """Record the queue step for one sink (created on first sight, order = config's)."""
+        self.queued += queued
+        self.sink_counters.setdefault(sink_name, {}).update(queued=queued)
+
+    def sink_push_result(
+        self, sink_name: str, *, pushed: int, failed: int, dead_lettered: int
+    ) -> None:
+        """Record one sink's drain, and keep the site totals as the SUM across sinks.
+
+        The scalars are what every pre-sinks reader already reads (`report.pushed`), so they
+        must stay the total; the per-sink map is what makes "which leg failed" answerable
+        without guessing.
+        """
+        counters = self.sink_counters.setdefault(sink_name, {"queued": 0})
+        counters.update(pushed=pushed, push_failed=failed, dead_lettered=dead_lettered)
+        self.pushed += pushed
+        self.push_failed += failed
+        self.dead_lettered += dead_lettered
 
     def absorb(self, result: TickResult) -> None:
         if result.ok:
@@ -782,6 +1038,7 @@ class _TickBuilder:
             push_failed=self.push_failed,
             dead_lettered=self.dead_lettered,
             parked=self.parked,
+            sinks={name: dict(counts) for name, counts in self.sink_counters.items()},
         )
 
 

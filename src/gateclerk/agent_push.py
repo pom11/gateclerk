@@ -442,6 +442,22 @@ def enqueue_events(
 # --- drain: the retry loop (one tick) ---------------------------------------------------------
 
 
+def default_row_meta(event_id: int, sink_name: str, enqueued_at: str) -> dict[str, str]:
+    """The envelope a rendering sink's row is built from — the queue's own three fields.
+
+    `enqueued_at` is the QUEUE row's stamp, not "now": after a two-day outage a reader of a
+    csv archive can still tell queue lag from event time, which is the only reason the
+    column exists. `sink_name` is the row's identity as stored, so a `legacy+<n>` row
+    migrated by v5/v6 reports the name it was queued under rather than today's configured
+    name (a row that lied about which sink served it would be unattributable forever).
+    """
+    return {"event_id": str(event_id), "sink_name": sink_name, "enqueued_at": enqueued_at}
+
+
+#: The callable shape `drain` hands a rendering transport: the queue row's facts.
+RowMeta = Callable[[int, str, str], Mapping[str, str]]
+
+
 def drain(
     conn: sqlite3.Connection,
     *,
@@ -455,6 +471,7 @@ def drain(
     limit: int = DEFAULT_PUSH_BATCH_LIMIT,
     log: LogSink | None = None,
     sink_name: str = IMPLICIT_SINK_NAME,
+    row_meta: RowMeta | None = None,
 ) -> DrainResult:
     """Push every due row for one sink; back off, or dead-letter, whatever fails.
 
@@ -474,11 +491,22 @@ def drain(
     wedge the rows behind it (the spec's "keep retrying the queue" only means something
     if a failure is not allowed to stop the drain). Success DELETEs the queue row and any
     dead-letter row for the same key — the store keeps the event either way.
+
+    `row_meta` (SINKS-WIRING) is the queue's side of the file sinks' contract: a transport
+    that declares `renders_rows = True` is handed the row's own facts (`event_id`,
+    `sink_name`, `enqueued_at`) and turns them plus the stored payload into the line it
+    writes, because the sink's FORMAT is the sink's business and this module holds no
+    type-specific branch. A render failure is a row failure — the same backoff, the same
+    error class, the same eventual dead-letter — never a skip: `default_row_meta` is the
+    default so a caller that does not care still gets the documented columns. A transport
+    that declares nothing (the stub transport, the https transport, every test fake) is
+    called with the payload exactly as before, newline and all.
     """
     stamp = _stamp(now)
     _check_sink_name(sink_name)
+    meta_for: RowMeta = row_meta if row_meta is not None else default_row_meta
     rows = conn.execute(
-        "SELECT id, event_id, payload, attempts, first_failed_at FROM push_queue"
+        "SELECT id, event_id, payload, attempts, first_failed_at, enqueued_at FROM push_queue"
         " WHERE sink_name = ? AND endpoint = ? AND next_attempt_at <= ?"
         " ORDER BY next_attempt_at, id LIMIT ?",
         (sink_name, endpoint, stamp, max(1, int(limit))),
@@ -488,7 +516,7 @@ def drain(
     retried: list[int] = []
     dead_lettered: list[int] = []
     for row in rows:
-        outcome = _call_transport(transport, endpoint, row["payload"])
+        outcome = _send_row(transport, endpoint, row, sink_name=sink_name, meta_for=meta_for)
         if isinstance(outcome, int):
             _mark_sent(
                 conn,
@@ -569,11 +597,57 @@ class HttpStatusRejectedError(Exception):
         self.status = status
 
 
+def _send_row(
+    transport: Transport,
+    endpoint: str,
+    row: sqlite3.Row,
+    *,
+    sink_name: str,
+    meta_for: RowMeta,
+) -> int | Exception:
+    """One send attempt for one queue row, render seam included (SINKS-WIRING).
+
+    Two shapes of transport, one failure model:
+
+    * `renders_rows = True` (a csv/jsonl `FileSinkWriter`): the sink's format is the sink's
+      business, so this module hands over the ROW's facts and the transport builds the line.
+      A render that raises is folded into the outcome exactly like a send that raises —
+      attempts burn, the outage clock starts, the error class lands on the row — because a
+      punch that cannot be rendered is a punch that did not get delivered, and the only
+      alternative is dropping it silently.
+    * anything else (the stub transport, `HttpsIngestTransport`, every test fake): the
+      payload goes out newline-terminated exactly as P2-04 shipped it, byte for byte. The
+      attribute check — not a type check, not a registry lookup — is what keeps the queue
+      free of any knowledge of sink types (SINKS-CORE's contract with the queue).
+
+    The row's stored payload is never mutated: rendering produces the LINE, the payload
+    stays what the store holds, so a re-delivery re-renders from the same bytes.
+    """
+    payload = row["payload"]
+    if getattr(transport, "renders_rows", False):
+        try:
+            body = transport.render(  # type: ignore[attr-defined]
+                payload, meta_for(int(row["event_id"]), sink_name, row["enqueued_at"])
+            )
+        except Exception as exc:  # a broken render is a failed ROW, never a silent skip
+            return exc
+    else:
+        body = f"{payload}\n"
+    try:
+        status = transport(endpoint, body)
+    except Exception as exc:  # the transport is injected: anything it raises means
+        return exc  # "not accepted", and one bad row must not break the whole drain.
+    return status if 200 <= status < 300 else HttpStatusRejectedError(status)
+
+
 def _call_transport(transport: Transport, endpoint: str, payload: str) -> int | Exception:
     """One send attempt. A raised exception is a failure with a class, not a crash.
 
     The payload goes out as one JSONL line (newline-terminated so the ingest can append
     batches without gluing two records together — `model.to_jsonl`'s own guarantee).
+
+    Kept as the plain, render-free call for any caller that has no queue row to hand
+    (replay paths, probes). `drain` uses `_send_row`, which adds the optional render seam.
     """
     try:
         status = transport(endpoint, f"{payload}\n")
@@ -807,9 +881,19 @@ def delete_dead_letter(
 # --- read seams (P2-05's gauge, P2-07's CLI) ---------------------------------------------------
 
 
-def queue_depth(conn: sqlite3.Connection) -> int:
-    """Rows waiting to go out (§2e's backlog gauge)."""
-    return conn.execute("SELECT COUNT(*) FROM push_queue").fetchone()[0]
+def queue_depth(conn: sqlite3.Connection, *, sink_name: str | None = None) -> int:
+    """Rows waiting to go out (§2e's backlog gauge).
+
+    `sink_name` (SINKS-WIRING) narrows it to one sink's backlog — the same filter
+    `pending_rows`/`dead_letter_rows` already take, so the agent's per-sink "is anything
+    pending" probe does not have to count the whole table (another sink's outage would
+    otherwise keep this sink's bearer probe warm and spend a `security` invocation on it).
+    """
+    if sink_name is None:
+        return conn.execute("SELECT COUNT(*) FROM push_queue").fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM push_queue WHERE sink_name = ?", (sink_name,)
+    ).fetchone()[0]
 
 
 def dead_letter_depth(conn: sqlite3.Connection) -> int:
