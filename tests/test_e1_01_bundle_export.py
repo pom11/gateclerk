@@ -290,7 +290,9 @@ def test_writer_refuses_worktree_style_git_file(tmp_path: Path) -> None:
 
 
 def test_writer_allows_a_private_root_outside_any_repo(tmp_path: Path) -> None:
-    out = write_bundle(tmp_path / "gateclerk-private" / "bundles" / "site-a-host", **bundle_kwargs())
+    out = write_bundle(
+        tmp_path / "gateclerk-private" / "bundles" / "site-a-host", **bundle_kwargs()
+    )
     assert out.is_dir()  # tmp_path has no .git ancestor (repo_root -> None)
 
 

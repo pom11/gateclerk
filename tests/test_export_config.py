@@ -32,22 +32,22 @@ from gateclerk.export_cli import CONFIG_EXPORT_COLUMNS
 runner = CliRunner()
 
 PLANTED_SECRETS: tuple[str, ...] = (
-    "SuperSecretDevicePw_9911",
-    "BearerSecretToken_8822",
-    "UrlUserPass_7733",
-    "QueryTokenValue_6644",
-    "SinkHeaderSecret_5566",
+    "fake-device-secret-9911",
+    "secret-bearer-token-8822",
+    "fake-url-user-pass-7733",
+    "secret-query-token-6644",
+    "fake-sink-header-secret-5566",
     "dGhpcyBpcyBhIHNlY3JldCBiYXNlNjQgdG9rZW4=",
     "Ab9Xz2Kp7Qm4Rt8Wn3Yj6Vc1Lf5Hg0Ds",
 )
 
-DIRTY_SITES_TOML = f"""\
-top_secret_global = "{PLANTED_SECRETS[0]}"
+DIRTY_SITES_TOML = """\
+top_secret_global = "fake-device-secret-9911"
 
 [[site]]
 name = "demo-a"
 enabled = true
-host = "http://admin:{PLANTED_SECRETS[2]}@192.0.2.10:8080/isapi"
+host = "http://admin:fake-url-user-pass-7733@192.0.2.10:8080/isapi"
 port = 80
 isapi_user = "admin"
 device_code = "DEMO-A-1"
@@ -61,25 +61,25 @@ overlap_s = 300
 push_dead_letter_after_s = 86400
 db_warn_bytes = 2147483648
 keychain_service = "gateclerk-hikvision"
-password = "{PLANTED_SECRETS[0]}"
-api_token = "{PLANTED_SECRETS[1]}"
+password = "fake-device-secret-9911"
+api_token = "secret-bearer-token-8822"
 
 [[site.sink]]
 name = "cloud"
 type = "https"
-url = "https://ingest:{PLANTED_SECRETS[2]}@ingest.example.invalid/v1/push?token={PLANTED_SECRETS[3]}#frag"
+url = "https://ingest:fake-url-user-pass-7733@ingest.example.invalid/v1/push?token=secret-query-token-6644#frag"
 token_env = "GATECLERK_INGEST_TOKEN_DEMO_A"
 token_keychain = "gateclerk-ingest-demo-a"
 enabled = true
-token = "{PLANTED_SECRETS[1]}"
-headers = {{ Authorization = "Bearer {PLANTED_SECRETS[4]}" }}
+token = "secret-bearer-token-8822"
+headers = { Authorization = "Bearer fake-sink-header-secret-5566" }
 
 [[site.sink]]
 name = "badref"
 type = "https"
 url = "https://ingest.example.invalid/v2/push"
-token_env = "{PLANTED_SECRETS[5]}"
-token_keychain = "{PLANTED_SECRETS[6]}"
+token_env = "dGhpcyBpcyBhIHNlY3JldCBiYXNlNjQgdG9rZW4="
+token_keychain = "Ab9Xz2Kp7Qm4Rt8Wn3Yj6Vc1Lf5Hg0Ds"
 enabled = false
 
 [[site]]
@@ -89,7 +89,7 @@ host = "192.0.2.20"
 device_code = "DEMO-B-1"
 serials = ["DEMO-SN-002", "DEMO-SN-003"]
 iana_tz = "Europe/Bucharest"
-push_target = "https://admin:{PLANTED_SECRETS[2]}@ingest.example.invalid/legacy?secret={PLANTED_SECRETS[3]}"
+push_target = "https://admin:fake-url-user-pass-7733@ingest.example.invalid/legacy?secret=secret-query-token-6644"
 """
 
 

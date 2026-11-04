@@ -781,10 +781,10 @@ re-raising). TDD: 6 of the 8 were red against c624e62 before the fix.
 ## 2026-10-23 — t_cf2ad3c5: apply's journal repo-out refusal now exits 2 (was the device class)
 
 The audit half of t_0d635ee2 found the same class of mismatch on the JOURNAL guard and
-carded it here. `_refuse_repo_path` raised a bare `JournalError` (a plain `GateclerkError`):
+carded it here. `_refuse_repo_path` raised a bare `JournalError` (a plain `GateClerkError`):
 `undo`'s own try/except mapped it to exit 2 ("undo refused: …"), but `apply --apply` opens
 its per-phase journals inside the composer under `_Guard`/`_fail`, whose catch-all
-`GateclerkError` arm filed the refusal under exit 4 — "the box said no" for a run that never
+`GateClerkError` arm filed the refusal under exit 4 — "the box said no" for a run that never
 contacted a box. Fix shape, same seam class as the parent card: one new class,
 `JournalRepoOutError(JournalError, ConfigError)`, at the refusal site in migrate_write —
 the ConfigError base puts it on p1-08's exit-2 class through the ONE existing `_fail`

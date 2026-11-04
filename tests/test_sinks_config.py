@@ -299,7 +299,9 @@ def test_registry_entry_declares_its_own_keys_and_refuses_foreign_ones() -> None
         parse(toml_of(*sink_lines(name="archive", type="csv", url=URL)))
     assert "url" in str(exc.value)
     with pytest.raises(ConfigError) as exc:
-        parse(toml_of(*sink_lines(name="bc", type="https", url=URL, path="/var/lib/gateclerk/x.csv")))
+        parse(
+            toml_of(*sink_lines(name="bc", type="https", url=URL, path="/var/lib/gateclerk/x.csv"))
+        )
     assert "path" in str(exc.value)
 
 
@@ -388,10 +390,12 @@ def test_token_rung_names_must_not_be_blank(blank: str) -> None:
 def test_https_sink_headers_are_optional_string_pairs() -> None:
     site = parse(
         toml_of(
-            *sink_lines(name="bc", type="https", url=URL, headers={"X-Gateclerk-Trace": "sinks-core"})
+            *sink_lines(
+                name="bc", type="https", url=URL, headers={"X-GateClerk-Trace": "sinks-core"}
+            )
         )
     )
-    assert sink_of(site, "bc").headers == {"X-Gateclerk-Trace": "sinks-core"}
+    assert sink_of(site, "bc").headers == {"X-GateClerk-Trace": "sinks-core"}
 
 
 def test_headers_may_not_carry_authorization() -> None:
@@ -414,16 +418,18 @@ def test_headers_may_not_carry_authorization() -> None:
 
 
 def test_headers_may_not_carry_the_site_confirmation_either() -> None:
-    """`X-Gateclerk-Site` is the transport's confirmation header (T15: it CONFIRMS the
+    """`X-GateClerk-Site` is the transport's confirmation header (T15: it CONFIRMS the
     token's site, and a contradicting claim is a 403 server-side). A config that could
     set it could claim another site with this site's token."""
     with pytest.raises(ConfigError) as exc:
         parse(
             toml_of(
-                *sink_lines(name="bc", type="https", url=URL, headers={"X-Gateclerk-Site": "SITE-B"})
+                *sink_lines(
+                    name="bc", type="https", url=URL, headers={"X-GateClerk-Site": "SITE-B"}
+                )
             )
         )
-    assert "X-Gateclerk-Site" in str(exc.value)
+    assert "X-GateClerk-Site" in str(exc.value)
 
 
 def test_headers_refuse_a_non_string_value() -> None:
@@ -445,7 +451,10 @@ def test_headers_may_not_be_declared_on_a_file_sink() -> None:
         parse(
             toml_of(
                 *sink_lines(
-                    name="archive", type="csv", path="/var/lib/gateclerk/a.csv", headers={"X-A": "b"}
+                    name="archive",
+                    type="csv",
+                    path="/var/lib/gateclerk/a.csv",
+                    headers={"X-A": "b"},
                 )
             )
         )

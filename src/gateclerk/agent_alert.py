@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from gateclerk.agent_store import WatermarkCheck, read_checkpoint
-from gateclerk.exceptions import IsapiAuthError, GateclerkError
+from gateclerk.exceptions import GateClerkError, IsapiAuthError
 from gateclerk.tz import Skew
 
 __all__ = [
@@ -230,7 +230,7 @@ class AlertPolicy:
 
     def _park_path(self, device_key: str) -> Path:
         if self.park_dir is None:  # pragma: no cover - every caller gates on park_dir
-            raise GateclerkError("park path requested on an in-memory policy (no park_dir)")
+            raise GateClerkError("park path requested on an in-memory policy (no park_dir)")
         return self.park_dir / f"park-{_safe_name(self.site)}__{_safe_name(device_key)}.json"
 
     def _read_park(self, device_key: str) -> dict[str, Any] | None:

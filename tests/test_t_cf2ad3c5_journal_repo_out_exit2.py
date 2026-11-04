@@ -2,7 +2,7 @@
 
 Found while auditing the callers for t_0d635ee2 (which fixed the same CLASS of mismatch on
 the BUNDLE guard). `migrate_write._refuse_repo_path` raises a bare `JournalError`
-(migrate_write.py:699), and `JournalError` is a plain `GateclerkError`, so on the
+(migrate_write.py:699), and `JournalError` is a plain `GateClerkError`, so on the
 ``apply --apply`` path the composer's `_Guard`/`_fail` maps it to exit 4 — the DEVICE class.
 A run refused because the operator pointed the journal root inside a git repo never
 touched the device: exit 4 tells the next reader "the box said no", which is wrong
@@ -80,7 +80,7 @@ def test_apply_refuses_a_repo_run_dir_with_exit_2_json(
     """`apply --apply --run-dir <inside a git init repo>` exits 2 with the guard's message.
 
     Before this card the same command exited 4 — the device class — through `_fail`'s
-    bare-`GateclerkError` arm, telling the next reader the box refused. Nothing was ever
+    bare-`GateClerkError` arm, telling the next reader the box refused. Nothing was ever
     sent to a device: this is the "fix your input" class (§2, p1-08's table).
     """
     _export_pending_box(monkeypatch, root)
@@ -416,7 +416,7 @@ def test_undo_second_pass_refuses_a_repo_undo_journal_with_exit_2(
 def test_fail_maps_the_refusal_onto_the_documented_exit_2(git_repo: Path) -> None:
     """`_fail` — the single mapping — converts the refusal; it must not re-raise it.
 
-    Today the bare `JournalError` reaches `_fail`'s catch-all `GateclerkError` arm and lands
+    Today the bare `JournalError` reaches `_fail`'s catch-all `GateClerkError` arm and lands
     on exit 4; the pin is that the ConfigError arm fires first and lands it on 2.
     """
     import typer

@@ -77,11 +77,11 @@ import httpx
 
 from gateclerk.endpoints import SEARCH_ENDPOINTS, Endpoint, HttpMethod, endpoint_for
 from gateclerk.exceptions import (
+    GateClerkError,
     IsapiAuthError,
     IsapiBusy,
     IsapiError,
     IsapiLocalNetworkError,
-    GateclerkError,
 )
 from gateclerk.isapi_response import envelope_to_error, parse_body, parse_envelope
 
@@ -282,7 +282,7 @@ class IsapiClient:
         if self._owner_thread is None:
             self._owner_thread = ident
         elif self._owner_thread != ident:
-            raise GateclerkError(
+            raise GateClerkError(
                 "IsapiClient used from a second thread — httpx digest state is unlocked "
                 "and sharing it races nc counters (gotchas §1.7b). One client per thread."
             )
@@ -391,7 +391,7 @@ class IsapiClient:
         headers: dict[str, str] = {}
         if expected is HttpMethod.POST:
             if payload is None:  # defensive; _call's callers always pass a body for POST
-                raise GateclerkError(f"{endpoint.name} is a search POST and needs a JSON body")
+                raise GateClerkError(f"{endpoint.name} is a search POST and needs a JSON body")
             content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             headers["Content-Type"] = "application/json"
 
@@ -511,12 +511,12 @@ class IsapiClient:
     def _check(self, name: str, expected: HttpMethod) -> Endpoint:
         endpoint = endpoint_for(name)  # unknown names raise; no free-form paths
         if endpoint.method is not expected:
-            raise GateclerkError(
+            raise GateClerkError(
                 f"{endpoint.name} is registered as {endpoint.method.value}; refusing "
                 f"to call it as {expected.value}. The registry is the read-only contract."
             )
         if expected is HttpMethod.POST and name not in SEARCH_ENDPOINTS:
-            raise GateclerkError(
+            raise GateClerkError(
                 f"{endpoint.name} is a POST outside the stateless-search allowlist — "
                 "this client does not make mutating requests (DESIGN.md invariants)."
             )

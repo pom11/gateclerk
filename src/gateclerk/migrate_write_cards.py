@@ -76,7 +76,7 @@ from enum import StrEnum
 from time import monotonic as _monotonic
 from typing import Any, Protocol
 
-from gateclerk.exceptions import GateclerkError
+from gateclerk.exceptions import GateClerkError
 from gateclerk.migrate_bundle import BundleData, content_hash, normalize_record
 from gateclerk.migrate_diff import DiffClass, Plan, plan_still_valid
 from gateclerk.migrate_probe import CapabilityMatrix, require_fresh
@@ -199,7 +199,7 @@ def card_hash(card_no: str, *, prefix_len: int = 12) -> str:
 # --- §5b.1: the user-delete ban, stated as code ---------------------------------------------
 
 
-class CardDeleteScopeError(GateclerkError):
+class CardDeleteScopeError(GateClerkError):
     """A card delete was refused BEFORE it was built or sent (§5b, §5b.1).
 
     Two different refusals share this type because both mean "the shape is not the one
@@ -209,7 +209,7 @@ class CardDeleteScopeError(GateclerkError):
     """
 
 
-class DeleteAbortedError(GateclerkError):
+class DeleteAbortedError(GateClerkError):
     """The §5b count-delta wrapper says the delete removed MORE than it was told to.
 
     This is the incident, not a retry cue — the wrapper exists to turn D-WIPE from a

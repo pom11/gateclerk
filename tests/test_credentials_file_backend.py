@@ -297,7 +297,9 @@ def test_write_to_a_permissive_store_is_refused_before_the_value_lands(tmp_path:
     with pytest.raises(CredentialUnavailable, match="refuses to use it"):
         store.write("gateclerk-site-b-192.0.2.11", "fake-new-pw")
     stored = json.loads(store.path.read_text(encoding="utf-8"))
-    assert "gateclerk-site-b-192.0.2.11" not in stored["refs"], "the new ref must NOT have been added"
+    assert "gateclerk-site-b-192.0.2.11" not in stored["refs"], (
+        "the new ref must NOT have been added"
+    )
 
 
 def test_a_store_returned_to_0600_resolves_again(tmp_path: Path) -> None:
@@ -909,7 +911,9 @@ def test_creds_set_refuses_a_permissive_target(tmp_path: Path) -> None:
 
 def test_creds_get_lists_names_never_values_and_flags_an_empty_ref(tmp_path: Path) -> None:
     path = tmp_path / "credentials.json"
-    write_store(CredentialFileStore(path), {DEVICE_REF: FROM_FILE, "gateclerk-site-b-192.0.2.11": ""})
+    write_store(
+        CredentialFileStore(path), {DEVICE_REF: FROM_FILE, "gateclerk-site-b-192.0.2.11": ""}
+    )
     code, out = cli(
         ["creds", "get", "--credentials-file", str(path), "-o", "json"],
         env={CREDENTIALS_FILE_ENV: "off"},

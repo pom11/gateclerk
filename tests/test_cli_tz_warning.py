@@ -457,7 +457,7 @@ def test_a_wild_claim_through_the_cli_still_exits_zero(box, monkeypatch, capsys)
     Injected by wrapping the assembler `pipeline` looks up as a module global, so the
     whole real path runs (walk, render, emitter) and only the record's claimed offset is
     widened to something `offset_hhmm` refuses. Without the guard this run exits 1 — the
-    `_Guard` re-raises anything that is not a `GateclerkError`, so a dead guard costs the
+    `_Guard` re-raises anything that is not a `GateClerkError`, so a dead guard costs the
     operator a crashed backfill instead of a warning.
     """
     real = pipeline_mod.event_record_from_device

@@ -69,7 +69,7 @@ page_delay_ms = 100                  # between pages of one paged search
 #                                    # the deployed gateclerk_ingest function URL (the real
 #                                    # host is deployment config, never committed). The
 #                                    # bearer token DETERMINES the site server-side;
-#                                    # `X-Gateclerk-Site` below only confirms it. Get the
+#                                    # `X-GateClerk-Site` below only confirms it. Get the
 #                                    # token from the operator: it lives in the macOS
 #                                    # keychain item named by the site, NEVER in this
 #                                    # file, and never in a log:

@@ -6,7 +6,7 @@ chars): they pass httpx's URL validation, then CPython's `socket.getaddrinfo` id
 the name and raises `UnicodeError("label empty or too long")` — or, for the A-label,
 httpx's own URL layer raises `idna.IDNAError` while preparing the Host header. Neither
 class is an `httpx.TransportError`, so the transport's `except httpx.TransportError` never
-wrapped them and the command's `except GateclerkError` never mapped them: real subprocess,
+wrapped them and the command's `except GateClerkError` never mapped them: real subprocess,
 exit 1, full Rich traceback.
 
 These run through `cli_child` (tests/conftest.py): the real `main()`, the real httpx

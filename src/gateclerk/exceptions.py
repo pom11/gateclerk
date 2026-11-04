@@ -27,6 +27,7 @@ __all__ = [
     "CredentialUnavailable",
     "EnrollmentReadAborted",
     "EventBoundsError",
+    "GateClerkError",
     "IsapiAuthError",
     "IsapiBadContent",
     "IsapiBusy",
@@ -35,22 +36,21 @@ __all__ = [
     "IsapiNotFound",
     "IsapiPayloadError",
     "NotImplementedYet",
-    "GateclerkError",
     "SearchProtocolError",
     "SearchRunawayError",
     "redact_b64",
 ]
 
 
-class GateclerkError(Exception):
+class GateClerkError(Exception):
     """Base for everything this package raises deliberately."""
 
 
-class NotImplementedYet(GateclerkError):
+class NotImplementedYet(GateClerkError):
     """Placeholder for a command whose real implementation lands in a later card."""
 
 
-class IsapiPayloadError(GateclerkError):
+class IsapiPayloadError(GateClerkError):
     """A device body we refused to parse: too big, declares an XML DTD/entity, or is
     neither JSON nor well-formed XML.
 
@@ -60,7 +60,7 @@ class IsapiPayloadError(GateclerkError):
     """
 
 
-class IsapiLocalNetworkError(GateclerkError):
+class IsapiLocalNetworkError(GateClerkError):
     """The OS refused to let us reach the device at all.
 
     OBSERVED.md delta (4): on this Mac *curl* reaches the LAN while plain *python* gets
@@ -70,7 +70,7 @@ class IsapiLocalNetworkError(GateclerkError):
     """
 
 
-class ConfigError(GateclerkError):
+class ConfigError(GateClerkError):
     """Config or credential resolution failed — the request never left the process.
 
     p1-08 maps this to exit code 2. Subclasses carry the exact command that would have
@@ -104,7 +104,7 @@ class BundleRepoOutError(ValueError, ConfigError):
     """
 
 
-class IsapiError(GateclerkError):
+class IsapiError(GateClerkError):
     """An ISAPI error envelope ({statusCode, statusString, subStatusCode, ...})."""
 
     def __init__(
@@ -196,7 +196,7 @@ class IsapiNotFound(IsapiError):
 # --- paging (p1-05) -------------------------------------------------------------------
 
 
-class SearchRunawayError(GateclerkError):
+class SearchRunawayError(GateClerkError):
     """A paged search hit its hard page cap while the device still said MORE.
 
     The loop bound is a safety net (DESIGN.md: 10k pages), not a plan: a real walk
@@ -223,7 +223,7 @@ class SearchRunawayError(GateclerkError):
         self.position = position
 
 
-class EventBoundsError(GateclerkError):
+class EventBoundsError(GateClerkError):
     """An AcsEvent query was asked for without startTime/endTime.
 
     Some firmware answers an unbounded event search with `Invalid Content`; worse,
@@ -233,7 +233,7 @@ class EventBoundsError(GateclerkError):
     """
 
 
-class SearchProtocolError(GateclerkError):
+class SearchProtocolError(GateClerkError):
     """A search response we could not read as a search response (missing root key,
     non-list record list, non-numeric counters).
 
@@ -246,7 +246,7 @@ class SearchProtocolError(GateclerkError):
 # --- enrollment export (E1) --------------------------------------------------------------
 
 
-class EnrollmentReadAborted(GateclerkError):
+class EnrollmentReadAborted(GateClerkError):
     """A required enrollment read failed CLOSED (design §0.7; card E1-01).
 
     An enrollment export/diff is only trustworthy if every required read said OK:

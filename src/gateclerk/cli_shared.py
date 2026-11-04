@@ -309,7 +309,7 @@ def _fail(fmt: OutputFormat, exc: BaseException) -> typer.Exit:
 
 
 class _Guard:
-    """Context manager: `with _Guard(fmt): ...` turns any GateclerkError into its exit code.
+    """Context manager: `with _Guard(fmt): ...` turns any GateClerkError into its exit code.
 
     Commands are written straight-line — resolve site, resolve creds, open client, read —
     and every one of those steps can fail. Repeating a six-branch try/except in each body

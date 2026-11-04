@@ -90,7 +90,7 @@ recorded here as what each code *means*, merged where the classes genuinely coin
                               in means moving that pin deliberately, not as a side effect
 
 Order matters in :func:`exit_code_for`: ``IsapiAuthError`` is an ``IsapiError``, and the
-search errors are ``GateclerkError``s, so the specific classes are tested before the general
+search errors are ``GateClerkError``s, so the specific classes are tested before the general
 ones — the same order ``cli._fail`` documented, now in one importable place.
 """
 
@@ -102,9 +102,9 @@ from gateclerk.exceptions import (
     ConfigError,
     CredentialUnavailable,
     EventBoundsError,
+    GateClerkError,
     IsapiAuthError,
     IsapiError,
-    GateclerkError,
     SearchProtocolError,
     SearchRunawayError,
 )
@@ -186,6 +186,6 @@ def exit_code_for(exc: BaseException) -> int:
         return int(ExitCode.USAGE_OR_CONFIG)
     if isinstance(exc, SearchProtocolError | IsapiError):
         return int(ExitCode.DEVICE)
-    if isinstance(exc, GateclerkError):
+    if isinstance(exc, GateClerkError):
         return int(ExitCode.DEVICE)
     raise KeyError(f"unclassified exception {type(exc).__name__!r} — no exit code defined")

@@ -49,7 +49,7 @@ Task 15 (spec §7, the merged `gateclerk_ingest` function is the frozen contract
 
     POST <push_target>                      Content-Type: application/jsonl
     Authorization: Bearer *** ingest token>     401 absent/unknown/revoked
-    X-Gateclerk-Site: <SITE>                        CONFIRMS the token's site only;
+    X-GateClerk-Site: <SITE>                        CONFIRMS the token's site only;
                                                   a contradicting claim is 403 there
 
 The bearer DETERMINES the site server-side, so it is resolved PER SITE with no global
@@ -1114,7 +1114,7 @@ class HttpsIngestTransport:
         import httpx
 
         self.site = site.strip()
-        #: The `X-Gateclerk-Site` claim is a CONFIRMATION only (the token determines the
+        #: The `X-GateClerk-Site` claim is a CONFIRMATION only (the token determines the
         #: site); a site whose operator prefers to send no claim at all gets that.
         self.confirm_site = bool(confirm_site)
         self._env = env
@@ -1161,7 +1161,7 @@ class HttpsIngestTransport:
         if self.confirm_site:
             # Uppercase because the function uppercases the claim before comparing it
             # to the token's site; a wrong-cased claim is still only ever a claim.
-            headers["X-Gateclerk-Site"] = self.site.upper()
+            headers["X-GateClerk-Site"] = self.site.upper()
         payload = body if body.endswith("\n") else f"{body}\n"
         response = self._client.post(
             url,

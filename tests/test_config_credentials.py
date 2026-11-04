@@ -506,7 +506,10 @@ def test_stdout_is_decoded_without_losing_odd_bytes() -> None:
 def test_flag_beats_env_and_keychain() -> None:
     fake = FakeSecurity(secret=b"fake-keychain-pw\n")
     creds = resolve(
-        user="flagged", password="fake-flag-pw", env={"GATECLERK_PASSWORD": "fake-env-pw"}, fake=fake
+        user="flagged",
+        password="fake-flag-pw",
+        env={"GATECLERK_PASSWORD": "fake-env-pw"},
+        fake=fake,
     )
     assert creds.source is CredentialSource.FLAG
     assert creds.password.reveal() == "fake-flag-pw"
@@ -565,7 +568,9 @@ def test_user_precedence_flag_env_config_comment_default(
 
 
 def test_user_rung_still_works_when_the_password_came_from_a_flag() -> None:
-    creds = resolve(password="fake-flag-pw", env={"GATECLERK_USER": "env-user"}, fake=FakeSecurity())
+    creds = resolve(
+        password="fake-flag-pw", env={"GATECLERK_USER": "env-user"}, fake=FakeSecurity()
+    )
     assert creds.user == "env-user"
 
 

@@ -459,7 +459,7 @@ def _home_kw(directory: Path | None) -> dict[str, Any]:
 def _plan(body: Any, output: OutputFormat, *, site: str) -> svc.ServicePlan:
     """Run a planner call, turning `ServiceError` into the documented exit 2.
 
-    `ServiceError` is not a `GateclerkError`, so `_Guard` would re-raise it as an unclassified
+    `ServiceError` is not a `GateClerkError`, so `_Guard` would re-raise it as an unclassified
     bug — deliberately: a refusal in this group is its own class of thing, and the machine
     form gets the refusal `kind` as a field instead of a paraphrased message.
     """

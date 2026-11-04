@@ -1389,7 +1389,7 @@ def test_https_sink_custom_headers_ride_the_request_without_the_two_reserved_one
     tmp_path: Path,
 ) -> None:
     """A sink's `headers` reach the wire; the transport's own two (Authorization,
-    X-Gateclerk-Site) stay the transport's (config cannot set them — SINKS-CORE's refusal)."""
+    X-GateClerk-Site) stay the transport's (config cannot set them — SINKS-CORE's refusal)."""
     mod = writers_mod()
     sink = SinkSpec(
         name="bc",

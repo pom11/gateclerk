@@ -24,7 +24,7 @@ The three shipped types
 -----------------------
 `https`  url + optional custom headers + optional token REFERENCES. Keeps Task 15's wire
          contract untouched (POST, `Content-Type: application/jsonl`, `Authorization
-         Bearer <token>`, `X-Gateclerk-Site` confirmation); the transport is unchanged by
+         Bearer <token>`, `X-GateClerk-Site` confirmation); the transport is unchanged by
          this module. The token is a REF only, never a value: `token_env` names an
          environment variable, `token_keychain` names a keychain service, and the
          resolver's default rungs stay exactly T15's per-site ones
@@ -152,7 +152,7 @@ class SinkSpec:
     token_env: str | None = None
     #: A keychain SERVICE name holding the bearer token (a REF, never a value).
     token_keychain: str | None = None
-    #: Extra request headers. `Authorization` and `X-Gateclerk-Site` may not appear here
+    #: Extra request headers. `Authorization` and `X-GateClerk-Site` may not appear here
     #: (refused at parse time): the first would put a bearer in a committed config and
     #: fight the transport's own header, the second would let a config claim another site.
     headers: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
@@ -281,7 +281,7 @@ def _headers(table: Mapping[str, Any], *, site: str, sink: str) -> Mapping[str, 
 
     A header VALUE that is not a string would raise inside the transport on the first
     send — i.e. during the outage the agent is already fighting — and `Authorization` /
-    `X-Gateclerk-Site` are the transport's own two headers: the first is the bearer token
+    `X-GateClerk-Site` are the transport's own two headers: the first is the bearer token
     (which has exactly one home: the ref rungs), the second is the site confirmation the
     ingest cross-checks against the token (a config that could set it could claim another
     site with this site's credentials).
@@ -312,7 +312,7 @@ def _headers(table: Mapping[str, Any], *, site: str, sink: str) -> Mapping[str, 
             )
         if lowered == "x-gateclerk-site":
             raise ConfigError(
-                f"site {site!r} sink {sink!r}: headers may not carry X-Gateclerk-Site — it "
+                f"site {site!r} sink {sink!r}: headers may not carry X-GateClerk-Site — it "
                 "confirms the site the token already determines, and a config that could "
                 "set it could claim another site"
             )

@@ -73,7 +73,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from gateclerk.exceptions import GateclerkError
+from gateclerk.exceptions import GateClerkError
 from gateclerk.migrate_bundle import BundleData, comparable_record, content_hash
 from gateclerk.migrate_export import EnrollmentState, collect_enrollment_state
 from gateclerk.migrate_probe import CapabilityMatrix, require_fresh
@@ -169,7 +169,7 @@ class DiffPolicy:
     site_tz: str | None = DEFAULT_SITE_TZ
 
 
-class DiffAbortedError(GateclerkError):
+class DiffAbortedError(GateClerkError):
     """`--on-conflict=abort` and the plan found conflicts: refuse to plan writes.
 
     The conflicts ride on the exception so the CLI still prints them (data, not a
