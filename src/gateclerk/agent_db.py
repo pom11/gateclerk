@@ -214,6 +214,18 @@ CREATE TABLE dead_letter (
 CREATE INDEX dead_letter_endpoint ON dead_letter (endpoint);
 """
 
+_SERIAL_EPOCH_V7 = """
+ALTER TABLE events ADD COLUMN serial_epoch INTEGER NOT NULL DEFAULT 0;
+
+DROP INDEX events_key;
+
+CREATE UNIQUE INDEX events_key ON events (device_serial, serial_epoch, serial_no);
+
+ALTER TABLE checkpoint ADD COLUMN serial_epoch INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE checkpoint ADD COLUMN firmware TEXT;
+"""
+
 # --- SINKS-CORE appends here (v5 + v6: per-sink delivery state) -------------------------------
 #
 # Today's queue was keyed `UNIQUE (event_id, endpoint)`, which is exactly the shape of the
@@ -354,6 +366,12 @@ MIGRATIONS: tuple[Migration, ...] = (
     # comment block above v5 for why these REBUILD the tables instead of altering them. --
     Migration(version=5, name="push_queue_per_sink", sql=_PUSH_QUEUE_V5),
     Migration(version=6, name="dead_letter_per_sink", sql=_DEAD_LETTER_V6),
+    # Card t_fbd85a10: a device's event serialNo can restart after a firmware upgrade
+    # or a log clear. The epoch is the only legal way two punches may share a serial:
+    # old rows keep epoch 0, a confirmed reset opens epoch+1. The checkpoint carries
+    # the current epoch and the firmware it was written under — the evidence pair the
+    # loop compares before it allows a rewind (agent_store.reset_checkpoint).
+    Migration(version=7, name="serial_epoch", sql=_SERIAL_EPOCH_V7),
 )
 
 

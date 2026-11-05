@@ -493,7 +493,9 @@ def test_insert_column_list_is_the_contract_tuple(db) -> None:
     cols = [c.strip() for c in listed.split(",") if c.strip()]
     assert cols[:2] == ["id", "revision"], "id/revision are literals, not parameters"
     assert tuple(cols[2:]) == agent_store._UPSERT_COLUMNS
-    assert tuple(cols[2 + 8 :]) == RECORD_JSON_KEYS, "flattened columns ARE the contract tuple"
+    assert tuple(cols[2 + len(agent_store._HEAD_COLUMNS) :]) == RECORD_JSON_KEYS, (
+        "flattened columns ARE the contract tuple"
+    )
     # Parameters: one '?' per non-literal column, and _row_values supplies exactly that.
     values = agent_store._UPSERT.split("VALUES")[1].split("ON CONFLICT")[0]
     assert values.count("?") == len(agent_store._UPSERT_COLUMNS)
@@ -518,7 +520,9 @@ def test_column_pin_bites_a_renamed_contract_key() -> None:
     """
     head = agent_store._UPSERT.split("VALUES")[0]
     listed = head[head.index("(") + 1 : head.rindex(")")].replace("\n", " ")
-    flat = tuple(c.strip() for c in listed.split(",") if c.strip())[2 + 8 :]
+    flat = tuple(c.strip() for c in listed.split(",") if c.strip())[
+        2 + len(agent_store._HEAD_COLUMNS) :
+    ]
     mutated = (*RECORD_JSON_KEYS[:-1], "renamed_key")
     assert flat == RECORD_JSON_KEYS, "precondition: the shipped pin passes"
     assert flat != mutated, (
