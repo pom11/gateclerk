@@ -10,12 +10,13 @@ Two jobs, one seam:
             **flag > env > keychain** (card p1-02). A gitignored `.env` is only a way of
             getting values into the environment, so it needs no rung of its own.
 
-The credential seam: `IsapiClient` takes `(base_url, username, password)` and builds its
-digest auth once. Every shipped call site — `cli_shared._client_for`,
-`agent_loop.build_device_loop`, `agent_cli._client_for_host`, the `init_cli` probe and
-`doctor_cli.default_device_prober` — resolves **eagerly** and passes values.
-`credential_provider` exists for callers that want lazy re-resolution; until the seam
-lands (decision t_514870e8, Slice 3), no `IsapiClient` consumes a provider.
+The credential seam: `IsapiClient` takes either `(base_url, username, password)` values or
+a `credentials=` provider, and re-reads that provider at nonce retirement and circuit
+expiry. `agent_cli._client_for_host` is the one shipped call site that passes a provider
+(the long-lived `agent run` process, so a credential rotation self-heals without a
+restart — decision t_514870e8, Slice 3). The other call sites — `cli_shared._client_for`,
+`agent_loop.build_device_loop`, the injected agent factory, the `init_cli` probe and
+`doctor_cli.default_device_prober` — still resolve **eagerly** and pass values.
 
 VERIFIED against the real `security` CLI (macOS, throwaway keychain, 2026-10-15):
   * `find-generic-password -s S -a A -w` prints ONLY the secret, newline-terminated.
@@ -675,9 +676,9 @@ class Credentials:
 
 
 #: The lazy credential seam. A *provider* is a callable that re-resolves on every call;
-#: the client today caches the values it was built with, so no shipped call site passes a
-#: provider or re-consults one on nonce retirement. Nothing downstream may stash
-#: `provider().password.reveal()`.
+#: `IsapiClient` consults it at construction, nonce retirement and circuit expiry (never
+#: per request or page), and the long-lived agent is the shipped consumer. Nothing
+#: downstream may stash `provider().password.reveal()`.
 CredentialProvider = Callable[[], Credentials]
 
 
@@ -944,11 +945,10 @@ def credential_provider(
 ) -> CredentialProvider:
     """A *callable* that re-resolves on every call, for callers that want lazy credentials.
 
-    Re-resolution is the intended capability: a digest nonce can expire minutes into a
-    paged pull, and a future client seam could ask for a fresh credential at that moment
-    instead of reusing one it cached (decision t_514870e8, Slice 3). Today's
-    `IsapiClient` does not consume a provider: every shipped call site resolves eagerly
-    and passes plaintext values.
+    `IsapiClient` consumes one at construction, nonce retirement and circuit expiry, never
+    per request or page (decision t_514870e8). `agent_cli` passes this provider for the
+    long-lived `agent run` clients, which is what lets a rotated credential self-heal
+    without a process restart; the other call sites still resolve eagerly.
     """
     return lambda: resolve_credentials(
         target, user=user, password=password, env=env, keychain=keychain

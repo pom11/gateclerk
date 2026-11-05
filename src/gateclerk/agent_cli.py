@@ -84,6 +84,7 @@ from gateclerk.config import (
     ConfigError,
     DeviceTarget,
     SiteConfig,
+    credential_provider,
     credential_ref,
     resolve_credentials,
 )
@@ -1331,12 +1332,15 @@ def _client_for_host(
     credentials_dir: Path | str | None = None,
     password: str | None = None,
 ) -> IsapiClient:
-    """Resolve the credential for one device and build its long-lived client.
+    """Build one device's long-lived client, from a provider unless a factory was injected.
 
-    `build_device_loop` would do both, but resolving here is what lets the caller inject a
+    `build_device_loop` would do both, but building here is what lets the caller inject a
     transport (the offline test path, and any owner-wired transport) without reaching into the
-    loop. The plaintext goes straight into the client's digest construction — the transport's
-    own rule — and is never kept on this module, printed, or returned.
+    loop. The default path hands the transport a re-readable provider (the Slice-2 seam), so
+    a credential rotated while the agent runs is picked up at nonce retirement or circuit
+    expiry — the §2c self-heal. An injected `client_factory` keeps receiving the eager
+    (base, user, secret) triple, so every already-wired test and owner transport is untouched.
+    The plaintext is never kept on this module, printed, or returned.
     """
     flag_password = flag_rung_password(
         site.name,
@@ -1345,22 +1349,34 @@ def _client_for_host(
         credentials_dir=credentials_dir,
         env=env,
     )
-    creds = resolve_credentials(
-        DeviceTarget(
-            host=host,
-            port=site.port,
-            site=site.name,
-            keychain_service=site.keychain_service,
-            config_user=site.isapi_user,
+    target = DeviceTarget(
+        host=host,
+        port=site.port,
+        site=site.name,
+        keychain_service=site.keychain_service,
+        config_user=site.isapi_user,
+    )
+    base_url = f"http://{host}:{site.port}"
+    if client_factory is not None:
+        creds = resolve_credentials(
+            target,
+            password=flag_password,
+            env=env,
+            keychain=keychain,
+        )
+        return client_factory(base_url, creds.user, creds.password.reveal())
+    return IsapiClient(
+        base_url,
+        "",
+        "",
+        credentials=credential_provider(
+            target,
+            password=flag_password,
+            env=env,
+            keychain=keychain,
         ),
-        password=flag_password,
-        env=env,
-        keychain=keychain,
+        read_timeout=site.timeout_s,
     )
-    factory = client_factory or (
-        lambda base, user, secret: IsapiClient(base, user, secret, read_timeout=site.timeout_s)
-    )
-    return factory(f"http://{host}:{site.port}", creds.user, creds.password.reveal())
 
 
 # --- stderr (the same channel P2-05's default sink and P2-03's warn use) --------------------
