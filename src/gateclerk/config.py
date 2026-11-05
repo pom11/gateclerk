@@ -10,10 +10,12 @@ Two jobs, one seam:
             **flag > env > keychain** (card p1-02). A gitignored `.env` is only a way of
             getting values into the environment, so it needs no rung of its own.
 
-The seam that matters for the rest of P1: p1-03's ISAPI client receives a **callable**
-(`CredentialProvider`), never a password attribute. The client therefore cannot hold a
-plaintext password, cannot log one, and P2's site agent can hand it a systemd-credential
-provider without touching ISAPI code.
+The credential seam: `IsapiClient` takes `(base_url, username, password)` and builds its
+digest auth once. Every shipped call site — `cli_shared._client_for`,
+`agent_loop.build_device_loop`, `agent_cli._client_for_host`, the `init_cli` probe and
+`doctor_cli.default_device_prober` — resolves **eagerly** and passes values.
+`credential_provider` exists for callers that want lazy re-resolution; until the seam
+lands (decision t_514870e8, Slice 3), no `IsapiClient` consumes a provider.
 
 VERIFIED against the real `security` CLI (macOS, throwaway keychain, 2026-10-15):
   * `find-generic-password -s S -a A -w` prints ONLY the secret, newline-terminated.
@@ -672,9 +674,10 @@ class Credentials:
         return f"{self.user}{where} via {self.source.value}"
 
 
-#: The seam p1-03 codes against. A *provider* is called per authentication attempt, so a
-#: long-lived client can re-read the keychain when a digest nonce goes stale without ever
-#: holding the plaintext. Nothing downstream may stash `provider().password.reveal()`.
+#: The lazy credential seam. A *provider* is a callable that re-resolves on every call;
+#: the client today caches the values it was built with, so no shipped call site passes a
+#: provider or re-consults one on nonce retirement. Nothing downstream may stash
+#: `provider().password.reveal()`.
 CredentialProvider = Callable[[], Credentials]
 
 
@@ -939,11 +942,13 @@ def credential_provider(
     env: Mapping[str, str] | None = None,
     keychain: KeychainReader | None = None,
 ) -> CredentialProvider:
-    """A *callable* that resolves on demand — what the ISAPI client receives.
+    """A *callable* that re-resolves on every call, for callers that want lazy credentials.
 
-    Re-resolution is the feature: a digest nonce can expire minutes into a paged pull,
-    and at that moment the client asks for a credential instead of reaching for one it
-    cached. It also means no plaintext password ever lives on the client object.
+    Re-resolution is the intended capability: a digest nonce can expire minutes into a
+    paged pull, and a future client seam could ask for a fresh credential at that moment
+    instead of reusing one it cached (decision t_514870e8, Slice 3). Today's
+    `IsapiClient` does not consume a provider: every shipped call site resolves eagerly
+    and passes plaintext values.
     """
     return lambda: resolve_credentials(
         target, user=user, password=password, env=env, keychain=keychain
