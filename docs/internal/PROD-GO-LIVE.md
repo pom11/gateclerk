@@ -267,28 +267,93 @@ accepted quirk. `device_code` is the BC device code when it differs from the ser
 
 ## 6. Alerts to micro-notify
 
-Today the alert sink is **one stderr line**. Under the systemd unit that line lands in
-journald next to systemd's own output (`src/gateclerk/agent_alert.py:156-171`,
-`deploy/gateclerk-agent@.service:151-153`, `deploy/README.md:118-130`).
+The alert sink is still **one stderr line** first. Under the systemd unit that line lands
+in journald next to systemd's own output (`src/gateclerk/agent_alert.py:156-171`,
+`deploy/gateclerk-agent@.service:151-153`, `deploy/README.md:118-130`); in the container it
+is the compose service log (`deploy/README.md:201-203`). That line is the evidence of
+record. micro-notify is an **additional** page, never a replacement for it.
 
-**Until the ALERT-SINK-MNOTIFY card lands, production alerts = journald log only.** This
-doc does not configure micro-notify and does not implement the alert transport. Watch the
-log with:
+A site may declare ONE alert route in the same typed-sink vocabulary as the push sinks:
 
-```bash
-journalctl -u gateclerk-agent@site-a -f
-journalctl -u gateclerk-agent@site-a -n 50
+```toml
+[[site.sink]]
+name = "alerts"
+type = "mnotify"          # alert-only: SiteConfig.event_sinks excludes it
+to = "gateclerk-alerts@<TENANT-DOMAIN>"   # operator mailbox; placeholder
+# timeout_s = 300         # optional override; the mail budget default
 ```
 
-Container install (container install, deploy/compose.yaml; verified against the merged file): the same
-stderr line is in the compose service log:
+`to` is the single recipient field and `timeout_s` defaults to the 300 s mail budget. A
+`mnotify` block with no recipient or a non-positive timeout is refused
+(`src/gateclerk/sinks.py:174-180`, `src/gateclerk/sinks.py:216-223`). `agent_cli` picks
+the site's one alert route (`src/gateclerk/agent_cli.py:1179-1194`) and `gateclerk sink
+add` writes the block (`src/gateclerk/sink_cli.py:351-365`, `src/gateclerk/sink_cli.py:453`).
 
-```bash
-docker compose -f deploy/compose.yaml logs -f site-a
-docker compose -f deploy/compose.yaml logs --tail 50 site-a
-```
+The journald-first law is absolute. The sink writes the same stderr line immediately on
+the calling thread, BEFORE it touches the queue; only then does one daemon worker attempt
+delivery (`src/gateclerk/agent_mnotify.py:175-206`,
+`src/gateclerk/agent_mnotify.py:237-246`). A missing binary, timeout, non-zero exit or
+unexpected runner failure only adds a warning; the line is never written twice, and
+alerting never blocks or raises into the polling loop
+(`src/gateclerk/agent_mnotify.py:263-286`, `src/gateclerk/agent_cli.py:1179-1194`).
 
-Source: `deploy/README.md:201-203`.
+The exec timeout is **300 s** for mail (`MNOTIFY_TIMEOUT_S`,
+`src/gateclerk/agent_mnotify.py:56-57`). A timeout is an **unknown outcome**, not a clean
+failure: mnotify may already have delivered, so the sink warns and never resends
+(`src/gateclerk/agent_mnotify.py:299-311`).
+
+Exit-code policy is micro-notify's `docs/SERVICE-INTEGRATION.md` §1-§3 at commit
+`afeab10`: branch on the process exit code; 0 sent, 2 usage/config, 3 guardrail, 4 auth,
+5 remote, 6 daily cap, 130 interrupted; any other code is a crash/infrastructure failure.
+Invoke with an argv array and `--body-file`: alert text is untrusted input and is never
+shell-interpolated (§1). Exit 5 is never retried blindly because a lost response may
+already have delivered (§3).
+
+### mnotify decisions
+
+Answers to micro-notify `docs/SERVICE-INTEGRATION.md` §10 at `afeab10`. Operator-owned
+items stay placeholders; no real mailbox, token, host or tenant value is recorded here.
+
+- **Q1 sender and allowlist.** Sender is a dedicated mailbox
+  `gateclerk-alerts@<TENANT-DOMAIN>` (`[mail] sender`). The `[allow]` list contains exact
+  recipient addresses only — NO domain wildcard — and includes at least the operator's
+  alert mailbox `[OPERATOR-ONLY value]`.
+- **Q2 recipient caps.** `limits.max_recipients = 5` explicit (the default 20 is too
+  loose). cc and bcc count toward the cap. No Teams DMs.
+- **Q3 channels.** MAIL-ONLY at go-live; no `[teams.targets]`. Teams is later, deliberate,
+  and the operator provisions the `teams__<target>` webhook secret.
+- **Q4 timeout.** Exec timeout 300 s (contract §4 budget). Timeout = unknown outcome →
+  warn with the alert id, never resend. The sink never blocks the polling loop (single
+  worker thread).
+- **Q5 exit 5.** NEVER auto-retry. Dedupe key = alert id `(site, device serial, kind,
+  park key, timestamp)`, logged next to mnotify's mail `requestId`. Resend only
+  operator-manually after checking the mnotify audit JSONL `[OPERATOR-ONLY]`.
+- **Q6 image.** SAME IMAGE (contract §5 default): mnotify inside the gateclerk image at
+  `/opt/mnotify/bin`, no sidecar (matches the #93 container install doc at `deploy/CONTAINER.md`).
+- **Q7 secrets.** Operator provisions on the prod host: `/etc/mnotify/config.toml` mode
+  0600; one file per account under `/run/secrets/mnotify` (root-owned 0444; read-only
+  mount accepted). `MICRO_NOTIFY_CONFIG` / `MICRO_NOTIFY_SECRETS=file` /
+  `MICRO_NOTIFY_SECRETS_DIR` are PATHS, never values. Go-live is APP MODE
+  (certificate/client-secret), so the read-only secrets mount suffices. Delegated mode is
+  NOT chosen; if ever used its secrets dir must be WRITABLE (micro-notify
+  `docs/DELEGATED-SETUP.md`, container section, `afeab10`). Rotation = operator re-runs
+  admin setup.
+- **Q8 concurrency — HARD RULE.** mnotify's daily counter (`state_dir/counter.json`) is an
+  UNLOCKED read-modify-write. Any mnotify processes sharing a `state_dir` must NEVER send
+  concurrently: serialise the WHOLE invocation (check + send + record), e.g. one `flock`
+  around the exec. Locking only the counter write is too late (micro-notify
+  `docs/SERVICE-INTEGRATION.md` §6 at `afeab10`). Production satisfies this structurally:
+  one agent per site plus one dedicated per-site mnotify volume/`state_dir`
+  (`deploy/CONTAINER.md`), and #94's sink serialises in-process (single worker + lock,
+  `src/gateclerk/agent_mnotify.py:168-169`). Any future deployment that shares a
+  `state_dir` must use the same `flock` around the exec.
+- **Q9 audit.** `/var/lib/mnotify/audit/sent.jsonl` on the per-site mnotify volume
+  (already in `deploy/CONTAINER.md`); metadata-only, no bodies. The subject carries site
+  + device serial and no PII, so verbatim recording is acceptable. Rotation/shipping =
+  operator, alongside the volume backup `[OPERATOR-ONLY]`.
+- **Q10 daily cap.** `limits.daily_max` stays at the default 200 (expected volume is far
+  below the cap). Exit 6 = no retry today (UTC rollover); the journald evidence line
+  remains.
 
 ## 7. Network reach from the production box
 
@@ -416,7 +481,7 @@ docker compose -f deploy/compose.yaml exec site-a gateclerk status \
 Source for the systemd start: `deploy/README.md:198-203`. `status` reads the store and
 cached health only; it never contacts the device or the ingest
 (`src/gateclerk/status_cli.py:10-26`). In the container, the healthcheck reports `healthy`
-only after a completed pass (`deploy/CONTAINER.md` in the sibling card; re-check).
+only after a completed pass (`deploy/CONTAINER.md`).
 
 **(c) [OPERATOR-ONLY] Give the old unit one final ok tick, then stop the Mac unit.** Each
 `agent run` tick polls, stores and then pushes at the end of the same cycle
