@@ -878,3 +878,7 @@ globs every recorded site.
 - Oct 25 zero rows also proves no stale claim in windows (dev 120 on all rows read today).
 - Receipts in OBSERVED-site-B.md §1b; card t_0d976509 closed. Optional closure leg for
   "winning label == current claim": operator scans once on B post-flip (not required).
+
+## 2026-11-05 — D-001 Slice 3: agent credential-provider consumer
+
+`agent run` now passes a re-readable credential provider to its long-lived clients, so P2-SITE-AGENT.md §2c's "a transient creds rotation self-heals without a site visit" is actually implemented (nonce-retirement or circuit-expiry re-read; no per-request keychain prompts).

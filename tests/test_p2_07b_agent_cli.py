@@ -54,9 +54,10 @@ from gateclerk.agent_alert import PENDING_SERIAL, AlertPolicy
 from gateclerk.agent_db import connect
 from gateclerk.agent_store import read_checkpoint
 from gateclerk.cli import AUTH_TERMINAL_EXIT, CONFIG_ERROR_EXIT, app
-from gateclerk.config import ConfigSurface, site_from_args
+from gateclerk.config import ConfigSurface, KeychainItem, site_from_args
 from gateclerk.endpoints import REGISTRY
 from gateclerk.isapi_transport import IsapiClient
+from gateclerk.secrets import Secret
 
 # CLI-SPLIT-STRUCTURE: the ONE hand-maintained leaf set lives in test_cli_conventions
 # (`EXPECTED_LEAVES`, with its len-pin + symmetric-difference message). The surface pins
@@ -119,6 +120,25 @@ def wall_digits(moment: datetime, *, claim_min: int = CLAIM_MIN) -> str:
     """
     assert claim_min == CLAIM_MIN, "wall_digits assumes the loop labels bounds with the claim"
     return moment.astimezone(ZoneInfo(SITE_TZ)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+class RotatingKeychain:
+    """A fake keychain READER whose item value the test can rotate mid-run.
+
+    `resolve_credentials` only needs `.read()`; recording `reads` is the keychain-prompt
+    budget the agent must respect (each real `security` invocation can raise an ACL prompt).
+    """
+
+    def __init__(self, password: str) -> None:
+        self.password = password
+        self.reads = 0
+
+    def read(self, target: Any, *, with_comment: bool = True) -> KeychainItem:
+        self.reads += 1
+        return KeychainItem(
+            password=Secret(self.password, label=f"keychain:{target.host}"),
+            comment=f"user={target.config_user}",
+        )
 
 
 class FakeMonotonic:
@@ -227,7 +247,12 @@ class AgentHarness:
             agent_cli,
             "IsapiClient",
             lambda base, user, secret, **kw: IsapiClient(
-                base, user, secret, transport=device.transport, now=self.monotonic
+                base,
+                user,
+                secret,
+                transport=device.transport,
+                now=self.monotonic,
+                **kw,
             ),
         )
         monkeypatch.setenv(HOST_PASSWORD_ENV, password)
@@ -598,6 +623,153 @@ def test_agent_ack_clears_the_park_in_policy_state_not_in_stdout(
     code4, out4 = h.cli(["run", "--site", SITE, "--state-root", str(h.state_root), "--once"])
     assert code4 == 0, out4
     assert len(device.served) > served, "the acked device was polled again"
+
+
+def test_slice3_rotation_self_heals_in_one_process_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slice 3 of D-001: the §2c self-heal, in ONE long-lived agent process.
+
+    The pre-Slice-3 agent cached the plaintext at construction, so the acked re-probe
+    knocked with the stale secret forever (a parked agent never crashes, so
+    `Restart=always` never re-resolved it). Here the fake keychain rotates between ticks:
+    tick 2 parks on a terminal 401, the operator acks, the circuit window expires, and
+    tick 3 must re-read the source and succeed — with no second `build_site_agent` and
+    no process restart. The read counter also pins the prompt budget: one resolve at
+    construction, NONE while the circuit is open or on ordinary ticks, one at expiry.
+    """
+    device = seeded_device()
+    device.add_events(*punch_events(T0, -300))
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None)
+    monkeypatch.delenv(HOST_PASSWORD_ENV, raising=False)  # force the fake keychain rung
+    keychain = RotatingKeychain(PASSWORD)
+    agent = h.api_agent(client_factory=None, env={}, keychain=keychain)
+    try:
+        assert keychain.reads == 1, "point (1): the ctor fail-fast resolve"
+
+        first = agent.tick()
+        assert first.ticks_ok == 1, first
+        assert h.stored_serials() == [200]
+        assert keychain.reads == 1, "an ordinary tick resolves nothing"
+
+        # The device AND the source rotate while the SAME agent keeps running.
+        device.password = "fakepw-rotated"
+        keychain.password = "fakepw-rotated"
+
+        second = agent.tick()
+        assert second.ticks_failed == 1, second
+        assert agent.loops[0].client.circuit_open(), "the terminal 401 opened the circuit"
+        assert agent.policy.parked(SITE, "MASKED-SER-1") is not None
+        assert keychain.reads == 1, "opening a circuit is not a provider-read point"
+
+        served = len(device.served)
+        refused = agent.tick()
+        assert refused.ticks_refused == 1, "unacked: the gate refuses before any request"
+        assert len(device.served) == served, "zero requests while the park is unacked"
+        assert keychain.reads == 1, "a refused tick must not prompt the keychain"
+
+        assert agent.policy.ack(SITE) == 1
+        # The operator provisions the ROTATED secret; the agent process is still the original.
+        keychain.password = "fakepw-rotated"
+        h.now += timedelta(seconds=1800)  # REPROBE_AFTER_S: the re-probe grid opens
+        h.monotonic.advance(311)  # past DEFAULT_CIRCUIT_FALLBACK_SECONDS + margin
+
+        third = agent.tick()
+        assert third.ticks_ok == 1, (third, [r.error for r in agent._last_tick.values()])
+        assert keychain.reads == 2, "exactly one resolve at circuit expiry"
+        assert not agent.loops[0].client.circuit_open()
+        assert agent.policy.parked(SITE, "MASKED-SER-1") is None, "a good tick lifts the park"
+
+        h.now += timedelta(seconds=CADENCE_S)
+        h.monotonic.advance(CADENCE_S)
+        fourth = agent.tick()
+        assert fourth.ticks_ok == 1, fourth
+        assert keychain.reads == 2, "ordinary requests after the heal never re-prompt"
+    finally:
+        agent.close()
+
+
+def test_slice3_keychain_budget_is_one_read_per_rotation_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prompt budget on its own: ordinary requests and in-window ticks are free.
+
+    Each real `security` call can raise a macOS ACL prompt (KeychainReader's docstring),
+    so re-resolution is allowed only at construction and the two lifetime points — never
+    per request or per tick. This is Slice 2's contract observed through the agent path.
+    """
+    device = seeded_device()
+    device.add_events(*punch_events(T0, -300))
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None)
+    monkeypatch.delenv(HOST_PASSWORD_ENV, raising=False)  # force the fake keychain rung
+    keychain = RotatingKeychain(PASSWORD)
+    agent = h.api_agent(client_factory=None, env={}, keychain=keychain)
+    try:
+        for step in range(3):
+            h.now += timedelta(seconds=CADENCE_S)
+            h.monotonic.advance(CADENCE_S)
+            report = agent.tick()
+            assert report.ticks_ok == 1, (step, report)
+        assert keychain.reads == 1, "three ordinary ticks, one construction resolve"
+
+        device.password = "fakepw-rotated"
+        failed = agent.tick()
+        assert failed.ticks_failed == 1, failed
+        assert keychain.reads == 1, "the 401 that parks the device reads nothing"
+    finally:
+        agent.close()
+
+
+def test_slice3_injected_client_factory_still_gets_the_eager_triple(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The injection seam is unchanged: a factory receives (base, user, secret).
+
+    Only the DEFAULT construction path passes the provider; an owner-wired factory keeps
+    the pre-Slice-3 contract, which is what leaves every existing offline test untouched.
+    """
+    h = AgentHarness(tmp_path, seeded_device(), monkeypatch, push_target=None)
+    monkeypatch.delenv(HOST_PASSWORD_ENV, raising=False)  # force the fake keychain rung
+    site = h.site_config()
+    keychain = RotatingKeychain(PASSWORD)
+    seen: list[tuple[str, str, str]] = []
+    sentinel = object()
+
+    def factory(base: str, user: str, secret: str) -> Any:
+        seen.append((base, user, secret))
+        return sentinel
+
+    got = agent_cli._client_for_host(
+        site,
+        HOST,
+        env={},
+        keychain=keychain,
+        client_factory=factory,
+    )
+    assert got is sentinel
+    assert seen == [(f"http://{HOST}:{site.port}", site.isapi_user, PASSWORD)]
+    assert keychain.reads == 1, "the eager path resolves once, as before"
+
+    captured: dict[str, Any] = {}
+
+    class CaptureClient:
+        def __init__(self, base: str, user: str, password: str, **kw: Any) -> None:
+            captured.update(base=base, user=user, password=password, **kw)
+
+    monkeypatch.setattr(agent_cli, "IsapiClient", CaptureClient)
+    agent_cli._client_for_host(
+        site,
+        HOST,
+        env={},
+        keychain=keychain,
+        client_factory=None,
+    )
+    assert captured["user"] == "" and captured["password"] == ""
+    provider = captured["credentials"]
+    assert callable(provider)
+    assert keychain.reads == 1, "building the client does not resolve until the ctor does"
+    assert provider().password.reveal() == PASSWORD
+    assert keychain.reads == 2
 
 
 def test_agent_ack_of_a_site_with_no_park_exits_2(
