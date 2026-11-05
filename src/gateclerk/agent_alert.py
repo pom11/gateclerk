@@ -87,6 +87,9 @@ KIND_CLOCK_SKEW = "clock_skew"
 KIND_CHECKPOINT_STALL = "checkpoint_stall"
 #: db past the §2b keep-everything watermark.
 KIND_DB_WATERMARK = "db_watermark"
+#: A confirmed device serialNo reset (firmware upgrade or log clear). One critical
+#: per incident; the loop has already stored the new punches under a new epoch.
+KIND_SERIAL_RESET = "serial_reset"
 
 #: §2c verbatim: "slow re-probe e.g. every 30 min only after operator
 #: acknowledgement". 30 minutes, as seconds.
@@ -233,6 +236,7 @@ class AlertPolicy:
             #: door whose polls succeed is not a stall (card STALL-ALERT-FALSE).
             "checkpoint_stall": 0,
             "db_watermark": 0,
+            "serial_reset": 0,
         }
         self._mem_parks: dict[str, dict[str, Any]] = {}
         # Consecutive non-auth failed polls per device. "ok" resets to 0; auth
@@ -248,6 +252,10 @@ class AlertPolicy:
         self._skew_open = False
         self._watermark_open = False
         self._stall_open_at: dict[str, str] = {}  # serial -> checkpoint updated_at seen
+        #: Confirmed reset episodes already paged: (old_serial, new_serial). A kill
+        #: before the checkpoint rewind can re-confirm the same reset next tick; the
+        #: operator must still see exactly one page for it.
+        self._serial_reset_seen: set[tuple[int, int]] = set()
 
     # --- park store ---------------------------------------------------------------------
 
@@ -453,6 +461,25 @@ class AlertPolicy:
             # shape) lifts. §2c's rationale for the slow re-probe over park-forever:
             # "a transient creds rotation self-heals without a site visit".
             self._unpark(serial)
+            reset = getattr(result, "serial_reset", None)
+            if reset is not None:
+                episode = (reset.old_serial, reset.new_serial)
+                if episode not in self._serial_reset_seen:
+                    self._serial_reset_seen.add(episode)
+                    old_fw = reset.old_firmware or "unknown"
+                    new_fw = reset.new_firmware or "unknown"
+                    fired.append(
+                        self._fire(
+                            LEVEL_CRITICAL,
+                            KIND_SERIAL_RESET,
+                            serial,
+                            f"device serialNo reset: checkpoint {reset.old_serial} -> "
+                            f"newest {reset.new_serial} (firmware {old_fw} -> {new_fw}); "
+                            "new punches are stored under a new serial epoch and the "
+                            "old rows are untouched — verify the device log was not "
+                            "cleared outside a planned upgrade",
+                        )
+                    )
             return fired
 
         if getattr(result, "skipped", False):
