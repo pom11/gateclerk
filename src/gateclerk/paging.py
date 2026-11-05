@@ -782,15 +782,13 @@ def oldest_serial_in_window(
     This is the read-only ring-floor probe of card t_ed9c7e92. The device returns a
     bounded window oldest-first by default (paging.py module doc: the backfill
     default), so ``maxResults=1`` makes the first page *the floor*: one POST, no
-    cursor walk, no extra handshake. The window must start at or before the oldest
-    event still retained, or the answer is only "oldest since the window opened".
+    cursor walk, no extra handshake. The caller passes the window that starts at the
+    pre-advance checkpoint time, so the answer covers exactly the unread interval.
 
-    ``major`` is a server filter OBSERVED.md proves trusted on this firmware
-    (major=5 = punches; 3 = the 1/min noise sharing the ring). It is re-applied
-    client-side anyway, the same double-filter rule pipeline/agent_loop use: a
-    firmware that silently ignores a filter must not turn noise into the floor.
-    A page with no matching record returns None — the recorded NO MATCH shape is
-    "nothing retained in this window", never a protocol error.
+    ``major=0`` is the all-events floor: serialNo is device-wide, so the oldest
+    retained event of ANY major above ``checkpoint+1`` proves events after our
+    checkpoint were evicted unread (punches may be lost). The caller decides whether
+    that comparison is meaningful; this function only reports the floor.
     """
     window = window_for_device(since, until, site_tz=site_tz)
     cond = build_event_cond(window, device_offset_min=device_offset_min, major=major)

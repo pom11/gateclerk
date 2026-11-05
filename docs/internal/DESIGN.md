@@ -416,21 +416,26 @@ nonce, serial or employee name (fixtures mask them — see tests/fixtures/README
    poll — device-side config is off-limits to us, but the *polling* client is theirs
    to stop). Poll interval must be minutes, not days.
 
-   **Device ring-floor signal (DECIDED 2026-11-05, card t_ed9c7e92).** The agent
-   records the device's oldest retained **punch** with ONE bounded AcsEvent read:
-   window `[our earliest stored event instant, now]`, `major=5`, `maxResults=1`,
-   oldest-first (the backfill default). `major=5` is a server filter OBSERVED.md
-   proves trusted, and the client re-filters — the all-events floor would rise every
-   time the 1/min noise recycles the shared ring and prove only "it wrapped", while
-   a punch-only floor rises when a punch is evicted. A floor **past the checkpoint**
-   means punches in that serial range were evicted before we read them: possible
-   loss, not proof a punch existed there (serialNo is device-wide monotonic, so a
-   floor at/below the checkpoint leaves every unread punch retained). Cadence: at
-   most hourly, and only while the checkpoint is stale — zero extra requests while
-   punches flow, one POST per stale hour otherwise. Hourly leaves ~6 days of margin
-   on the observed ~7-day ring and avoids doubling the 5-minute poll's request count
-   against the ~190-use digest nonce cap. A parked or failing device is never
-   probed; the failed-poll arm owns that case.
+   **Device ring-floor signal (DECIDED 2026-11-05, card t_ed9c7e92).** Loss is
+   detected at the FIRST ok tick after process start or a failed-poll streak, and
+   ONLY when the time since the last known successful poll is long enough to matter
+   (24 h: the observed ring is ~10,199 events and the 1/min noise adds ~1,440/day,
+   so retention is ~7 days and a shorter gap cannot have evicted anything after the
+   checkpoint). The agent spends ONE read-only AcsEvent page in the *unread* window
+   `[the pre-advance checkpoint time, now]`, oldest-first, `maxResults=1`, with NO
+   major filter. serialNo is device-wide, so the signal is the oldest retained event
+   of ANY major compared with the checkpoint as it stood BEFORE this tick advanced:
+   a floor above `checkpoint+1` means events in that serial range were evicted before
+   the agent read them, and punches in the range may be lost — possible loss, not
+   proof a punch existed there. A punch-only floor was rejected: the evicted rows
+   may be noise, whose serials still prove the ring wrapped past our checkpoint.
+   A door polled normally is never probed (the same floor rise is harmless when
+   every poll read everything), and a quiet week of successful polls spends zero
+   extra requests. The last-known-good instant for a fresh process comes from the
+   mtime of the health snapshot the agent already writes minus its
+   `last_poll_ok_age_s`, so no schema change is needed. A parked/skipped or failing
+   device is never probed; failures in the probe itself are swallowed, and the page
+   is once per incident with the serial range and gap length.
 5. **Multi-reader ambiguity** — one device per door means one direction signal per door.
   If a site ends up with a reader on each side of the same door, `direction` may need to
   come from the reader/door number rather than `attendanceStatus`. Worth confirming now.

@@ -1,219 +1,210 @@
 """Card t_ed9c7e92: the real device ring-floor signal for `checkpoint_stall`.
 
-The probe is ONE read-only AcsEvent page: window `[our earliest stored event, now]`,
-`major=5` (punches only — the 1/min major=3 noise shares the ring), `maxResults=1`,
-oldest-first. The device's answer is the oldest punch it still retains; a floor past
-the checkpoint means punches in that serial range were evicted before we read them.
+The signal is spent ONCE at the first ok tick after a real gap in successful polls
+(process start or a failed-poll streak), when the gap is long enough for the ~10k
+ring to have evicted events after the checkpoint. The probe is ONE read-only AcsEvent
+page in the *unread* window `[pre-advance checkpoint time, now]`, oldest-first,
+`maxResults=1`, all majors. Its answer is compared with the PRE-advance checkpoint:
+a floor above `checkpoint + 1` means events after that checkpoint were evicted
+unread, so punches may be lost. A door polled normally is never probed; a quiet
+week of successful polls costs zero extra device requests.
 
 No real device is touched: every case runs `FakeDevice` behind the real `IsapiClient`,
-with the p2-03/p2-05 harnesses' injected clocks and tmp sqlite store.
+through `AgentHarness`'s frozen clock and tmp state root (store + health snapshot).
 """
 
 from __future__ import annotations
 
 import json
+import os
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-import httpx
+import pytest
 
 from fakedevice import FakeDevice
-from test_p2_03_scheduler import (
-    CADENCE_S,
-    EVENT_PATH,
-    device_event,
-    seed_events,
-    seeded_device,
-)
-from test_p2_05_alerts import PASSWORD_OK, PolicyHarness
-
-NOISE = 1029
+from test_p2_03_scheduler import EVENT_PATH, T0, device_event, seeded_device
+from test_p2_07b_agent_cli import AgentHarness, punch_events, wall_digits
 
 
-def _noise(serial: int, wall: str) -> dict[str, Any]:
-    return {
-        "serialNo": serial,
-        "major": 3,
-        "minor": NOISE,
-        "type": 0,
-        "time": f"{wall}+02:00",
-        "currentVerifyMode": "invalid",
-    }
-
-
-def _last_event_cond(device: FakeDevice) -> dict[str, Any]:
-    for served in reversed(device.served):
-        if served.path == EVENT_PATH and served.body:
+def _probe_conditions(device: FakeDevice) -> list[dict[str, Any]]:
+    """Every AcsEvent POST body that was the one-page ring-floor probe."""
+    out: list[dict[str, Any]] = []
+    for served in device.served:
+        if served.path != EVENT_PATH or not served.body:
+            continue
+        try:
             body = json.loads(served.body)
-            cond = body.get("AcsEventCond")
-            assert isinstance(cond, dict), body
-            return cond
-    raise AssertionError("no AcsEvent request was served")
+        except ValueError:  # pragma: no cover - every body this suite sends is JSON
+            continue
+        cond = body.get("AcsEventCond") if isinstance(body, dict) else None
+        if isinstance(cond, dict) and cond.get("maxResults") == 1:
+            out.append(cond)
+    return out
 
 
-def _seeded_harness(tmp_path: Path) -> tuple[PolicyHarness, Any]:
+def _backdate_health(h: AgentHarness, at: Any) -> None:
+    """The snapshot's mtime is its write instant; tests pin it to the fake clock."""
+    path = h.state_root / "health" / "agent.json"
+    assert path.exists(), "the first tick must have written the health snapshot"
+    stamp = at.timestamp()
+    os.utime(path, (stamp, stamp))
+
+
+def _alerts_during(h: AgentHarness, alerts: list[Any]) -> Any:
+    agent = h.api_agent(sink=alerts.append)
+    try:
+        return agent, agent.tick()
+    except BaseException:
+        agent.close()
+        raise
+
+
+def test_outage_past_the_ring_pages_before_the_checkpoint_advance_hides_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     device = seeded_device()
-    seed_events(
-        device,
-        [
-            # Same wall minute as punch 60: the fake sorts wall then serial, so this
-            # noise row is FIRST in the page. The client-side major re-filter is what
-            # keeps the floor a punch, not this noise row.
-            _noise(50, "2026-10-19T09:58:00"),
-            device_event(60, "2026-10-19T09:58:00"),
-            _noise(71, "2026-10-19T09:59:00"),
-            device_event(61, "2026-10-19T10:00:00"),
-        ],
+    device.add_events(*punch_events(T0, -300))  # serial 200; checkpoint reaches 200
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None, now=T0)
+
+    first_alerts: list[Any] = []
+    first_agent, first = _alerts_during(h, first_alerts)
+    try:
+        assert first.ticks_ok == 1, first
+        assert h.conn().execute("SELECT MAX(serial_no) m FROM events").fetchone()["m"] == 200
+        _backdate_health(h, T0)
+    finally:
+        first_agent.close()
+
+    # Eight days down: the ring has recycled. Only events from the new stream survive
+    # on the device (the old rows are gone, not merely unread).
+    h.now += timedelta(days=8)
+    h.monotonic.advance(8 * 86400)
+    device._event_store = []
+    device.add_events(
+        device_event(9000, wall_digits(h.now - timedelta(minutes=2))),
+        device_event(9001, wall_digits(h.now - timedelta(minutes=1))),
     )
-    h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
-    first = h.tick()
-    assert first is not None and first.ok is True
-    assert first.device_serial is not None
-    return h, first.device_serial
+
+    alerts: list[Any] = []
+    agent, report = _alerts_during(h, alerts)
+    try:
+        assert report.ticks_ok == 1, report
+        # The walk HAS advanced the checkpoint to the new stream before the alert
+        # decision; the page must still name the pre-advance evidence.
+        checkpoint = h.conn().execute("SELECT checkpoint_serial FROM checkpoint").fetchone()
+        assert checkpoint["checkpoint_serial"] == 9001
+        assert [a.kind for a in alerts] == ["checkpoint_stall"], alerts
+        note = alerts[0].note
+        assert "possible loss" in note
+        assert "device ring floor" in note
+        assert "serials 201..8999" in note
+        assert "8.0 days" in note
+        assert "all majors" in note
+        assert "cannot prove" in note
+        assert report.alerts == ("critical:checkpoint_stall",)
+
+        probes = _probe_conditions(device)
+        assert len(probes) == 1
+        assert probes[0]["major"] == 0, "the floor is all-events, not punch-only"
+        assert "timeReverseOrder" not in probes[0], "oldest-first is the default"
+
+        # The next ok tick is not the first after the gap: no second probe, no page.
+        h.now += timedelta(seconds=300)
+        h.monotonic.advance(300)
+        later = agent.tick()
+        assert later.ticks_ok == 1 and later.alerts == ()
+        assert len(_probe_conditions(device)) == 1
+        assert len(alerts) == 1
+    finally:
+        agent.close()
 
 
-# --- the probe itself -------------------------------------------------------------------
-
-
-def test_probe_is_one_oldest_first_punch_page_and_ignores_noise(tmp_path: Path) -> None:
-    h, _serial = _seeded_harness(tmp_path)
-    device = h.device
-    before = device.requests_to("POST", EVENT_PATH)
-
-    assert h.loop.probe_ring_floor() == 60
-    assert device.requests_to("POST", EVENT_PATH) == before + 1, "exactly one POST"
-
-    cond = _last_event_cond(device)
-    assert cond["major"] == 5, "punches only: the noise stream is not the floor"
-    assert cond["maxResults"] == 1, "one page is the floor"
-    assert cond["searchResultPosition"] == 0
-    assert "timeReverseOrder" not in cond, "oldest-first is the documented default"
-
-
-def test_probe_window_starts_at_the_earliest_stored_event(tmp_path: Path) -> None:
-    h, _serial = _seeded_harness(tmp_path)
-    assert h.loop.probe_ring_floor() == 60
-
-    cond = _last_event_cond(h.device)
-    # The anchor is the DEVICE-LOCAL stamp of the earliest stored event (09:58),
-    # localized in the site zone and relabeled with the device's claim (+02:00) —
-    # the p1-05c shape, not the event's wrong +02 label converted through UTC.
-    assert cond["startTime"] == "2026-10-19T09:58:00+02:00"
-    assert cond["endTime"] == "2026-10-19T10:00:00+02:00"
-
-
-def test_probe_returns_none_and_sends_nothing_without_stored_events(tmp_path: Path) -> None:
+def test_short_restart_does_not_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     device = seeded_device()
-    seed_events(device, [_noise(50, "2026-10-19T09:58:00")])
-    h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
-    first = h.tick()
-    assert first is not None and first.ok is True
-    before = device.requests_to("POST", EVENT_PATH)
+    device.add_events(*punch_events(T0, -300))
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None, now=T0)
 
-    assert h.loop.probe_ring_floor() is None
-    assert device.requests_to("POST", EVENT_PATH) == before, "no anchor = no request"
+    first_alerts: list[Any] = []
+    first_agent, first = _alerts_during(h, first_alerts)
+    try:
+        assert first.ticks_ok == 1, first
+        _backdate_health(h, T0)
+    finally:
+        first_agent.close()
 
-
-def test_probe_failure_is_silent_and_never_breaks_the_alert_path(tmp_path: Path) -> None:
-    h, _serial = _seeded_harness(tmp_path)
-    warnings: list[str] = []
-    h.loop._warn = warnings.append
-    h.device.reset_raw("POST", EVENT_PATH, httpx.Response(503, text="busy"))
-
-    assert h.loop.probe_ring_floor() is None
-    assert warnings and "ring-floor probe failed" in warnings[0]
-    assert "busy" not in warnings[0], "never copy transport text into the warn line"
-
-
-# --- the alert arm ----------------------------------------------------------------------
-
-
-def test_device_floor_past_the_checkpoint_pages_possible_loss(tmp_path: Path) -> None:
-    h, serial = _seeded_harness(tmp_path)
-    # A fresh checkpoint is not stale: the probe must not be spent.
-    calls: list[int] = []
-    assert h.policy.check_stall(serial, ring_probe=lambda: calls.append(1) or 9999) is None
-    assert calls == [], "no probe while the checkpoint is moving"
-
-    h.clock.advance(4 * CADENCE_S)
-    h.monotonic.advance(4 * CADENCE_S)
-    fired = h.policy.check_stall(serial, ring_probe=lambda: 9999)
-    assert fired is not None and fired.kind == "checkpoint_stall"
-    assert fired.level == "critical"
-    assert "device ring floor" in fired.note
-    assert "past our checkpoint" in fired.note
-    assert "possible loss" in fired.note
-    assert "cannot prove" in fired.note
-
-    # Same floor, same frozen checkpoint: one page per incident, not per check.
-    h.clock.advance(3600)
+    h.now += timedelta(hours=1)
     h.monotonic.advance(3600)
-    assert h.policy.check_stall(serial, ring_probe=lambda: 9999) is None
-    assert h.kinds().count("checkpoint_stall") == 1
+    alerts: list[Any] = []
+    agent, report = _alerts_during(h, alerts)
+    try:
+        assert report.ticks_ok == 1, report
+        assert _probe_conditions(device) == [], "under a day cannot have evicted a week"
+        assert alerts == []
+    finally:
+        agent.close()
 
 
-def test_device_floor_at_or_below_the_checkpoint_is_silence(tmp_path: Path) -> None:
-    h, serial = _seeded_harness(tmp_path)
-    h.clock.advance(4 * CADENCE_S)
-    h.monotonic.advance(4 * CADENCE_S)
-
-    # The fake ignores the server-side major filter (its documented lenience), so
-    # the checkpoint is the highest serial it returned, noise included: 71.
-    assert h.policy.check_stall(serial, ring_probe=lambda: 60) is None
-    h.clock.advance(3600)
-    h.monotonic.advance(3600)
-    assert h.policy.check_stall(serial, ring_probe=lambda: 71) is None, "at the checkpoint"
-    h.clock.advance(3600)
-    h.monotonic.advance(3600)
-    fired = h.policy.check_stall(serial, ring_probe=lambda: 72)
-    assert fired is not None and "72" in fired.note
-
-
-def test_probe_is_throttled_to_the_hourly_cadence(tmp_path: Path) -> None:
-    h, serial = _seeded_harness(tmp_path)
-    h.clock.advance(4 * CADENCE_S)
-    h.monotonic.advance(4 * CADENCE_S)
-    calls: list[int] = []
-
-    def probe() -> int:
-        calls.append(1)
-        return 60
-
-    assert h.policy.check_stall(serial, ring_probe=probe) is None
-    assert len(calls) == 1
-    h.clock.advance(CADENCE_S)
-    h.monotonic.advance(CADENCE_S)
-    assert h.policy.check_stall(serial, ring_probe=probe) is None
-    assert len(calls) == 1, "one probe per hour, not per stale tick"
-
-    h.clock.advance(3600)
-    h.monotonic.advance(3600)
-    assert h.policy.check_stall(serial, ring_probe=probe) is None
-    assert len(calls) == 2
+def test_quiet_week_of_successful_polls_sends_no_extra_request_and_no_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device = seeded_device()
+    device.add_events(*punch_events(T0, -300))
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None, now=T0)
+    alerts: list[Any] = []
+    agent = h.api_agent(sink=alerts.append)
+    try:
+        assert agent.tick().ticks_ok == 1
+        for _ in range(14):  # 7 days, a poll every 12 hours, every one successful
+            h.now += timedelta(hours=12)
+            h.monotonic.advance(12 * 3600)
+            report = agent.tick()
+            assert report.ticks_ok == 1, report
+        assert _probe_conditions(device) == [], "successful polls never spend the probe"
+        assert alerts == []
+    finally:
+        agent.close()
 
 
-def test_probe_exception_is_swallowed_and_no_alert_is_invented(tmp_path: Path) -> None:
-    h, serial = _seeded_harness(tmp_path)
-    h.clock.advance(4 * CADENCE_S)
-    h.monotonic.advance(4 * CADENCE_S)
+def test_a_punch_arriving_between_walk_and_probe_cannot_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device = seeded_device()
+    device.add_events(*punch_events(T0, -300))  # checkpoint serial 200
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None, now=T0)
 
-    def boom() -> int:
-        raise RuntimeError("device said no")
+    first_alerts: list[Any] = []
+    first_agent, first = _alerts_during(h, first_alerts)
+    try:
+        assert first.ticks_ok == 1, first
+        _backdate_health(h, T0)
+    finally:
+        first_agent.close()
 
-    assert h.policy.check_stall(serial, ring_probe=boom) is None
-    assert h.alerts == []
-    assert h.policy.counters["checkpoint_stall"] == 0
+    # The gap is old enough to be worth a probe, but the device has NOT evicted
+    # anything: the next device-wide serial after the checkpoint is 201.
+    h.now += timedelta(hours=25)
+    h.monotonic.advance(25 * 3600)
+    device._event_store = []
 
+    alerts: list[Any] = []
+    agent = h.api_agent(sink=alerts.append)
+    try:
+        loop = agent.loops[0]
+        original = loop.probe_ring_floor
 
-def test_no_probe_means_the_old_two_arms_are_unchanged(tmp_path: Path) -> None:
-    """The default call (no ring_probe) is still the p2-05 behaviour: a quiet door
-    with successful polls is silence, even when the checkpoint is stale.
-    """
-    h, serial = _seeded_harness(tmp_path)
-    for _ in range(4):
-        h.clock.advance(CADENCE_S)
-        h.monotonic.advance(CADENCE_S)
-        quiet = h.tick()
-        assert quiet is not None and quiet.ok is True
-        assert h.policy.check_stall(serial) is None
-    assert h.alerts == []
+        def racing_probe(since_stamp: str) -> int | None:
+            # Exactly reviewer point 1's race: a punch lands after the walk read and
+            # before the probe asks. It is checkpoint+1, so it is NOT evidence that
+            # anything below it was evicted.
+            device.add_events(device_event(201, wall_digits(h.now)))
+            return original(since_stamp)
+
+        loop.probe_ring_floor = racing_probe  # type: ignore[method-assign]
+        report = agent.tick()
+        assert report.ticks_ok == 1, report
+        assert len(_probe_conditions(device)) == 1, "the probe did run (not vacuously green)"
+        assert alerts == [], alerts
+    finally:
+        agent.close()

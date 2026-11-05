@@ -57,13 +57,7 @@ from typing import Any
 from gateclerk.agent_db import connect
 from gateclerk.agent_push import Transport as PushTransport
 from gateclerk.agent_push import device_users_line
-from gateclerk.agent_store import (
-    Checkpoint,
-    advance_checkpoint,
-    read_checkpoint,
-    read_oldest_event_stamp,
-    store_events,
-)
+from gateclerk.agent_store import Checkpoint, advance_checkpoint, read_checkpoint, store_events
 from gateclerk.config import DeviceTarget, resolve_credentials
 from gateclerk.exceptions import IsapiError
 from gateclerk.isapi_transport import IsapiClient
@@ -132,6 +126,12 @@ class TickResult:
     #: The checkpoint after this tick (None when nothing ever advanced), and whether
     #: THIS tick moved it (a quiet tick re-reports the serial without churning).
     checkpoint_serial: int | None = None
+    #: The checkpoint as it stood BEFORE this tick's first advance. The ring-floor
+    #: probe (card t_ed9c7e92) must compare the device's oldest retained event with
+    #: THIS serial: comparing with `checkpoint_serial` above would compare against a
+    #: serial this very tick just walked, which no retained event can exceed.
+    checkpoint_serial_before: int | None = None
+    checkpoint_time_before: str | None = None
     advanced: bool = False
     #: Normalized termination of the LAST completed chunk's SearchSummary
     #: (paging.py:351) — the §2e `search_termination` observable: P2-06 reports it,
@@ -317,10 +317,17 @@ class DeviceLoop:
                 error="auth circuit open — device parked, no request sent (P2-05 alert channel)",
             )
         since, until = None, None
+        before: Checkpoint | None = None
         try:
             self._ensure_device_state()
             if self.device_serial is None:  # pragma: no cover - _ensure raises otherwise
                 raise IsapiError("bootstrap completed without a device serial")
+            # Capture the checkpoint BEFORE the per-chunk advances below. The ring-floor
+            # probe (card t_ed9c7e92) compares the device's oldest retained event with
+            # this value: after the walk there is nothing retained above the advanced
+            # checkpoint by construction, so using the post-tick serial would make the
+            # arm dead (and a late arrival would look like loss).
+            before = read_checkpoint(self.conn, self.device_serial)
             since, until = self._window()
             counts = _WalkCounts()
             advanced = False
@@ -358,41 +365,44 @@ class DeviceLoop:
                     if checkpoint_serial is not None
                     else (checkpoint.checkpoint_serial if checkpoint else None)
                 ),
+                checkpoint_serial_before=(before.checkpoint_serial if before else None),
+                checkpoint_time_before=(before.checkpoint_time if before else None),
                 advanced=advanced,
                 termination=counts.termination,
             )
         except Exception as exc:
             return self._failure(exc, since=since, until=until)
 
-    def probe_ring_floor(self) -> int | None:
-        """One read-only AcsEvent page: the oldest PUNCH the device still retains.
+    def probe_ring_floor(self, since_stamp: str) -> int | None:
+        """One read-only AcsEvent page: the oldest event of ANY major still retained.
 
-        The device ring is shared with the 1/min major=3 noise, so the all-events
-        floor rises whenever noise fills the ring and proves only "it wrapped". This
-        probes ``major=5`` (a filter OBSERVED.md proves trusted) so the answer is the
-        oldest retained punch: a rise means a punch was evicted, not merely that
-        noise recycled the ring. Callers compare it with the checkpoint serial — a
-        floor PAST the checkpoint means punches in that serial range were evicted
-        before the agent read them (possible loss; the device cannot prove a punch
-        existed in the gap).
+        The device ring is shared by punches and the 1/min major=3 noise, and serialNo
+        is device-wide. The signal is therefore the oldest retained event of ANY major
+        in the *unread* window that starts at the pre-advance checkpoint time: a floor
+        above ``checkpoint_serial + 1`` means events after that checkpoint were evicted
+        before this agent read them, so punches in that serial range may be lost. A
+        punch-only floor would miss the case where the evicted rows were noise and the
+        ring moved while the agent was down.
 
-        Window: ``[earliest stored event instant, now]``. Starting at our own first
-        stored event makes it cover every punch this agent ever read; the device
-        answers the first page oldest-first, so ``maxResults=1`` is the floor with
-        one POST (no cursor walk). Deliberately silent on failure: the alert path
-        must bend, never break — a failed probe is "no evidence this hour", and the
-        failing-poll arm still speaks. The caller decides when it is worth asking.
+        Window: ``[the pre-advance checkpoint's device-local stamp, now]``. The caller
+        captures that checkpoint before the tick walks and advances it; passing the
+        post-tick one would make the comparison dead by construction. The device
+        answers oldest-first, so ``maxResults=1`` is the floor with one POST (no cursor
+        walk). A floor AT the checkpoint (or one serial past it: the next event, which
+        the walk may just have read) proves nothing was evicted.
+
+        Deliberately silent on failure: the alert path must bend, never break — a failed
+        probe is "no evidence this incident", and the failing-poll arm still speaks.
+        The caller decides when it is worth asking. A parked/skipped device is never
+        asked because only an ok tick offers this callable.
         """
         if self.device_serial is None or self.conn is None:
             return None
         try:
-            anchor = read_oldest_event_stamp(self.conn, self.device_serial)
-            if anchor is None:
-                return None
-            # The anchor is the device's own wall digits; p1-05c's TimeResolver
+            # The checkpoint stamp is device wall digits; p1-05c's TimeResolver
             # localizes them in the SITE zone (the claim may be the known +02/+03
-            # lie), exactly like the poll's checkpoint floor.
-            since = _parse_stamp(anchor, site_tz=self.site_tz)
+            # lie), exactly like the poll's own window floor.
+            since = _parse_stamp(since_stamp, site_tz=self.site_tz)
             until = self._now()
             if until.tzinfo is None or since >= until:
                 return None
@@ -405,7 +415,7 @@ class DeviceLoop:
                 until=until,
                 site_tz=self.site_tz,
                 device_offset_min=self._claim,
-                major=5,
+                major=0,
                 limits=limits,
                 inter_page_delay=self._inter_page_delay,
                 sleep=self._sleep,
@@ -414,7 +424,7 @@ class DeviceLoop:
         except Exception as exc:  # the alert path must never raise
             self._warn(
                 f"warning: device ring-floor probe failed ({type(exc).__name__}); "
-                "checkpoint_stall has no device-floor evidence this hour"
+                "checkpoint_stall has no device-floor evidence this incident"
             )
             return None
         return None if oldest is None else oldest.serial_no

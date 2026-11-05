@@ -355,7 +355,7 @@ def read_oldest_serial(conn: sqlite3.Connection, device_serial: str) -> int | No
     already kept are gone (deleted or lost), so P2-05's ``check_stall`` names this
     arm "stored history disappeared". The device-side ring floor is a separate
     read-only probe (``DeviceLoop.probe_ring_floor``, card t_ed9c7e92; DESIGN.md:411)
-    that asks the device for its oldest retained punch; the health surface keeps its
+    that asks for the oldest retained event of any major; the health surface keeps its
     own store metric line (agent_health renders `oldest_serial` from the same table,
     NOTES-p2-06: "no fabrication").
     """
@@ -364,30 +364,6 @@ def read_oldest_serial(conn: sqlite3.Connection, device_serial: str) -> int | No
         (device_serial,),
     ).fetchone()
     return row["m"]
-
-
-def read_oldest_event_stamp(conn: sqlite3.Connection, device_serial: str) -> str | None:
-    """The DEVICE-LOCAL stamp of the store's earliest event, as the probe's anchor.
-
-    The ring-floor probe (card t_ed9c7e92) asks the device for the oldest retained
-    punch in ``[this event, now]``. Starting at our own first stored event is what
-    makes that window cover every punch this agent has ever read (and every later
-    one): the checkpoint serial can never name an event older than this row. It is
-    deliberately NOT a signal — the device-side answer is (``DeviceLoop.probe_ring_floor``).
-
-    The returned string is ``event_time_local`` (the device's own wall digits,
-    untouched) because p1-05c's rule is that the digits are the truth and the
-    trailing claim may be wrong; the caller localizes them in the site zone. The
-    row is chosen by earliest ``event_time_utc`` (a real instant, never a string
-    comparison across offsets); tz-unresolved rows are NULL and cannot anchor.
-    """
-    row = conn.execute(
-        "SELECT COALESCE(event_time_local, event_time_utc) stamp FROM events "
-        "WHERE device_serial = ? AND event_time_utc IS NOT NULL "
-        "ORDER BY event_time_utc ASC, id ASC LIMIT 1",
-        (device_serial,),
-    ).fetchone()
-    return None if row is None else row["stamp"]
 
 
 def advance_checkpoint(
