@@ -233,9 +233,10 @@ class HealthSnapshot:
     reasons: tuple[str, ...]
     #: Threshold the health surface reports. The paging semantics live in
     #: AlertPolicy.check_stall: "stall" now means EVIDENCE OF LOSS (a streak of
-    #: failed polls, or stored history disappearing), never the mere silence of a
-    #: quiet door. A rising oldest serial is our own store's floor, not the device's
-    #: ring; real ring-rollover detection is card t_ed9c7e92.
+    #: failed polls, stored history disappearing, or the device ring floor passing
+    #: the checkpoint), never the mere silence of a quiet door. A rising oldest
+    #: serial is our own store's floor; the device ring floor is a separate
+    #: alert-path probe (card t_ed9c7e92), not this metric.
     checkpoint_stall_s: float
     devices: tuple[DeviceHealth, ...]
     site_metrics: tuple[MetricLine, ...]

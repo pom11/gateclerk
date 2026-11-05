@@ -408,15 +408,29 @@ nonce, serial or employee name (fixtures mask them — see tests/fixtures/README
   BC). Owner decision, per site, with a door-side test pass. Not blocking P1.
 3. **Site identity** — `site` is agent config today (`site-a`...). Once a punch joins to
   a BC location code we need the canonical mapping. Same owner question as (1).
-4. **Retention / gaps** — partially answered by probe: oldest retained event is
-   serial 27 @ 2026-05-21 (device started counting ~then; no rolling observed in ~5
-   months of history). BUT site-a's noise stream runs 1/min ≈ 1,440 events/day, so
-   whatever the real ring capacity is, noise will dominate it. **Operational
-   consequence:** the agent must record oldest-serialNo per poll (a monotonic increase
-   of the minimum = rolling started = punches are being lost) and the owner should kill
-   the noise source at its client (looks like a Hik-Connect/remote poll — device-side
-   config is off-limits to us, but the *polling* client is theirs to stop). Poll
-   interval must be minutes, not days.
+4. **Retention / gaps** — answered by probe: oldest retained event is serial 27 @
+   2026-05-21 (device started counting ~then; no rolling observed in ~5 months of
+   history). BUT site-a's noise stream runs 1/min ≈ 1,440 events/day, so whatever the
+   real ring capacity is, noise will dominate it. **Operational consequence:** the
+   owner should kill the noise source at its client (looks like a Hik-Connect/remote
+   poll — device-side config is off-limits to us, but the *polling* client is theirs
+   to stop). Poll interval must be minutes, not days.
+
+   **Device ring-floor signal (DECIDED 2026-11-05, card t_ed9c7e92).** The agent
+   records the device's oldest retained **punch** with ONE bounded AcsEvent read:
+   window `[our earliest stored event instant, now]`, `major=5`, `maxResults=1`,
+   oldest-first (the backfill default). `major=5` is a server filter OBSERVED.md
+   proves trusted, and the client re-filters — the all-events floor would rise every
+   time the 1/min noise recycles the shared ring and prove only "it wrapped", while
+   a punch-only floor rises when a punch is evicted. A floor **past the checkpoint**
+   means punches in that serial range were evicted before we read them: possible
+   loss, not proof a punch existed there (serialNo is device-wide monotonic, so a
+   floor at/below the checkpoint leaves every unread punch retained). Cadence: at
+   most hourly, and only while the checkpoint is stale — zero extra requests while
+   punches flow, one POST per stale hour otherwise. Hourly leaves ~6 days of margin
+   on the observed ~7-day ring and avoids doubling the 5-minute poll's request count
+   against the ~190-use digest nonce cap. A parked or failing device is never
+   probed; the failed-poll arm owns that case.
 5. **Multi-reader ambiguity** — one device per door means one direction signal per door.
   If a site ends up with a reader on each side of the same door, `direction` may need to
   come from the reader/door number rather than `attendanceStatus`. Worth confirming now.

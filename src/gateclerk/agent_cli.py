@@ -636,7 +636,13 @@ class SiteAgent:
             if isinstance(recoveries, int):
                 self.policy.observe_recoveries(recoveries)
             if loop.device_serial:
-                stall = self.policy.check_stall(loop.device_serial)
+                # The device ring-floor probe is a READ on the same device. Only an ok
+                # tick may offer it: a skipped tick (circuit open/park) must present
+                # ZERO requests, and a failed walk already has the failed-poll arm.
+                stall = self.policy.check_stall(
+                    loop.device_serial,
+                    ring_probe=loop.probe_ring_floor if result.ok else None,
+                )
                 if stall is not None:
                     report.alerts.append(stall)
             # Task 15's hourly roster step, pulled per cycle: a no-op (None) until the

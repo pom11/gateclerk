@@ -57,7 +57,13 @@ from typing import Any
 from gateclerk.agent_db import connect
 from gateclerk.agent_push import Transport as PushTransport
 from gateclerk.agent_push import device_users_line
-from gateclerk.agent_store import Checkpoint, advance_checkpoint, read_checkpoint, store_events
+from gateclerk.agent_store import (
+    Checkpoint,
+    advance_checkpoint,
+    read_checkpoint,
+    read_oldest_event_stamp,
+    store_events,
+)
 from gateclerk.config import DeviceTarget, resolve_credentials
 from gateclerk.exceptions import IsapiError
 from gateclerk.isapi_transport import IsapiClient
@@ -67,6 +73,7 @@ from gateclerk.paging import (
     ChunkResult,
     PagingLimits,
     iter_event_windows,
+    oldest_serial_in_window,
 )
 from gateclerk.pipeline import (
     NOISE_MAJOR,
@@ -356,6 +363,61 @@ class DeviceLoop:
             )
         except Exception as exc:
             return self._failure(exc, since=since, until=until)
+
+    def probe_ring_floor(self) -> int | None:
+        """One read-only AcsEvent page: the oldest PUNCH the device still retains.
+
+        The device ring is shared with the 1/min major=3 noise, so the all-events
+        floor rises whenever noise fills the ring and proves only "it wrapped". This
+        probes ``major=5`` (a filter OBSERVED.md proves trusted) so the answer is the
+        oldest retained punch: a rise means a punch was evicted, not merely that
+        noise recycled the ring. Callers compare it with the checkpoint serial — a
+        floor PAST the checkpoint means punches in that serial range were evicted
+        before the agent read them (possible loss; the device cannot prove a punch
+        existed in the gap).
+
+        Window: ``[earliest stored event instant, now]``. Starting at our own first
+        stored event makes it cover every punch this agent ever read; the device
+        answers the first page oldest-first, so ``maxResults=1`` is the floor with
+        one POST (no cursor walk). Deliberately silent on failure: the alert path
+        must bend, never break — a failed probe is "no evidence this hour", and the
+        failing-poll arm still speaks. The caller decides when it is worth asking.
+        """
+        if self.device_serial is None or self.conn is None:
+            return None
+        try:
+            anchor = read_oldest_event_stamp(self.conn, self.device_serial)
+            if anchor is None:
+                return None
+            # The anchor is the device's own wall digits; p1-05c's TimeResolver
+            # localizes them in the SITE zone (the claim may be the known +02/+03
+            # lie), exactly like the poll's checkpoint floor.
+            since = _parse_stamp(anchor, site_tz=self.site_tz)
+            until = self._now()
+            if until.tzinfo is None or since >= until:
+                return None
+            limits = self._limits or (
+                paging_limits_from_caps(self._caps) if self._caps is not None else PagingLimits()
+            )
+            oldest = oldest_serial_in_window(
+                _search_reader(self.client),
+                since=since,
+                until=until,
+                site_tz=self.site_tz,
+                device_offset_min=self._claim,
+                major=5,
+                limits=limits,
+                inter_page_delay=self._inter_page_delay,
+                sleep=self._sleep,
+                clock=self._monotonic,
+            )
+        except Exception as exc:  # the alert path must never raise
+            self._warn(
+                f"warning: device ring-floor probe failed ({type(exc).__name__}); "
+                "checkpoint_stall has no device-floor evidence this hour"
+            )
+            return None
+        return None if oldest is None else oldest.serial_no
 
     def close(self) -> None:
         """Release the client's socket pool and the db connection (unit shutdown)."""

@@ -108,6 +108,7 @@ __all__ = [
     "STATUS_MORE",
     "ChunkResult",
     "CountGetter",
+    "OldestSerial",
     "PageReader",
     "PageRecord",
     "PagedSearch",
@@ -753,6 +754,74 @@ def acs_event_search(
         sleep=sleep,
         clock=clock,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class OldestSerial:
+    """The oldest event one bounded AcsEvent page carries (serial + its stamp)."""
+
+    serial_no: int
+    event_time: str | None = None
+
+
+def oldest_serial_in_window(
+    reader: PageReader,
+    *,
+    since: datetime,
+    until: datetime,
+    site_tz: str | tzinfo | None = DEFAULT_SITE_TZ,
+    device_offset_min: int | None = None,
+    major: int = 0,
+    limits: PagingLimits | None = None,
+    inter_page_delay: float = DEFAULT_INTER_PAGE_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> OldestSerial | None:
+    """ONE page of the existing AcsEvent search: the oldest event in the window.
+
+    This is the read-only ring-floor probe of card t_ed9c7e92. The device returns a
+    bounded window oldest-first by default (paging.py module doc: the backfill
+    default), so ``maxResults=1`` makes the first page *the floor*: one POST, no
+    cursor walk, no extra handshake. The window must start at or before the oldest
+    event still retained, or the answer is only "oldest since the window opened".
+
+    ``major`` is a server filter OBSERVED.md proves trusted on this firmware
+    (major=5 = punches; 3 = the 1/min noise sharing the ring). It is re-applied
+    client-side anyway, the same double-filter rule pipeline/agent_loop use: a
+    firmware that silently ignores a filter must not turn noise into the floor.
+    A page with no matching record returns None — the recorded NO MATCH shape is
+    "nothing retained in this window", never a protocol error.
+    """
+    window = window_for_device(since, until, site_tz=site_tz)
+    cond = build_event_cond(window, device_offset_min=device_offset_min, major=major)
+    search = acs_event_search(
+        reader,
+        limits=limits,
+        page_size=1,
+        max_pages=1,
+        inter_page_delay=inter_page_delay,
+        sleep=sleep,
+        clock=clock,
+    )
+    page = next(search.pages(cond), None)
+    if page is None:
+        return None
+    for record in page.records:
+        if major and str(record.get("major")) != str(major):
+            continue
+        serial = record.get("serialNo")
+        if isinstance(serial, bool):
+            continue
+        if isinstance(serial, int):
+            stamp = record.get("time")
+            return OldestSerial(serial_no=serial, event_time=None if stamp is None else str(stamp))
+        if isinstance(serial, str) and serial.strip().isdigit():
+            stamp = record.get("time")
+            return OldestSerial(
+                serial_no=int(serial.strip()),
+                event_time=None if stamp is None else str(stamp),
+            )
+    return None
 
 
 def user_info_search(

@@ -79,12 +79,14 @@ nothing (pinned by feeding it both markers). The §5 rollout gate needs this cou
 EVIDENCE that fallback ≈ 0, so its source must be the loop's verdict.
 
 **oldest_serial: MIN(events.serial_no)** — this is our keep-everything store's floor,
-NOT the device's oldest retained event: no oldest-retained probe exists, so real
-ring-rollover detection does not exist yet (card t_ed9c7e92). DESIGN.md:411 records
-the intended device-side probe: record oldest-serialNo per poll; a monotonic increase
-of the minimum means rolling started. P2-05's serial-floor arm reads this store value
-and names what it actually detects: stored history disappeared. No fabrication; the
-docstring says so and the test recomputes the SQL.
+NOT the device's oldest retained event. P2-05's store-floor arm reads this value and
+names what it actually detects: stored history disappeared. No fabrication; the
+docstring says so and the test recomputes the SQL. The separate device-side ring-floor
+probe shipped later (card t_ed9c7e92): `DeviceLoop.probe_ring_floor` asks for the
+oldest retained **punch** (`major=5`, one oldest-first AcsEvent page) and
+`AlertPolicy.check_stall` uses it at most hourly while the checkpoint is stale; a floor
+past the checkpoint is possible loss. This health metric deliberately stays the store
+value — the device read is alert-path evidence, not a per-collect gauge.
 
 **push_ok/push_failed are the drain log's own cumulative counters** — wired as
 `drain(..., log=collector.observe_push_log)`, parsed from the drain line itself so
