@@ -16,6 +16,9 @@ dependencies = [
 # orjson is an *optional* fast path only. The code must import and run without it
 # (fall back to stdlib json). Nothing may hard-import orjson.
 fast = ["orjson>=3.10"]
+# Excel import/template is optional too: the package and every other command must work
+# without openpyxl; `users import` / `users template` explain the extra when it is absent.
+excel = ["openpyxl>=3.1"]
 
 [project.scripts]
 gateclerk = "gateclerk.cli:app"
