@@ -309,11 +309,6 @@ Invoke with an argv array and `--body-file`: alert text is untrusted input and i
 shell-interpolated (§1). Exit 5 is never retried blindly because a lost response may
 already have delivered (§3).
 
-Citation note: #94 merged the alert sink and #93 the container install doc at commit
-`341aba0`; PR #92's later merge removed those paths from `main`. Open a
-`src/gateclerk/...` or `deploy/CONTAINER.md` reference with `git show 341aba0:<path>`
-until that revert is repaired.
-
 ### mnotify decisions
 
 Answers to micro-notify `docs/SERVICE-INTEGRATION.md` §10 at `afeab10`. Operator-owned
@@ -334,7 +329,7 @@ items stay placeholders; no real mailbox, token, host or tenant value is recorde
   park key, timestamp)`, logged next to mnotify's mail `requestId`. Resend only
   operator-manually after checking the mnotify audit JSONL `[OPERATOR-ONLY]`.
 - **Q6 image.** SAME IMAGE (contract §5 default): mnotify inside the gateclerk image at
-  `/opt/mnotify/bin`, no sidecar (matches the #93 container install doc at `341aba0:deploy/CONTAINER.md`).
+  `/opt/mnotify/bin`, no sidecar (matches the #93 container install doc at `deploy/CONTAINER.md`).
 - **Q7 secrets.** Operator provisions on the prod host: `/etc/mnotify/config.toml` mode
   0600; one file per account under `/run/secrets/mnotify` (root-owned 0444; read-only
   mount accepted). `MICRO_NOTIFY_CONFIG` / `MICRO_NOTIFY_SECRETS=file` /
@@ -349,11 +344,11 @@ items stay placeholders; no real mailbox, token, host or tenant value is recorde
   around the exec. Locking only the counter write is too late (micro-notify
   `docs/SERVICE-INTEGRATION.md` §6 at `afeab10`). Production satisfies this structurally:
   one agent per site plus one dedicated per-site mnotify volume/`state_dir`
-  (`341aba0:deploy/CONTAINER.md`), and #94's sink serialises in-process (single worker + lock,
+  (`deploy/CONTAINER.md`), and #94's sink serialises in-process (single worker + lock,
   `src/gateclerk/agent_mnotify.py:168-169`). Any future deployment that shares a
   `state_dir` must use the same `flock` around the exec.
 - **Q9 audit.** `/var/lib/mnotify/audit/sent.jsonl` on the per-site mnotify volume
-  (already in `341aba0:deploy/CONTAINER.md`); metadata-only, no bodies. The subject carries site
+  (already in `deploy/CONTAINER.md`); metadata-only, no bodies. The subject carries site
   + device serial and no PII, so verbatim recording is acceptable. Rotation/shipping =
   operator, alongside the volume backup `[OPERATOR-ONLY]`.
 - **Q10 daily cap.** `limits.daily_max` stays at the default 200 (expected volume is far
@@ -486,7 +481,7 @@ docker compose -f deploy/compose.yaml exec site-a gateclerk status \
 Source for the systemd start: `deploy/README.md:198-203`. `status` reads the store and
 cached health only; it never contacts the device or the ingest
 (`src/gateclerk/status_cli.py:10-26`). In the container, the healthcheck reports `healthy`
-only after a completed pass (`deploy/CONTAINER.md` in the sibling card; re-check).
+only after a completed pass (`deploy/CONTAINER.md`).
 
 **(c) [OPERATOR-ONLY] Give the old unit one final ok tick, then stop the Mac unit.** Each
 `agent run` tick polls, stores and then pushes at the end of the same cycle
