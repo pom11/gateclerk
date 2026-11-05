@@ -353,11 +353,10 @@ def read_oldest_serial(conn: sqlite3.Connection, device_serial: str) -> int | No
     This is OUR keep-everything store's minimum, not the device's oldest retained
     event: real ring rollover does not move it. A rise here means rows the agent
     already kept are gone (deleted or lost), so P2-05's ``check_stall`` names this
-    arm "stored history disappeared". Real ring-rollover detection does not exist
-    yet (card t_ed9c7e92); docs/internal/DESIGN.md:411 records the intended probe:
-    "the agent must record oldest-serialNo per poll (a monotonic increase of the
-    minimum = rolling started = punches are being lost)". The health surface keeps
-    its own metric line (agent_health renders `oldest_serial` from the same table,
+    arm "stored history disappeared". The device-side ring floor is a separate
+    read-only probe (``DeviceLoop.probe_ring_floor``, card t_ed9c7e92; DESIGN.md:411)
+    that asks for the oldest retained event of any major; the health surface keeps its
+    own store metric line (agent_health renders `oldest_serial` from the same table,
     NOTES-p2-06: "no fabrication").
     """
     row = conn.execute(

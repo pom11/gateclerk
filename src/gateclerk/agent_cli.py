@@ -62,7 +62,8 @@ import random
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +117,16 @@ HEALTH_DIR_NAME = "health"
 HEALTH_FILE_NAME = "agent.json"
 #: systemd exposes `LoadCredential=<name>:<path>` as this env var pointing at a dir of files.
 CREDENTIALS_DIRECTORY_ENV = "CREDENTIALS_DIRECTORY"
+
+#: Minimum wall-clock gap since the last known successful poll before the ring-floor
+#: probe is worth ONE request (card t_ed9c7e92). The observed ring is ~10k events with
+#: the site's 1/min major=3 noise, i.e. ~1,440 events/day and ~7 days of retention
+#: (OBSERVED.md: 10,199 events, earliest serial 27). A gap shorter than a day therefore
+#: leaves >6 days before any event after the checkpoint can be evicted, so the answer
+#: cannot show loss: spending the POST would only cost nonce budget. A normal 5-minute
+#: poll and a short restart never probe; a quiet week of SUCCESSFUL polls never probes
+#: either, because the gap is the time since the last success, not since the last punch.
+RING_PROBE_MIN_GAP_S = 24 * 60 * 60
 
 
 def _now() -> datetime:
@@ -597,6 +608,12 @@ class SiteAgent:
             raise ConfigError(f"push_target {self.push_target!r} has an unacceptable scheme")
         #: device key (serial, or `pending` before bootstrap) -> that loop's last TickResult.
         self._last_tick: dict[str, Any] = {}
+        #: Device serial -> wall-clock instant of the last SUCCESSFUL poll. Seeded from
+        #: the health snapshot this agent already writes, so a restart remembers its
+        #: last-known-good without a schema change (card t_ed9c7e92). The ring-floor
+        #: probe's gate is the time since this instant, never the checkpoint's age:
+        #: that is what distinguishes an outage from a quiet door.
+        self._last_ok_at: dict[str, datetime] = self._last_ok_from_health()
         self._cycle_started = time.monotonic()
 
     # --- one pass -------------------------------------------------------------------------
@@ -636,7 +653,30 @@ class SiteAgent:
             if isinstance(recoveries, int):
                 self.policy.observe_recoveries(recoveries)
             if loop.device_serial:
-                stall = self.policy.check_stall(loop.device_serial)
+                # The ring-floor probe is a READ on the same device: spend it ONLY at
+                # the first ok tick after a gap long enough for the ~7-day ring to have
+                # evicted events after the checkpoint. A skipped tick (circuit
+                # open/park) presents ZERO requests; a failed walk already has the
+                # failed-poll arm and offers no probe. The checkpoint passed for the
+                # comparison is the PRE-tick one (the walk just advanced it).
+                gap_s = self._last_ok_gap(loop.device_serial, moment) if result.ok else None
+                ring_probe = None
+                if (
+                    gap_s is not None
+                    and gap_s >= RING_PROBE_MIN_GAP_S
+                    and result.checkpoint_serial_before is not None
+                    and result.checkpoint_time_before
+                ):
+                    checkpoint_time = result.checkpoint_time_before
+                    ring_probe = partial(loop.probe_ring_floor, checkpoint_time)
+                stall = self.policy.check_stall(
+                    loop.device_serial,
+                    ring_probe=ring_probe,
+                    checkpoint_serial_before=result.checkpoint_serial_before,
+                    gap_s=gap_s,
+                )
+                if result.ok:
+                    self._last_ok_at[loop.device_serial] = moment
                 if stall is not None:
                     report.alerts.append(stall)
             # Task 15's hourly roster step, pulled per cycle: a no-op (None) until the
@@ -942,6 +982,47 @@ class SiteAgent:
         except OSError:  # pragma: no cover - a missing file is the fresh-install case
             return []
         return self.policy.observe_watermark(check)
+
+    def _last_ok_gap(self, device_serial: str, now: datetime) -> float | None:
+        """Seconds since the last known successful poll, or None when never known."""
+        last = self._last_ok_at.get(device_serial)
+        if last is None:
+            return None
+        return max(0.0, (now - last).total_seconds())
+
+    def _last_ok_from_health(self) -> dict[str, datetime]:
+        """Seed last-known-good across restarts from the snapshot the agent writes.
+
+        The snapshot carries `last_poll_ok_age_s` (process monotonic) and is replaced
+        atomically after every pass, so its FILE MTIME is the instant the last pass
+        finished: mtime minus that age is the wall-clock instant of the last successful
+        poll, even when the last pass failed. No new column, no second state file, and
+        a missing/corrupt snapshot simply means "unknown" — which spends no request.
+        """
+        if self.health_path is None:
+            return {}
+        try:
+            payload = json.loads(self.health_path.read_text(encoding="utf-8"))
+            written = datetime.fromtimestamp(self.health_path.stat().st_mtime, tz=UTC)
+        except (OSError, ValueError, TypeError):
+            return {}
+        devices = payload.get("devices") if isinstance(payload, dict) else None
+        if not isinstance(devices, list):
+            return {}
+        seeded: dict[str, datetime] = {}
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+            serial = device.get("device_serial")
+            age = device.get("last_poll_ok_age_s")
+            if (
+                isinstance(serial, str)
+                and isinstance(age, (int, float))
+                and not isinstance(age, bool)
+                and age >= 0
+            ):
+                seeded[serial] = written - timedelta(seconds=float(age))
+        return seeded
 
     def _write_health(self) -> None:
         """Export the §2e snapshot for a separate reader process (P2-06's sidecar contract).

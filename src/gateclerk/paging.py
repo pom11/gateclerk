@@ -108,6 +108,7 @@ __all__ = [
     "STATUS_MORE",
     "ChunkResult",
     "CountGetter",
+    "OldestSerial",
     "PageReader",
     "PageRecord",
     "PagedSearch",
@@ -753,6 +754,72 @@ def acs_event_search(
         sleep=sleep,
         clock=clock,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class OldestSerial:
+    """The oldest event one bounded AcsEvent page carries (serial + its stamp)."""
+
+    serial_no: int
+    event_time: str | None = None
+
+
+def oldest_serial_in_window(
+    reader: PageReader,
+    *,
+    since: datetime,
+    until: datetime,
+    site_tz: str | tzinfo | None = DEFAULT_SITE_TZ,
+    device_offset_min: int | None = None,
+    major: int = 0,
+    limits: PagingLimits | None = None,
+    inter_page_delay: float = DEFAULT_INTER_PAGE_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> OldestSerial | None:
+    """ONE page of the existing AcsEvent search: the oldest event in the window.
+
+    This is the read-only ring-floor probe of card t_ed9c7e92. The device returns a
+    bounded window oldest-first by default (paging.py module doc: the backfill
+    default), so ``maxResults=1`` makes the first page *the floor*: one POST, no
+    cursor walk, no extra handshake. The caller passes the window that starts at the
+    pre-advance checkpoint time, so the answer covers exactly the unread interval.
+
+    ``major=0`` is the all-events floor: serialNo is device-wide, so the oldest
+    retained event of ANY major above ``checkpoint+1`` proves events after our
+    checkpoint were evicted unread (punches may be lost). The caller decides whether
+    that comparison is meaningful; this function only reports the floor.
+    """
+    window = window_for_device(since, until, site_tz=site_tz)
+    cond = build_event_cond(window, device_offset_min=device_offset_min, major=major)
+    search = acs_event_search(
+        reader,
+        limits=limits,
+        page_size=1,
+        max_pages=1,
+        inter_page_delay=inter_page_delay,
+        sleep=sleep,
+        clock=clock,
+    )
+    page = next(search.pages(cond), None)
+    if page is None:
+        return None
+    for record in page.records:
+        if major and str(record.get("major")) != str(major):
+            continue
+        serial = record.get("serialNo")
+        if isinstance(serial, bool):
+            continue
+        if isinstance(serial, int):
+            stamp = record.get("time")
+            return OldestSerial(serial_no=serial, event_time=None if stamp is None else str(stamp))
+        if isinstance(serial, str) and serial.strip().isdigit():
+            stamp = record.get("time")
+            return OldestSerial(
+                serial_no=int(serial.strip()),
+                event_time=None if stamp is None else str(stamp),
+            )
+    return None
 
 
 def user_info_search(

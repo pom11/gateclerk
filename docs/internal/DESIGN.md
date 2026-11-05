@@ -408,15 +408,34 @@ nonce, serial or employee name (fixtures mask them — see tests/fixtures/README
   BC). Owner decision, per site, with a door-side test pass. Not blocking P1.
 3. **Site identity** — `site` is agent config today (`site-a`...). Once a punch joins to
   a BC location code we need the canonical mapping. Same owner question as (1).
-4. **Retention / gaps** — partially answered by probe: oldest retained event is
-   serial 27 @ 2026-05-21 (device started counting ~then; no rolling observed in ~5
-   months of history). BUT site-a's noise stream runs 1/min ≈ 1,440 events/day, so
-   whatever the real ring capacity is, noise will dominate it. **Operational
-   consequence:** the agent must record oldest-serialNo per poll (a monotonic increase
-   of the minimum = rolling started = punches are being lost) and the owner should kill
-   the noise source at its client (looks like a Hik-Connect/remote poll — device-side
-   config is off-limits to us, but the *polling* client is theirs to stop). Poll
-   interval must be minutes, not days.
+4. **Retention / gaps** — answered by probe: oldest retained event is serial 27 @
+   2026-05-21 (device started counting ~then; no rolling observed in ~5 months of
+   history). BUT site-a's noise stream runs 1/min ≈ 1,440 events/day, so whatever the
+   real ring capacity is, noise will dominate it. **Operational consequence:** the
+   owner should kill the noise source at its client (looks like a Hik-Connect/remote
+   poll — device-side config is off-limits to us, but the *polling* client is theirs
+   to stop). Poll interval must be minutes, not days.
+
+   **Device ring-floor signal (DECIDED 2026-11-05, card t_ed9c7e92).** Loss is
+   detected at the FIRST ok tick after process start or a failed-poll streak, and
+   ONLY when the time since the last known successful poll is long enough to matter
+   (24 h: the observed ring is ~10,199 events and the 1/min noise adds ~1,440/day,
+   so retention is ~7 days and a shorter gap cannot have evicted anything after the
+   checkpoint). The agent spends ONE read-only AcsEvent page in the *unread* window
+   `[the pre-advance checkpoint time, now]`, oldest-first, `maxResults=1`, with NO
+   major filter. serialNo is device-wide, so the signal is the oldest retained event
+   of ANY major compared with the checkpoint as it stood BEFORE this tick advanced:
+   a floor above `checkpoint+1` means events in that serial range were evicted before
+   the agent read them, and punches in the range may be lost — possible loss, not
+   proof a punch existed there. A punch-only floor was rejected: the evicted rows
+   may be noise, whose serials still prove the ring wrapped past our checkpoint.
+   A door polled normally is never probed (the same floor rise is harmless when
+   every poll read everything), and a quiet week of successful polls spends zero
+   extra requests. The last-known-good instant for a fresh process comes from the
+   mtime of the health snapshot the agent already writes minus its
+   `last_poll_ok_age_s`, so no schema change is needed. A parked/skipped or failing
+   device is never probed; failures in the probe itself are swallowed, and the page
+   is once per incident with the serial range and gap length.
 5. **Multi-reader ambiguity** — one device per door means one direction signal per door.
   If a site ends up with a reader on each side of the same door, `direction` may need to
   come from the reader/door number rather than `attendanceStatus`. Worth confirming now.

@@ -17,8 +17,14 @@ BINDING SPEC: docs/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
   punches. The page fires only when that stale checkpoint coincides with
   ``STALL_STRIKES`` consecutive non-auth failed polls. A separate arm pages when
   our store's oldest serialNo rises — that means stored history disappeared, not
-  that the device ring is rolling. Real ring-rollover detection does not exist
-  yet (card t_ed9c7e92); docs/internal/DESIGN.md:411 records the intended probe.
+  that the device ring is rolling. The device-side ring-floor arm (card
+  t_ed9c7e92) is spent ONCE at the first ok tick after a long gap in successful
+  polls: it asks the device for its oldest retained event of ANY major and compares
+  that with the checkpoint as it stood BEFORE the tick advanced. A floor past
+  ``checkpoint+1`` means events in that serial range were evicted unread, so punches
+  may be lost. A door polled normally is never probed (the same rise is harmless
+  when every poll read everything); a quiet week costs zero extra requests. See
+  ``check_stall`` and docs/internal/DESIGN.md:411.
 
 The invariant that outranks everything else here — the lockout-safety one the card
 pins hardest — is that an UNACKED parked device is touched NEVER again: not at the
@@ -75,8 +81,9 @@ KIND_AUTH_TERMINAL = "auth_terminal"
 KIND_DEVICE_LOCKED = "device_locked"
 #: device clock past ``tz.SKEW_WARN_SECONDS`` (DESIGN.md "Time handling": log, never fix).
 KIND_CLOCK_SKEW = "clock_skew"
-#: checkpoint stale AND a failed-poll streak, or stored history disappeared.
-#: Never mere silence; the serial-floor arm is not ring-rollover detection.
+#: checkpoint stale AND a failed-poll streak, stored history disappeared, or the
+#: device ring floor passed the PRE-advance checkpoint after a long gap.
+#: Never mere silence; the store-floor arm is not ring-rollover detection.
 KIND_CHECKPOINT_STALL = "checkpoint_stall"
 #: db past the §2b keep-everything watermark.
 KIND_DB_WATERMARK = "db_watermark"
@@ -530,25 +537,40 @@ class AlertPolicy:
 
     # --- the critical channel: checkpoint stall (DESIGN.md OQ4) ----------------------------
 
-    def check_stall(self, device_serial: str) -> Alert | None:
+    def check_stall(
+        self,
+        device_serial: str,
+        *,
+        ring_probe: Callable[[], int | None] | None = None,
+        checkpoint_serial_before: int | None = None,
+        gap_s: float | None = None,
+    ) -> Alert | None:
         """Checkpoint age becomes a stall ONLY with evidence of loss, never silence.
 
         The health/alert field stays, but its meaning changed with STALL-ALERT-FALSE:
         a stall is EVIDENCE OF LOSS, not "the checkpoint has not moved". A checkpoint
         that stops moving while polls SUCCEED and the device returns nothing newer is
-        a quiet door (night/lunch) — the checkpoint only moves on major=5 punches, so
-        age alone is silence and must not page. Two shapes are evidence:
+        a quiet door (night/lunch) — age alone is silence and must not page. Three
+        shapes are evidence:
 
         * a stale checkpoint AND ``STALL_STRIKES`` consecutive non-auth failed polls
           (an ok poll resets the streak; auth failures and circuit-open skips neither
           count nor reset);
         * our store's oldest serialNo rose since the previous check — stored history
-          disappeared. This reads MIN(serial_no) from the keep-everything store, not
-          the device's retained floor: it is NOT ring-rollover detection, which does
-          not exist yet (card t_ed9c7e92). docs/internal/DESIGN.md:411 records the
-          intended device-side probe: "the agent must record oldest-serialNo per
-          poll (a monotonic increase of the minimum = rolling started = punches are
-          being lost)".
+          disappeared. This reads MIN(serial_no) from the keep-everything store, so
+          it is NOT device ring-rollover detection;
+        * the DEVICE's oldest retained event of ANY major is past the checkpoint that
+          stood BEFORE this tick walked (card t_ed9c7e92). The caller injects
+          ``ring_probe`` — a zero-arg, read-only call returning that floor
+          (``DeviceLoop.probe_ring_floor``) — exactly once, at the first ok tick after
+          process start or a long failed-poll streak. serialNo is device-wide, so a
+          floor above ``checkpoint_before + 1`` proves events after that checkpoint
+          were evicted unread: punches may be lost. The all-major floor is the signal
+          (noise shares the ring); a punch-only floor would miss the wrap. This arm
+          must NOT run while polls succeed (the same floor rise is harmless when every
+          poll read everything) and is never offered for a parked/skipped or failed
+          tick. ``gap_s`` is the time since the last known successful poll and only
+          shapes the evidence text.
 
         One page per incident: the frozen ``updated_at`` plus the evidence shape is
         the episode key; a further rise of the floor is a new incident. Silence for
@@ -564,8 +586,9 @@ class AlertPolicy:
             return None
         updated = _parse_iso(checkpoint.updated_at)
         threshold = timedelta(seconds=self.stall_strikes * self.cadence_s)
-        age = (self.now() - updated).total_seconds()
-        stale = self.now() - updated > threshold
+        now = self.now()
+        age = (now - updated).total_seconds()
+        stale = now - updated > threshold
 
         oldest = read_oldest_serial(self.conn, device_serial)
         previous_oldest = self._oldest_serial_seen.get(device_serial)
@@ -576,24 +599,62 @@ class AlertPolicy:
 
         streak = self._failed_streak.get(device_serial, 0)
         failing = streak >= self.stall_strikes
-        if not (stale and failing) and not floor_moved:
+
+        # Device ring floor: the caller offers the probe only at the first ok tick
+        # after a real gap, so this spends no request on a quiet door. The comparison
+        # is with the PRE-advance checkpoint: the walk has already read everything
+        # newer, and comparing with its post-tick value would make the arm dead.
+        device_floor: int | None = None
+        if ring_probe is not None and checkpoint_serial_before is not None and not failing:
+            try:
+                device_floor = ring_probe()
+            except Exception:
+                device_floor = None  # evidence is optional; the alert path never raises
+
+        floor_evicted = (
+            device_floor is not None
+            and checkpoint_serial_before is not None
+            and device_floor > checkpoint_serial_before + 1
+        )
+
+        if not (stale and failing) and not floor_moved and not floor_evicted:
             if not stale:
                 # The checkpoint moved (or healed): close the episode so a LATER
                 # stall is a new incident and pages fresh.
                 self._stall_open_at.pop(device_serial, None)
             return None
 
-        evidence = f"floor:{previous_oldest}->{oldest}" if floor_moved else "failing-poll"
+        if floor_evicted:
+            evidence = f"device-floor:{checkpoint_serial_before}->{device_floor}"
+        elif floor_moved:
+            evidence = f"floor:{previous_oldest}->{oldest}"
+        else:
+            evidence = "failing-poll"
         episode = f"{checkpoint.updated_at}|{evidence}"
         if self._stall_open_at.get(device_serial) == episode:
             return None  # already paged for exactly this incident
         self._stall_open_at[device_serial] = episode
-        if floor_moved:
+        if floor_evicted:
+            if gap_s is None:
+                gap_text = "an unrecorded gap"
+            elif gap_s >= 86400:
+                gap_text = f"{gap_s / 86400:.1f} days"
+            else:
+                gap_text = f"{gap_s / 3600:.1f} hours"
+            note = (
+                f"device ring floor: oldest retained event serialNo {device_floor} is "
+                f"past the pre-poll checkpoint {checkpoint_serial_before}; serials "
+                f"{checkpoint_serial_before + 1}..{device_floor - 1} were evicted "
+                f"before this agent read them after {gap_text} without a successful "
+                "poll — punches in that range may be lost (possible loss; the device "
+                "cannot prove a punch existed there). One AcsEvent oldest-first read, "
+                "all majors, compared before the checkpoint advanced"
+            )
+        elif floor_moved:
             note = (
                 f"oldest stored serialNo rose {previous_oldest} -> {oldest} — stored "
-                "history disappeared. This arm reads our keep-everything store, not "
-                "the device ring, so it is not ring-rollover detection; real "
-                "ring-rollover detection is card t_ed9c7e92 (DESIGN.md:411)"
+                "history disappeared. This arm reads our keep-everything store, so it "
+                "is not ring-rollover detection; the device-floor arm is (DESIGN.md:411)"
             )
         else:
             note = (
