@@ -27,6 +27,7 @@ tests/test_repo_hygiene.py.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,8 +37,7 @@ import pytest
 
 import gateclerk.agent_db as agent_db
 import gateclerk.agent_push as agent_push
-import gateclerk.agent_store as agent_store
-from gateclerk.model import EventRecord, from_jsonl
+from gateclerk.model import RECORD_JSON_KEYS, EventRecord, event_keys, from_jsonl, to_jsonl
 from gateclerk.sinks import IMPLICIT_SINK_NAME
 
 SITE = "site-a"
@@ -132,14 +132,64 @@ def build_pre_upgrade_db(path: Path, *, monkeypatch: pytest.MonkeyPatch) -> sqli
 
 
 def _store(conn: sqlite3.Connection, serial_nos: tuple[int, ...]) -> list[int]:
-    """Store realistic events through the REAL store code; return the event rowids.
+    """Store realistic events AT THE v4 SCHEMA; return the event rowids.
 
-    The payload bytes these put in `events.jsonl` are `to_jsonl()` verbatim, which is what
-    makes "the migration kept the punch" a real assertion rather than a string comparison.
+    The payload bytes these put in `events.jsonl` are `to_jsonl()` verbatim, which is
+    what makes "the migration kept the punch" a real assertion rather than a string
+    comparison. The writer is hand-rolled on purpose: this db is the pre-upgrade file,
+    and the CURRENT `agent_store.store_events` writes the v7 `serial_epoch` column that
+    a deployed v4 file does not have yet (card t_fbd85a10). Using it here made the
+    fixture a partially-upgraded db and the migration test vacuous.
     """
     records = [make_record(n, employee_no=str(n)) for n in serial_nos]
-    result = agent_store.store_events(conn, records, now=T0)
-    return [result.rowids[r.serial_no] for r in records]
+    stamp = iso(T0)
+    columns = (
+        "id",
+        "revision",
+        "jsonl",
+        "stored_at",
+        "updated_at",
+        "key_algorithm",
+        "idempotency_hash",
+        "idempotency_json",
+        "fingerprint_hash",
+        "fingerprint_json",
+        *RECORD_JSON_KEYS,
+    )
+    rowids: list[int] = []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for record in records:
+            keys = event_keys(record)
+            payload = record.to_dict()
+            values: list[Any] = [
+                None,
+                1,
+                to_jsonl([record])[:-1],
+                stamp,
+                stamp,
+                keys["algorithm"],
+                keys["idempotency_hash"],
+                keys["idempotency_json"],
+                keys["fingerprint_hash"],
+                keys["fingerprint_json"],
+            ]
+            for column in RECORD_JSON_KEYS:
+                value = payload[column]
+                if column == "raw":
+                    value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                values.append(value)
+            placeholders = ", ".join("?" for _ in values)
+            conn.execute(
+                f"INSERT INTO events ({', '.join(columns)}) VALUES ({placeholders})",  # noqa: S608
+                values,
+            )
+            rowids.append(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return rowids
 
 
 def seed_backlog(conn: sqlite3.Connection, *, serial_nos: tuple[int, ...]) -> list[int]:
@@ -225,11 +275,11 @@ def upgraded(tmp_path, monkeypatch) -> tuple[sqlite3.Connection, Path]:
 
 def test_the_shipped_history_now_ends_at_the_two_per_sink_steps() -> None:
     """A versioned migration means APPENDED entries, never an edited v3: an agent at v4
-    must reach v6 through the same code path that took it from v2 to v4."""
+    must reach v7 through the same code path that took it from v2 to v4."""
     names = [m.name for m in agent_db.MIGRATIONS]
-    assert [m.version for m in agent_db.MIGRATIONS] == [1, 2, 3, 4, 5, 6]
+    assert [m.version for m in agent_db.MIGRATIONS] == [1, 2, 3, 4, 5, 6, 7]
     assert names[4] == "push_queue_per_sink" and names[5] == "dead_letter_per_sink"
-    for m in agent_db.MIGRATIONS[4:]:
+    for m in agent_db.MIGRATIONS[4:6]:
         assert "DROP TABLE" in m.sql.upper(), (
             f"migration {m.version} rebuilds a table: a UNIQUE constraint cannot be "
             "altered in sqlite, so this step must swap the table — see its own comment"
@@ -242,13 +292,13 @@ def test_upgrade_bumps_the_recorded_version_and_leaves_the_old_history(
 ) -> None:
     conn, _ = upgraded
     rows = list(conn.execute("SELECT version, name FROM schema_migrations ORDER BY version"))
-    assert [r["version"] for r in rows] == [1, 2, 3, 4, 5, 6]
+    assert [r["version"] for r in rows] == [1, 2, 3, 4, 5, 6, 7]
     # The pre-upgrade entries keep their names: the history is a record, not a sketch.
     assert rows[2]["name"] == "push_queue" and rows[3]["name"] == "dead_letter"
 
 
 def test_upgrade_is_idempotent_on_a_second_open(tmp_path, monkeypatch) -> None:
-    """`connect` runs on every agent start: opening an already-v6 db must be a no-op, not
+    """`connect` runs on every agent start: opening an already-v7 db must be a no-op, not
     a second rebuild that rewrites (or re-hashes) the backlog."""
     path = tmp_path / "agent.sqlite3"
     conn = build_pre_upgrade_db(path, monkeypatch=monkeypatch)
@@ -268,7 +318,7 @@ def test_upgrade_is_idempotent_on_a_second_open(tmp_path, monkeypatch) -> None:
         assert [tuple(row[c] for c in shared) for row in after] == [
             tuple(row[c] for c in shared) for row in before
         ], "the second open rewrote nothing"
-        assert agent_db.current_version(second) == 6
+        assert agent_db.current_version(second) == 7
     finally:
         second.close()
 

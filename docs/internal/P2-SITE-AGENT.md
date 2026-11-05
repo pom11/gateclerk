@@ -134,6 +134,34 @@ Two different failure channels — keep them separate:
   - checkpoint stall / oldest-seen serialNo rising → **critical**: the ring has
     started rolling and punches are being lost (DESIGN.md open question 4).
 
+#### Alert routing: journald or mnotify (one route)
+
+The default sink stays one stderr line (journald on the unit). A site may declare ONE
+alert route in the same typed-sink vocabulary the push sinks use:
+
+```toml
+[[site.sink]]
+name = "alerts"
+type = "mnotify"          # NOT an event sink: `SiteConfig.event_sinks` excludes it
+to = "alerts@example.com"
+# timeout_s = 300         # optional; the micro-notify mail budget's hard exec timeout
+```
+
+`mnotify` wins when configured: alerts go to micro-notify mail, and gateclerk execs the
+CLI with an argv array and the body in a file (micro-notify's
+`docs/SERVICE-INTEGRATION.md`: branch on exit code, no blind retry, secrets stay in
+mnotify's own backend). Exactly one route is sane — two would page twice for one
+incident and leave no single authoritative destination; a second `mnotify` block is a
+config error. The fallback law is absolute: the sink writes the same stderr line it
+would have written without mnotify IMMEDIATELY, on the alert path's own thread, then
+hands the page to one daemon worker over a small bounded queue. A missing binary,
+timeout, non-zero exit or any unexpected runner failure only adds a warning saying
+delivery failed — the line is never written twice — and nothing blocks or raises into
+the polling loop. If the queue is full the page is dropped with a warning (the local
+line is already written). On agent exit, including `--once`, the sink waits a bounded
+time for an accepted page and warns if one is still in flight. Journald remains the
+evidence of record; mnotify is the page, never a replacement for the local line.
+
 ### (d) How the three site configs differ (1 codebase + 3 configs)
 
 A site block adds exactly what DESIGN.md "Credential plumbing" already defines:

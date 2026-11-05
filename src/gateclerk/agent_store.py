@@ -1,18 +1,22 @@
-"""The P2 site agent's event store: (device_serial, serial_no) UPSERT + completed-only checkpoint.
+"""The P2 site agent's event store: (device_serial, serial_epoch, serial_no) UPSERT +
+completed-only checkpoint.
 
 Card P2-02 (docs/P2-SITE-AGENT.md §1 seams 1-3 + §2b, SIGNED OFF 2026-10-19; device
 truth docs/OBSERVED.md). Semantics are pinned by the spec and the box — this module
 implements them, it does not invent them:
 
-UPSERT (seam 1). `events` is UNIQUE(device_serial, serial_no) and every write is
-`INSERT .. ON CONFLICT DO UPDATE SET .. WHERE events.jsonl IS NOT excluded.jsonl`.
-That `WHERE` is the whole "re-polling an overlap window is free" guarantee (DESIGN.md
-"Idempotency key"; the mechanism a mid-page crash heals by): a re-stored identical line
-conflicts, the guard is false, and SQLite does *no* write at all — verified zero
-statement cost (total_changes delta 0) and row identity (same rowid, same revision,
-same stamps) in tests. Without the guard the UPSERT would rewrite identical bytes every
-5-min tick: same visible row, a real write, and `updated_at` churning forever — a
-store that lies about which records were ever corrected.
+UPSERT (seam 1). `events` is UNIQUE(device_serial, serial_epoch, serial_no) and every
+write is `INSERT .. ON CONFLICT DO UPDATE SET .. WHERE events.jsonl IS NOT excluded.jsonl`.
+`serial_epoch` is 0 for every pre-reset row; card t_fbd85a10 adds the next epoch only
+when the loop has confirmed a device serialNo reset, so the new generation's reused
+serials cannot overwrite the old rows. That `WHERE` is the whole "re-polling an
+overlap window is free" guarantee (DESIGN.md "Idempotency key"; the mechanism a
+mid-page crash heals by): a re-stored identical line conflicts, the guard is false,
+and SQLite does *no* write at all — verified zero statement cost (total_changes delta
+0) and row identity (same rowid, same revision, same stamps) in tests. Without the
+guard the UPSERT would rewrite identical bytes every 5-min tick: same visible row, a
+real write, and `updated_at` churning forever — a store that lies about which records
+were ever corrected.
 
 What is stored (seam 6 / spec §2b): the `model.EventRecord.to_jsonl()` line
 byte-verbatim (the frozen 27-key contract IS the push payload — what we store is what
@@ -63,6 +67,7 @@ __all__ = [
     "CheckpointAdvanced",
     "CheckpointNotCompletedError",
     "CheckpointRegressionError",
+    "CheckpointReset",
     "MixedDeviceError",
     "StoreError",
     "StoreResult",
@@ -75,6 +80,7 @@ __all__ = [
     "event_rowid",
     "read_checkpoint",
     "read_oldest_serial",
+    "reset_checkpoint",
     "store_events",
 ]
 
@@ -123,6 +129,25 @@ class Checkpoint:
     checkpoint_serial: int
     checkpoint_time: str | None
     updated_at: str
+    #: Which serial generation the checkpoint names. 0 on every pre-reset row; a
+    #: confirmed serial reset opens the next epoch so a reused serialNo cannot
+    #: collide with (or overwrite) a row from the previous generation.
+    serial_epoch: int = 0
+    #: The firmware version the checkpoint was written under, when known. The loop
+    #: compares it with a fresh deviceInfo read before accepting a lower newest
+    #: serial as reset evidence (agent_loop._reset_evidence).
+    firmware: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointReset:
+    """The outcome of one confirmed serial reset (`reset_checkpoint`)."""
+
+    device_serial: str
+    old_serial: int
+    new_serial: int
+    old_epoch: int
+    new_epoch: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +201,7 @@ _HEAD_COLUMNS: tuple[str, ...] = (
     "idempotency_json",
     "fingerprint_hash",
     "fingerprint_json",
+    "serial_epoch",
 )
 _UPSERT_COLUMNS: tuple[str, ...] = (*_HEAD_COLUMNS, *_CONTRACT_COLUMNS)
 
@@ -187,6 +213,7 @@ INSERT INTO events (
     id, revision,
     jsonl, stored_at, updated_at,
     key_algorithm, idempotency_hash, idempotency_json, fingerprint_hash, fingerprint_json,
+    serial_epoch,
     site, device_serial, serial_no, employee_no, name,
     event_time_utc, event_time_local, tz_offset_min, tz_offset_min_device, tz_source,
     iana_tz, tz_unresolved, tz_ambiguous, tz_nonexistent, tz_reason, tz_offset_mismatch,
@@ -196,11 +223,12 @@ INSERT INTO events (
     NULL, 1,
     ?, ?, ?,
     ?, ?, ?, ?, ?,
+    ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?
 )
-ON CONFLICT(device_serial, serial_no) DO UPDATE
+ON CONFLICT(device_serial, serial_epoch, serial_no) DO UPDATE
 SET jsonl = excluded.jsonl,
     revision = events.revision + 1,
     updated_at = excluded.updated_at
@@ -214,12 +242,14 @@ RETURNING id, revision
 # device dict as JSON text.
 
 
-def _row_values(record: EventRecord, line: str, stamp: str) -> list[Any]:
+def _row_values(record: EventRecord, line: str, stamp: str, serial_epoch: int = 0) -> list[Any]:
     """One UPSERT parameter tuple: jsonl verbatim + digests + flattened contract.
 
     `to_dict()` is the model's own flat view (datetimes already ISO, enums already
     str) — the same dict `to_jsonl` serialises, so the columns and the stored line
     cannot disagree. `raw` has no sqlite scalar form: it goes in as JSON text.
+    `serial_epoch` is store bookkeeping, not contract: it never appears in the
+    payload, it only lets two generations share a serialNo in one table.
     """
     keys = event_keys(record)
     payload = record.to_dict()
@@ -232,6 +262,7 @@ def _row_values(record: EventRecord, line: str, stamp: str) -> list[Any]:
         keys["idempotency_json"],
         keys["fingerprint_hash"],
         keys["fingerprint_json"],
+        serial_epoch,
     ]
     for column in _CONTRACT_COLUMNS:
         value = payload[column]
@@ -247,6 +278,7 @@ def store_events(
     records: Sequence[EventRecord],
     *,
     now: datetime | None = None,
+    serial_epoch: int = 0,
 ) -> StoreResult:
     """UPSERT a batch (one poll window / one chunk's records). Returns per-outcome counts.
 
@@ -254,10 +286,20 @@ def store_events(
     half-stored — the overlap poll is the healer, and it needs a clean key space).
     A batch that repeats a key is legal (overlap page + new page in one call): the
     guard makes the repeat free and the last line for the key wins.
+
+    `serial_epoch` is the current generation of the device's serialNo. Before the
+    UPSERT, a record whose fingerprint `(employee_no, event_time_local, minor)` is
+    already stored for this device is skipped as the same punch: that is the
+    secondary guard DESIGN.md defines for a serial reset, and it is what stops a
+    pre-reset punch re-read after the reset from being pushed twice under the new
+    epoch. Only a record with no matching fingerprint gets a row in this epoch, so
+    two different punches may share a serialNo across epochs without merging.
     """
     batch = list(records)
     if not batch:
         return StoreResult(inserted=0, refreshed=0, unchanged=0)
+    if serial_epoch < 0:
+        raise ValueError(f"serial_epoch {serial_epoch} cannot be negative")
 
     serials = {r.device_serial for r in batch}
     if len(serials) > 1:
@@ -277,13 +319,31 @@ def store_events(
             if record.serial_no is None:
                 raise UnusableRecordError(
                     f"record for device {device_serial!r} has serial_no=None: the store's "
-                    "key is UNIQUE(device_serial, serial_no) and SQLite never dedupes "
-                    "NULLs, so storing it would duplicate the row on every overlap poll "
-                    "(and digest-deduping it would merge two different events). Route it "
+                    "key is UNIQUE(device_serial, serial_epoch, serial_no) and SQLite never "
+                    "dedupes NULLs, so storing it would duplicate the row on every overlap "
+                    "poll (and digest-deduping it would merge two different events). Route it "
                     "to the dead-letter/alert path instead (P2-04/P2-05)."
                 )
+            exact = conn.execute(
+                "SELECT 1 FROM events WHERE device_serial = ? AND serial_epoch = ?"
+                " AND serial_no = ?",
+                (device_serial, serial_epoch, record.serial_no),
+            ).fetchone()
+            if exact is None:
+                already = conn.execute(
+                    "SELECT 1 FROM events WHERE device_serial = ? AND serial_epoch <> ?"
+                    " AND fingerprint_hash = ? LIMIT 1",
+                    (device_serial, serial_epoch, record.fingerprint_hash),
+                ).fetchone()
+                if already is not None:
+                    # Same employee + device-local time + minor: the same punch, already
+                    # kept under an older epoch. Never a second push across a reset.
+                    unchanged += 1
+                    continue
             line = to_jsonl([record])[:-1]  # the to_jsonl line without its newline
-            returned = conn.execute(_UPSERT, _row_values(record, line, stamp)).fetchone()
+            returned = conn.execute(
+                _UPSERT, _row_values(record, line, stamp, serial_epoch)
+            ).fetchone()
             if returned is None:
                 # The guard said "identical bytes already in the row": the row exists
                 # (the conflict happened), so this lookup cannot miss — if it ever
@@ -334,15 +394,21 @@ def event_jsonl(conn: sqlite3.Connection, rowid: int) -> str | None:
 # --- the checkpoint -----------------------------------------------------------------------
 
 _CK_INSERT = """
-INSERT INTO checkpoint (device_serial, checkpoint_serial, checkpoint_time, updated_at)
-VALUES (?, ?, ?, ?)
+INSERT INTO checkpoint (
+    device_serial, checkpoint_serial, checkpoint_time, serial_epoch, firmware, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_serial) DO UPDATE
 SET checkpoint_serial = excluded.checkpoint_serial,
     -- A later advance that cannot name the time must not blank the known one: the
     -- next tick's window lower bound (checkpoint_time - overlap) reads this column.
     checkpoint_time = COALESCE(excluded.checkpoint_time, checkpoint.checkpoint_time),
+    -- The firmware the checkpoint was written under is reset evidence; an advance
+    -- that cannot name it keeps the known one.
+    firmware = COALESCE(excluded.firmware, checkpoint.firmware),
     updated_at = excluded.updated_at
 WHERE excluded.checkpoint_serial > checkpoint.checkpoint_serial
+  AND excluded.serial_epoch = checkpoint.serial_epoch
 RETURNING checkpoint_serial
 """
 
@@ -374,6 +440,8 @@ def advance_checkpoint(
     completed: bool,
     checkpoint_time: str | None = None,
     now: datetime | None = None,
+    serial_epoch: int = 0,
+    firmware: str | None = None,
 ) -> CheckpointAdvanced:
     """Advance one device's checkpoint — ONLY over a completed chunk (seam 2).
 
@@ -387,7 +455,8 @@ def advance_checkpoint(
     A LOWER serial raises `CheckpointRegressionError` and writes nothing; an EQUAL
     serial is a quiet no-op (the guard is `>`, so no churn). A successful advance is
     exactly ONE statement of change (pinned by test) — no half-applied checkpoint for
-    a systemd kill to find.
+    a systemd kill to find. A different `serial_epoch` is never advanced here: only
+    `reset_checkpoint`, after the loop has confirmed reset evidence, may open one.
     """
     if not completed:
         raise CheckpointNotCompletedError(
@@ -403,6 +472,10 @@ def advance_checkpoint(
         raise CheckpointRegressionError(
             f"checkpoint serial {max_serial} is negative — serialNo counts up from 0"
         )
+    if serial_epoch < 0:
+        raise CheckpointRegressionError(
+            f"serial_epoch {serial_epoch} is negative — an epoch starts at 0"
+        )
 
     stamp = _now_iso(now)
     conn.execute("BEGIN IMMEDIATE")
@@ -410,11 +483,12 @@ def advance_checkpoint(
         # Read the current serial and apply the UPSERT inside ONE transaction: the
         # refusal is reported from the same state the write saw, so it cannot race.
         current = conn.execute(
-            "SELECT checkpoint_serial FROM checkpoint WHERE device_serial = ?",
+            "SELECT checkpoint_serial, serial_epoch FROM checkpoint WHERE device_serial = ?",
             (device_serial,),
         ).fetchone()
         returned = conn.execute(
-            _CK_INSERT, (device_serial, max_serial, checkpoint_time, stamp)
+            _CK_INSERT,
+            (device_serial, max_serial, checkpoint_time, serial_epoch, firmware, stamp),
         ).fetchone()
     except BaseException:
         conn.execute("ROLLBACK")
@@ -427,6 +501,12 @@ def advance_checkpoint(
             checkpoint_serial=returned["checkpoint_serial"],
             advanced=True,
         )
+    if current is not None and serial_epoch != current["serial_epoch"]:
+        raise CheckpointRegressionError(
+            f"refusing to advance {device_serial!r} from epoch {current['serial_epoch']} "
+            f"under epoch {serial_epoch}: only a confirmed serial reset may open a new "
+            "epoch (reset_checkpoint)"
+        )
     if current is not None and max_serial < current["checkpoint_serial"]:
         raise CheckpointRegressionError(
             f"refusing to move {device_serial!r} from {current['checkpoint_serial']} down "
@@ -438,11 +518,75 @@ def advance_checkpoint(
     )
 
 
+def reset_checkpoint(
+    conn: sqlite3.Connection,
+    device_serial: str,
+    *,
+    expected_serial: int,
+    new_serial: int,
+    checkpoint_time: str | None = None,
+    firmware: str | None = None,
+    now: datetime | None = None,
+) -> CheckpointReset:
+    """Open a new serial epoch after a CONFIRMED reset — the only legal rewind.
+
+    The caller has already seen the device's newest serial below the checkpoint and
+    read the fresh deviceInfo evidence (`agent_loop._reset_evidence`); this function
+    is the store half, not the decision. `expected_serial` is a compare-and-swap: if
+    the checkpoint moved since the walk began, refuse rather than rewind a state the
+    caller did not see (two writers are not expected, but a wrong rewind is exactly
+    the silent loss this card forbids). One UPDATE keeps the row atomic under a kill.
+    """
+    if new_serial < 0:
+        raise CheckpointRegressionError(
+            f"reset checkpoint serial {new_serial} is negative — serialNo counts up from 0"
+        )
+    stamp = _now_iso(now)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current = conn.execute(
+            "SELECT checkpoint_serial, serial_epoch FROM checkpoint WHERE device_serial = ?",
+            (device_serial,),
+        ).fetchone()
+        if current is None:
+            raise CheckpointRegressionError(
+                f"refusing to reset {device_serial!r}: no checkpoint row to rewind"
+            )
+        if current["checkpoint_serial"] != expected_serial:
+            raise CheckpointRegressionError(
+                f"refusing to reset {device_serial!r}: expected checkpoint serial "
+                f"{expected_serial}, found {current['checkpoint_serial']} — the state "
+                "moved after the reset evidence was read"
+            )
+        returned = conn.execute(
+            "UPDATE checkpoint"
+            " SET checkpoint_serial = ?,"
+            "     checkpoint_time = COALESCE(?, checkpoint_time),"
+            "     serial_epoch = serial_epoch + 1,"
+            "     firmware = COALESCE(?, firmware),"
+            "     updated_at = ?"
+            " WHERE device_serial = ? AND checkpoint_serial = ?"
+            " RETURNING serial_epoch",
+            (new_serial, checkpoint_time, firmware, stamp, device_serial, expected_serial),
+        ).fetchone()
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return CheckpointReset(
+        device_serial=device_serial,
+        old_serial=expected_serial,
+        new_serial=new_serial,
+        old_epoch=current["serial_epoch"],
+        new_epoch=returned["serial_epoch"],
+    )
+
+
 def read_checkpoint(conn: sqlite3.Connection, device_serial: str) -> Checkpoint | None:
     """The device's checkpoint row, or None when the device has never advanced."""
     row = conn.execute(
-        "SELECT device_serial, checkpoint_serial, checkpoint_time, updated_at"
-        " FROM checkpoint WHERE device_serial = ?",
+        "SELECT device_serial, checkpoint_serial, checkpoint_time, updated_at,"
+        " serial_epoch, firmware FROM checkpoint WHERE device_serial = ?",
         (device_serial,),
     ).fetchone()
     if row is None:
@@ -452,6 +596,8 @@ def read_checkpoint(conn: sqlite3.Connection, device_serial: str) -> Checkpoint 
         checkpoint_serial=row["checkpoint_serial"],
         checkpoint_time=row["checkpoint_time"],
         updated_at=row["updated_at"],
+        serial_epoch=row["serial_epoch"],
+        firmware=row["firmware"],
     )
 
 
