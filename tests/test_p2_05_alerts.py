@@ -8,8 +8,9 @@ BINDING SPEC: docs/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
   already waits out ``unlockTime`` — never present creds while locked);
 * nonce recoveries -> NOT an alert: an info counter line only;
 * clock skew over threshold -> warning;
-* checkpoint stall (``updated_at`` older than k*cadence) -> CRITICAL (ring rolling,
-  punches lost — DESIGN.md OQ4).
+* checkpoint stall -> CRITICAL only on evidence of loss: k consecutive non-auth
+  failed polls with a stale checkpoint, or our store's oldest serialNo rising
+  (stored history disappeared — not ring-rollover; that is card t_ed9c7e92).
 
 The lockout-safety invariant the card pins hardest: an UNACKED parked device must be
 touched NEVER AGAIN — not at the cadence, not after a restart, not "just one probe".
@@ -27,6 +28,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -532,9 +534,12 @@ def test_checkpoint_stall_is_quiet_on_a_quiet_device(tmp_path: Path) -> None:
     assert h.policy.counters["checkpoint_stall"] == 0
 
 
-def test_checkpoint_stall_alerts_when_polls_fail(tmp_path: Path) -> None:
-    """A stale checkpoint PLUS a failing poll is evidence of loss: no successful poll
-    is proving the device has nothing newer. Boundary stays strictly-over k cadences.
+def test_checkpoint_stall_pages_once_after_k_failed_polls(tmp_path: Path) -> None:
+    """A stale checkpoint needs STALL_STRIKES consecutive non-auth failed polls.
+
+    One failed poll below the threshold does not page; the third consecutive failure
+    fires exactly one CRITICAL. Skipped ticks and auth failures neither count nor
+    reset the streak (they have their own channels and prove nothing about the walk).
     """
     device = seeded_device()
     seed_events(device, [device_event(60, "2026-10-19T09:58:00")])
@@ -551,7 +556,27 @@ def test_checkpoint_stall_alerts_when_polls_fail(tmp_path: Path) -> None:
     failed = h.tick()
     assert failed is not None and failed.ok is False and failed.device_serial == serial
     assert isinstance(failed.exception, IsapiBadContent)
-    assert h.policy.check_stall(serial) is None, "exactly k cadences is not OVER k"
+    assert h.policy.check_stall(serial) is None, "one failure below k does not page"
+
+    # A circuit-open skip and an auth failure are neither counted nor resetting.
+    h.policy.handle_tick(
+        SimpleNamespace(ok=False, skipped=True, device_serial=serial, exception=None)
+    )
+    h.policy.handle_tick(
+        SimpleNamespace(
+            ok=False,
+            skipped=False,
+            device_serial=serial,
+            exception=IsapiAuthError("locked", lock_status="locked"),
+        )
+    )
+    assert h.policy._failed_streak[serial] == 1, "skip/auth leave the streak untouched"
+
+    h.clock.advance(1)
+    h.monotonic.advance(1)
+    failed = h.tick()
+    assert failed is not None and failed.ok is False
+    assert h.policy.check_stall(serial) is None, "two failures are still below k"
 
     h.clock.advance(1)
     h.monotonic.advance(1)
@@ -560,8 +585,8 @@ def test_checkpoint_stall_alerts_when_polls_fail(tmp_path: Path) -> None:
     fired = h.policy.check_stall(serial)
     assert fired is not None and fired.kind == "checkpoint_stall"
     assert fired.level == "critical"
-    assert [a.kind for a in h.alerts] == ["checkpoint_stall"]
-    assert "poll FAILED" in fired.note
+    assert h.kinds().count("checkpoint_stall") == 1, "exactly one page for this episode"
+    assert "3 consecutive polls FAILED" in fired.note
     assert h.policy.check_stall(serial) is None, "one page per stall episode, not per check"
 
     # Heal the walk and move the checkpoint: the episode closes, so a later stall can
@@ -573,10 +598,64 @@ def test_checkpoint_stall_alerts_when_polls_fail(tmp_path: Path) -> None:
     assert h.policy.check_stall(serial) is None
 
 
-def test_checkpoint_stall_alerts_when_the_oldest_serial_rises(tmp_path: Path) -> None:
-    """Serial-gap arm, pinned to OBSERVED.md "Retention / gaps" (line 411): "a
-    monotonic increase of the minimum = rolling started = punches are being lost".
-    The store floor rising is the near-side form of that loss event.
+def test_checkpoint_stall_ok_poll_resets_the_failure_streak(tmp_path: Path) -> None:
+    """Any ok poll between failures resets the streak, so two isolated errors on a
+    quiet night do not accumulate into a CRITICAL page.
+    """
+    device = seeded_device()
+    seed_events(device, [device_event(60, "2026-10-19T09:58:00")])
+    h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
+    first = h.tick()
+    serial = first.device_serial
+    assert serial is not None
+
+    # Four quiet ok polls: checkpoint is now older than k cadence on success alone.
+    for _ in range(4):
+        h.clock.advance(CADENCE_S)
+        h.monotonic.advance(CADENCE_S)
+        quiet = h.tick()
+        assert quiet is not None and quiet.ok is True and quiet.advanced is False
+
+    device.reset_raw("POST", EVENT_PATH, _bad_content())
+    for _ in range(2):
+        h.clock.advance(CADENCE_S)
+        h.monotonic.advance(CADENCE_S)
+        failed = h.tick()
+        assert failed is not None and failed.ok is False
+    assert h.policy.check_stall(serial) is None, "two failures below k do not page"
+
+    # An ok poll in between (still no new events) resets the streak to zero.
+    device.raw.pop(f"POST {EVENT_PATH}", None)
+    h.clock.advance(CADENCE_S)
+    h.monotonic.advance(CADENCE_S)
+    quiet = h.tick()
+    assert quiet is not None and quiet.ok is True and quiet.advanced is False
+    assert h.policy._failed_streak[serial] == 0
+
+    device.reset_raw("POST", EVENT_PATH, _bad_content())
+    for _ in range(2):
+        h.clock.advance(CADENCE_S)
+        h.monotonic.advance(CADENCE_S)
+        failed = h.tick()
+        assert failed is not None and failed.ok is False
+    assert h.policy.check_stall(serial) is None, "the reset forced a fresh k-streak"
+
+    h.clock.advance(CADENCE_S)
+    h.monotonic.advance(CADENCE_S)
+    failed = h.tick()
+    assert failed is not None and failed.ok is False
+    fired = h.policy.check_stall(serial)
+    assert fired is not None and fired.kind == "checkpoint_stall"
+    assert h.kinds().count("checkpoint_stall") == 1
+
+
+def test_checkpoint_stall_fires_when_stored_history_disappears(tmp_path: Path) -> None:
+    """Serial-floor arm: our keep-everything store's MIN(serial_no) rising means
+    stored history disappeared. This is NOT ring-rollover detection — real
+    ring-rollover detection does not exist yet (card t_ed9c7e92); DESIGN.md:411
+    records the intended device-side probe: "the agent must record oldest-serialNo
+    per poll (a monotonic increase of the minimum = rolling started = punches are
+    being lost)".
     """
     device = seeded_device()
     seed_events(
@@ -593,20 +672,22 @@ def test_checkpoint_stall_alerts_when_the_oldest_serial_rises(tmp_path: Path) ->
     assert serial is not None
     assert h.policy.check_stall(serial) is None, "first check records the floor baseline"
 
-    # The floor moves from 60 to 61 while the checkpoint stays fresh: the events below
-    # it are gone, which is the loss signal regardless of checkpoint age.
+    # The store floor moves from 60 to 61 while the checkpoint stays fresh: rows the
+    # agent had kept are gone. This arm reports that fact, not device ring loss.
     h.conn.execute("DELETE FROM events WHERE device_serial = ? AND serial_no < ?", (serial, 61))
     fired = h.policy.check_stall(serial)
     assert fired is not None and fired.kind == "checkpoint_stall"
     assert fired.level == "critical"
-    assert "oldest serialNo rose 60 -> 61" in fired.note
+    assert "oldest stored serialNo rose 60 -> 61" in fired.note
+    assert "stored history disappeared" in fired.note
+    assert "not ring-rollover detection" in fired.note
     assert h.policy.check_stall(serial) is None, "a flat floor does not nag"
 
-    # A second rise is a NEW loss incident (fresh page).
+    # A second rise is a NEW stored-history incident (fresh page).
     h.conn.execute("DELETE FROM events WHERE device_serial = ? AND serial_no < ?", (serial, 62))
     again = h.policy.check_stall(serial)
     assert again is not None and "61 -> 62" in again.note
-    assert [a.kind for a in h.alerts].count("checkpoint_stall") == 2
+    assert h.kinds().count("checkpoint_stall") == 2
 
 
 def test_stall_is_quiet_for_a_device_that_never_advanced(tmp_path: Path) -> None:

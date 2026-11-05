@@ -11,13 +11,14 @@ BINDING SPEC: docs/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
 * nonce recoveries -> NOT an alert: an info counter line only (spec §2a: retirement
   is routine at any minutes-scale cadence; OBSERVED.md "Digest nonce use-cap");
 * clock skew over threshold -> warning;
-* checkpoint stall -> CRITICAL only on EVIDENCE OF LOSS, never on silence. A
+* checkpoint stall -> CRITICAL only on evidence of loss, never on silence. A
   checkpoint older than k*cadence while polls succeed and return nothing newer is
   a quiet door (night/lunch), not an outage: the checkpoint only moves on major=5
-  punches. The page fires when that stale checkpoint coincides with a FAILING poll,
-  or when the oldest serialNo rises — DESIGN.md OQ4's ring-floor signal,
-  "a monotonic increase of the minimum = rolling started = punches are being lost"
-  (OBSERVED.md "Retention / gaps").
+  punches. The page fires only when that stale checkpoint coincides with
+  ``STALL_STRIKES`` consecutive non-auth failed polls. A separate arm pages when
+  our store's oldest serialNo rises — that means stored history disappeared, not
+  that the device ring is rolling. Real ring-rollover detection does not exist
+  yet (card t_ed9c7e92); docs/internal/DESIGN.md:411 records the intended probe.
 
 The invariant that outranks everything else here — the lockout-safety one the card
 pins hardest — is that an UNACKED parked device is touched NEVER again: not at the
@@ -74,8 +75,8 @@ KIND_AUTH_TERMINAL = "auth_terminal"
 KIND_DEVICE_LOCKED = "device_locked"
 #: device clock past ``tz.SKEW_WARN_SECONDS`` (DESIGN.md "Time handling": log, never fix).
 KIND_CLOCK_SKEW = "clock_skew"
-#: checkpoint stale AND evidence of loss (a failing poll or a rising serial floor),
-#: never mere silence — the ring may be rolling (DESIGN.md OQ4).
+#: checkpoint stale AND a failed-poll streak, or stored history disappeared.
+#: Never mere silence; the serial-floor arm is not ring-rollover detection.
 KIND_CHECKPOINT_STALL = "checkpoint_stall"
 #: db past the §2b keep-everything watermark.
 KIND_DB_WATERMARK = "db_watermark"
@@ -227,11 +228,12 @@ class AlertPolicy:
             "db_watermark": 0,
         }
         self._mem_parks: dict[str, dict[str, Any]] = {}
-        # Last observed poll shape per device: "ok" | "failed" | "auth" | "skipped".
-        # Only "failed" (a non-auth walk failure) is stall evidence; auth has its own
-        # critical channel and a circuit-open skip touched nothing at all.
-        self._last_poll_status: dict[str, str] = {}
-        # Store floor per device across checks (the OBSERVED oldest-serialNo signal).
+        # Consecutive non-auth failed polls per device. "ok" resets to 0; auth
+        # failures and circuit-open skips neither count nor reset (they have their
+        # own channels and prove nothing about the event walk).
+        self._failed_streak: dict[str, int] = {}
+        # Our store's floor per device across checks: MIN(serial_no), NOT the
+        # device's oldest retained event. See agent_store.read_oldest_serial.
         self._oldest_serial_seen: dict[str, int | None] = {}
         # Episode guards: each of these alert kinds pages ONCE per incident, never
         # once per tick — an alert that fires every 5 minutes is an alert nobody reads.
@@ -439,7 +441,7 @@ class AlertPolicy:
             self.counters["ticks_ok"] += 1
             self._locked_open = False
             if serial is not None:
-                self._last_poll_status[serial] = "ok"
+                self._failed_streak[serial] = 0
             # A good tick IS the proof the credentials work again — the park (any
             # shape) lifts. §2c's rationale for the slow re-probe over park-forever:
             # "a transient creds rotation self-heals without a site visit".
@@ -448,14 +450,12 @@ class AlertPolicy:
 
         if getattr(result, "skipped", False):
             self.counters["circuit_open_skips"] += 1
-            if serial is not None:
-                self._last_poll_status[serial] = "skipped"
             return fired
 
         self.counters["tick_failures"] += 1
         exc = getattr(result, "exception", None)
-        if serial is not None:
-            self._last_poll_status[serial] = "auth" if isinstance(exc, IsapiAuthError) else "failed"
+        if serial is not None and not isinstance(exc, IsapiAuthError):
+            self._failed_streak[serial] = self._failed_streak.get(serial, 0) + 1
         if isinstance(exc, IsapiAuthError):
             if exc.locked:
                 if not self._locked_open:
@@ -539,13 +539,16 @@ class AlertPolicy:
         a quiet door (night/lunch) — the checkpoint only moves on major=5 punches, so
         age alone is silence and must not page. Two shapes are evidence:
 
-        * a stale checkpoint AND the last poll failed (no successful poll is proving
-          the device has nothing newer);
-        * the oldest serialNo rose since the previous check — DESIGN.md OQ4,
-          "a monotonic increase of the minimum = rolling started = punches are being
-          lost" (OBSERVED.md "Retention / gaps"). This store keeps everything, so its
-          floor can only rise when already-stored history disappears: the same loss
-          event seen from the near side.
+        * a stale checkpoint AND ``STALL_STRIKES`` consecutive non-auth failed polls
+          (an ok poll resets the streak; auth failures and circuit-open skips neither
+          count nor reset);
+        * our store's oldest serialNo rose since the previous check — stored history
+          disappeared. This reads MIN(serial_no) from the keep-everything store, not
+          the device's retained floor: it is NOT ring-rollover detection, which does
+          not exist yet (card t_ed9c7e92). docs/internal/DESIGN.md:411 records the
+          intended device-side probe: "the agent must record oldest-serialNo per
+          poll (a monotonic increase of the minimum = rolling started = punches are
+          being lost)".
 
         One page per incident: the frozen ``updated_at`` plus the evidence shape is
         the episode key; a further rise of the floor is a new incident. Silence for
@@ -571,7 +574,8 @@ class AlertPolicy:
             oldest is not None and previous_oldest is not None and oldest > previous_oldest
         )
 
-        failing = self._last_poll_status.get(device_serial) == "failed"
+        streak = self._failed_streak.get(device_serial, 0)
+        failing = streak >= self.stall_strikes
         if not (stale and failing) and not floor_moved:
             if not stale:
                 # The checkpoint moved (or healed): close the episode so a LATER
@@ -586,17 +590,17 @@ class AlertPolicy:
         self._stall_open_at[device_serial] = episode
         if floor_moved:
             note = (
-                f"oldest serialNo rose {previous_oldest} -> {oldest} — the event-ring "
-                "floor moved past stored history, so punches in that gap are LOST "
-                "(OBSERVED.md 'Retention / gaps': a monotonic increase of the minimum "
-                "= rolling started)"
+                f"oldest stored serialNo rose {previous_oldest} -> {oldest} — stored "
+                "history disappeared. This arm reads our keep-everything store, not "
+                "the device ring, so it is not ring-rollover detection; real "
+                "ring-rollover detection is card t_ed9c7e92 (DESIGN.md:411)"
             )
         else:
             note = (
                 f"checkpoint unmoved for {age:.0f}s (k={self.stall_strikes} x cadence "
-                f"{self.cadence_s}s) and the last poll FAILED — no successful poll is "
-                f"proving the device has nothing newer, so punches may be lost "
-                f"(last serial {checkpoint.checkpoint_serial})"
+                f"{self.cadence_s}s) and {streak} consecutive polls FAILED — no "
+                f"successful poll is proving the device has nothing newer, so punches "
+                f"may be unreported (last serial {checkpoint.checkpoint_serial})"
             )
         return self._fire(LEVEL_CRITICAL, KIND_CHECKPOINT_STALL, device_serial, note)
 

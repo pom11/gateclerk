@@ -52,9 +52,11 @@ device. Every metric line carries value AND source (`name value  # where it is
 computed`) so `/metrics` doubles as the documentation of its own vocabulary.
 
 **degraded = any device circuit open, or a checkpoint older than the caller's stall
-threshold** (spec §2c: checkpoint stall is critical — the ring has started rolling).
-Nothing else flips it: recoveries are info (§2a), skew is a warning (§2c); and this
-module raises no alert, sends no page and opens no socket — routing is P2-05's.
+threshold** (spec §2c's health field). The threshold reports age only; P2-05 pages
+only on evidence of loss (consecutive failed polls, or stored history disappearing),
+never on a quiet door's silence. Nothing else flips it: recoveries are info (§2a),
+skew is a warning (§2c); and this module raises no alert, sends no page and opens no
+socket — routing is P2-05's.
 """
 
 from __future__ import annotations
@@ -230,8 +232,10 @@ class HealthSnapshot:
     status: str  # "ok" | "degraded"
     reasons: tuple[str, ...]
     #: Threshold the health surface reports. The paging semantics live in
-    #: AlertPolicy.check_stall: "stall" now means EVIDENCE OF LOSS (a failing poll
-    #: or a rising oldest serial), never the mere silence of a quiet door.
+    #: AlertPolicy.check_stall: "stall" now means EVIDENCE OF LOSS (a streak of
+    #: failed polls, or stored history disappearing), never the mere silence of a
+    #: quiet door. A rising oldest serial is our own store's floor, not the device's
+    #: ring; real ring-rollover detection is card t_ed9c7e92.
     checkpoint_stall_s: float
     devices: tuple[DeviceHealth, ...]
     site_metrics: tuple[MetricLine, ...]
@@ -492,7 +496,8 @@ class AgentHealthCollector:
             ):
                 reasons.append(
                     f"device {serial}: checkpoint stalled {health.checkpoint_age_s:.0f}s"
-                    f" > {self.checkpoint_stall_s:.0f}s threshold (ring-roll risk)"
+                    f" > {self.checkpoint_stall_s:.0f}s threshold (age only — P2-05 "
+                    "pages on failed-poll evidence, not silence)"
                 )
 
         site_metrics = (
