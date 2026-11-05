@@ -14,9 +14,10 @@ or rotating JSONL files).
 ## What it is NOT
 
 - **Not a device configurator or door controller:** `gateclerk` never unlocks doors, never
-  changes device clocks, never reboots hardware, and never writes to a terminal (the sole
-  opt-in exception is `gateclerk migrate apply --apply` for explicitly gated terminal-to-terminal
-  enrollment migration).
+  changes device clocks, never reboots hardware, and never writes to a terminal (the two
+  opt-in exceptions are `gateclerk migrate apply --apply` for explicitly gated
+  terminal-to-terminal enrollment migration and `gateclerk users import --apply` for gated
+  Excel enrollment).
 - **Not a cloud service:** `gateclerk` has zero hardcoded endpoints and zero telemetry. If
   you do not configure a sink in `sites.toml`, data stays on disk in your local SQLite store.
 

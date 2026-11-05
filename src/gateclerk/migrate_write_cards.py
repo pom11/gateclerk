@@ -277,7 +277,9 @@ def card_caps(probe: CapabilityMatrix | None) -> Mapping[str, Any] | None:
         body = caps.get(key)
         if not isinstance(body, Mapping):
             continue
-        section = body.get("CardInfoCap")
+        # Real device document: {"CardInfo": {...}}; keep the old spelling readable
+        # for hand-assembled matrices.
+        section = body.get("CardInfo") or body.get("CardInfoCap")
         if isinstance(section, Mapping):
             return section
     return None

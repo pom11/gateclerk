@@ -1,0 +1,186 @@
+{
+ "card_info_capabilities": {
+  "CardInfo": {
+   "CardInfoDelCond": {
+    "CardNoList": {
+     "cardNo": {
+      "@max": 20,
+      "@min": 1
+     },
+     "maxSize": 30
+    },
+    "EmployeeNoList": {
+     "employeeNo": {
+      "@max": 32,
+      "@min": 1
+     },
+     "maxSize": 30
+    }
+   },
+   "CardInfoSearchCond": {
+    "CardNoList": {
+     "cardNo": {
+      "@max": 20,
+      "@min": 1
+     },
+     "maxSize": 30
+    },
+    "EmployeeNoList": {
+     "employeeNo": {
+      "@max": 32,
+      "@min": 1
+     },
+     "maxSize": 30
+    },
+    "maxResults": {
+     "@max": 30,
+     "@min": 1
+    },
+    "searchID": {
+     "@max": 64,
+     "@min": 1
+    }
+   },
+   "cardNo": {
+    "@max": 20,
+    "@min": 1
+   },
+   "cardType": {
+    "@opt": "normalCard,patrolCard,hijackCard,superCard"
+   },
+   "employeeNo": {
+    "@max": 32,
+    "@min": 1
+   },
+   "leaderCard": {
+    "@max": 1,
+    "@min": 1
+   },
+   "maxRecordNum": 3000,
+   "supportFunction": {
+    "@opt": "post,delete,put,get,setUp"
+   }
+  }
+ },
+ "user_info_capabilities": {
+  "UserInfo": {
+   "PersonInfoExtends": {
+    "maxSize": 1,
+    "value": {
+     "@max": 64,
+     "@min": 0
+    }
+   },
+   "RightPlan": {
+    "doorNo": {
+     "@max": 1,
+     "@min": 1
+    },
+    "maxPlanTemplate": 4,
+    "maxSize": 1,
+    "planTemplateNo": {
+     "@max": 255,
+     "@min": 1
+    }
+   },
+   "UserInfoDelCond": {
+    "EmployeeNoList": {
+     "employeeNo": {
+      "@max": 32,
+      "@min": 1
+     },
+     "maxSize": 30
+    }
+   },
+   "UserInfoSearchCond": {
+    "EmployeeNoList": {
+     "employeeNo": {
+      "@max": 32,
+      "@min": 1
+     },
+     "maxSize": 30
+    },
+    "fuzzySearch": {
+     "@max": 128,
+     "@min": 0
+    },
+    "isSupportNumOfCard": true,
+    "isSupportNumOfFP": true,
+    "isSupportNumOfFace": true,
+    "maxResults": {
+     "@max": 30,
+     "@min": 1
+    }
+   },
+   "Valid": {
+    "beginTime": {
+     "@max": 32,
+     "@min": 1
+    },
+    "enable": "true,false",
+    "endTime": {
+     "@max": 32,
+     "@min": 1
+    },
+    "timeRangeBegin": "2000-01-01T00:00:00",
+    "timeRangeEnd": "2037-12-31T23:59:59",
+    "timeType": {
+     "@opt": "local"
+    }
+   },
+   "belongGroup": {
+    "@max": 32,
+    "@min": 1
+   },
+   "closeDelayEnabled": "true,false",
+   "doorRight": {
+    "@max": 1,
+    "@min": 1
+   },
+   "employeeNo": {
+    "@max": 32,
+    "@min": 1
+   },
+   "floorNumber": {
+    "@max": 999,
+    "@min": 0
+   },
+   "gender": {
+    "@opt": "male,female,unknown"
+   },
+   "localUIRight": "true,false",
+   "maxBelongGroup": 4,
+   "maxOpenDoorTime": {
+    "@max": 255,
+    "@min": 0
+   },
+   "maxRecordNum": 3000,
+   "name": {
+    "@max": 128,
+    "@min": 0
+   },
+   "openDoorTime": {
+    "@max": 255,
+    "@min": 0
+   },
+   "password": {
+    "@max": 8,
+    "@min": 0
+   },
+   "purePwdVerifyEnable": true,
+   "roomNumber": {
+    "@max": 99,
+    "@min": 0
+   },
+   "supportFunction": {
+    "@opt": "post,delete,put,get,setUp"
+   },
+   "userType": {
+    "@opt": "normal,visitor,blackList"
+   },
+   "userVerifyMode": {
+    "@opt": "cardAndPw,card,fp,fpAndPw,fpOrCard,fpAndCard,fpAndCardAndPw,faceOrFpOrCardOrPw,faceAndFp,faceAndPw,faceAndCard,face,faceAndFpAndCard,faceAndPwAndFp,fpOrface,cardOrFace,cardOrFaceOrFp"
+   }
+  }
+ }
+}
