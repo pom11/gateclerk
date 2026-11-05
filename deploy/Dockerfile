@@ -34,7 +34,7 @@
 
 # micro-notify is pinned to a commit SHA, not a moving branch. It is fetched as the
 # GitHub archive tarball in the build stage below. Bump this one ARG deliberately.
-ARG MICRO_NOTIFY_SHA=f923ffcaa300af62e910049c7bb5c11d6ca3c495
+ARG MICRO_NOTIFY_SHA=afeab1025b32feef2d856ee0350ae2fc5ee2d5f6
 
 FROM python:3.12-alpine AS build
 
@@ -49,6 +49,7 @@ COPY src ./src
 
 # A virtualenv is the image's install root. It is built as root in this disposable
 # stage; the runtime stage copies it and never runs pip.
+# Follow-up: once PR #95 adds the `excel` extra, install `.[excel]` so `gateclerk users import` works.
 RUN python -m venv /opt/gateclerk \
     && /opt/gateclerk/bin/pip install --no-cache-dir .
 

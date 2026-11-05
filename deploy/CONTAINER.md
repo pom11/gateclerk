@@ -32,7 +32,7 @@ The default (last) stage is `alerts`: `gateclerk` in `/opt/gateclerk` and `mnoti
 contract: gateclerk execs `mnotify` as a child process, so the binary must exist in this
 container, not in a sidecar. `mnotify` is fetched from the public repository
 `pom11/micro-notify` as the GitHub archive tarball for the commit in the
-`MICRO_NOTIFY_SHA` build arg (default `f923ffcaa300af62e910049c7bb5c11d6ca3c495`).
+`MICRO_NOTIFY_SHA` build arg (default `afeab1025b32feef2d856ee0350ae2fc5ee2d5f6`).
 
 The alert-less image is the earlier stage:
 
@@ -43,6 +43,11 @@ docker build -f deploy/Dockerfile --target runtime -t gateclerk-agent:no-alerts 
 `cryptography` publishes musllinux wheels, so neither stage needs `gcc`, `rust` or
 `musl-dev` for the current dependency sets. The gateclerk build stage stays disposable so a
 future C-extension dependency can be compiled there only, never in `runtime`.
+
+**Follow-up (PR #95).** `gateclerk users import` needs `openpyxl`, which the wheel does not
+install, so that subcommand is not available in this image yet. Once PR #95 adds the `excel`
+extra, change the gateclerk install in the build stage from `.` to `.[excel]`; the
+Dockerfile carries the matching one-line note.
 
 The state directories for the documented sites (`site-a` and `site-b`) are created in the
 image. Docker gives an empty named volume the ownership of its image mount point; without
