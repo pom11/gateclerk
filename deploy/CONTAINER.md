@@ -44,10 +44,8 @@ docker build -f deploy/Dockerfile --target runtime -t gateclerk-agent:no-alerts 
 `musl-dev` for the current dependency sets. The gateclerk build stage stays disposable so a
 future C-extension dependency can be compiled there only, never in `runtime`.
 
-**Follow-up (PR #95).** `gateclerk users import` needs `openpyxl`, which the wheel does not
-install, so that subcommand is not available in this image yet. Once PR #95 adds the `excel`
-extra, change the gateclerk install in the build stage from `.` to `.[excel]`; the
-Dockerfile carries the matching one-line note.
+The image installs gateclerk with its `excel` extra, so `gateclerk users import` works in
+it. See `docs/USERS-IMPORT.md`.
 
 The state directories for the documented sites (`site-a` and `site-b`) are created in the
 image. Docker gives an empty named volume the ownership of its image mount point; without
