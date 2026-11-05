@@ -315,28 +315,6 @@ class SiteConfig:
         return ()
 
     @property
-    def event_sinks(self) -> tuple[SinkSpec, ...]:
-        """The sinks that receive stored EVENTS (the pusher fan-out).
-
-        `mnotify` is an alert route, not a punch destination: it belongs in the same
-        `[[site.sink]]` vocabulary (one typed block, one `sink list` row) but must never be
-        queued an event or drained by `SiteAgent._push`.
-        """
-        return tuple(spec for spec in self.effective_sinks if spec.type != "mnotify")
-
-    @property
-    def alert_sink(self) -> SinkSpec | None:
-        """The site's one `mnotify` alert route, or None for the stderr default.
-
-        Config validation refuses a second one: two alert routes would page twice for one
-        incident and split the operator's trust about which destination is authoritative.
-        """
-        for spec in self.sinks:
-            if spec.type == "mnotify":
-                return spec
-        return None
-
-    @property
     def db_path_resolved(self) -> str:
         """The sqlite path to actually open: the operator's, else the site-derived one.
 
@@ -424,12 +402,6 @@ class SiteConfig:
         from gateclerk.sinks import sink_name_problem, sink_spec_problem
 
         seen: set[str] = set()
-        alert_routes = [spec.name for spec in self.sinks if spec.type == "mnotify"]
-        if len(alert_routes) > 1:
-            problems.append(
-                "at most one mnotify alert sink may be declared (got "
-                f"{alert_routes}): two routes would page twice for one incident"
-            )
         for spec in self.sinks:
             problem = sink_spec_problem(spec)
             if problem:

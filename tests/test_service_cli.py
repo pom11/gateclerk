@@ -1074,25 +1074,14 @@ def test_the_cli_group_holds_its_own_help_and_is_registered_by_service_cmds() ->
 
 
 def test_deploy_artifacts_are_untouched_by_this_card() -> None:
-    """The card's own boundary: `service install` renders the systemd templates; it does
-    not add a file to `deploy/`.
+    """The card's own boundary: `deploy/` stays the committed template pair + README.
 
-    The container story (Dockerfile, compose, healthcheck, env example, CONTAINER.md) is
-    the separate CONTAINER-ALPINE card, so this test names the whole documented surface
-    rather than editing `test_deploy_templates.py`'s pin.
+    `service install` is a renderer for those files, not a fourth artifact in that directory —
+    and `test_deploy_templates.py`'s "exactly three files" pin is what this test agrees with
+    rather than edits.
     """
     found = sorted(p.name for p in DEPLOY.iterdir() if p.is_file())
-    assert found == [
-        "CONTAINER.md",
-        "Dockerfile",
-        "README.md",
-        "compose.yaml",
-        "container_healthcheck.sh",
-        "gateclerk-agent.plist",
-        "gateclerk-agent@.service",
-        "gateclerk.env.example",
-        "mnotify.toml.example",
-    ]
+    assert found == ["README.md", "gateclerk-agent.plist", "gateclerk-agent@.service"]
 
 
 # --- helpers -----------------------------------------------------------------------------------

@@ -171,13 +171,6 @@ class SinkSpec:
     #: event rows, where roster lines would be foreign rows in a documented table). It is
     #: decided at parse time so the drain never has to re-read the config mid-pass.
     accepts_roster: bool = True
-    # --- mnotify-alert-only -------------------------------------------------------------
-    #: The mail recipient an `mnotify` alert sink addresses (the mnotify CLI owns the
-    #: actual transport, credentials and allowlist).
-    to: str | None = None
-    #: Hard timeout for one `mnotify` child process. The contract's mail budget is 300 s
-    #: (mnotify retries Graph itself); a caller may tune it deliberately.
-    timeout_s: float | None = None
 
 
 def sink_spec_problem(spec: SinkSpec) -> str | None:
@@ -213,13 +206,6 @@ def sink_spec_problem(spec: SinkSpec) -> str | None:
             f"sink {spec.name!r} has rotation {spec.rotation!r} (accepted: "
             f"{' or '.join(ROTATIONS)})"
         )
-    if spec.type == "mnotify":
-        if not isinstance(spec.to, str) or not spec.to.strip():
-            return f"sink {spec.name!r} has no `to` recipient: an alert route must name one"
-        if "\n" in spec.to or "\r" in spec.to:
-            return f"sink {spec.name!r} has a `to` recipient containing a line break"
-        if spec.timeout_s is not None and (isinstance(spec.timeout_s, bool) or spec.timeout_s <= 0):
-            return f"sink {spec.name!r} has timeout_s {spec.timeout_s!r}: it must be > 0"
     return None
 
 
@@ -428,38 +414,6 @@ def _build_https(table: Mapping[str, Any], site: str) -> tuple[str, Mapping[str,
     }
 
 
-#: The mnotify mail contract's exec budget (mnotify retries Graph itself; see
-#: docs/SERVICE-INTEGRATION.md §4 in micro-notify). A site may override it.
-MNOTIFY_TIMEOUT_S = 300.0
-
-
-def _build_mnotify(table: Mapping[str, Any], site: str) -> tuple[str, Mapping[str, Any]]:
-    """An alert-route sink: `to` is the recipient, `timeout_s` the hard exec budget.
-
-    This type is deliberately NOT an event sink (see `SiteConfig.event_sinks`): it carries
-    alerts, not punches. The `ref` is a display/identity form only — the queue never sees
-    this sink — and mnotify's own config/keychain owns every credential, so none appears
-    here.
-    """
-    sink = str(table.get("name", "?"))
-    to = _text(table, "to", site=site, sink=sink)
-    if "\n" in to or "\r" in to:
-        raise ConfigError(
-            f"site {site!r} sink {sink!r}: to {to!r} contains a line break — a recipient "
-            "is a single mail address"
-        )
-    timeout = table.get("timeout_s", MNOTIFY_TIMEOUT_S)
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-        raise ConfigError(
-            f"site {site!r} sink {sink!r}: timeout_s must be a number > 0, got {timeout!r}"
-        )
-    return f"mailto:{to}", {
-        "to": to,
-        "timeout_s": float(timeout),
-        "accepts_roster": False,
-    }
-
-
 def _build_file(kind: str) -> Callable[[Mapping[str, Any], str], tuple[str, Mapping[str, Any]]]:
     """A factory for the two file-backed types: identical rules, different extension prose.
 
@@ -502,14 +456,6 @@ register_sink_type(
         keys=("path", "rotation", "accepts_roster"),
         required=("path",),
         build=_build_file("jsonl"),
-    )
-)
-register_sink_type(
-    SinkType(
-        name="mnotify",
-        keys=("to", "timeout_s"),
-        required=("to",),
-        build=_build_mnotify,
     )
 )
 

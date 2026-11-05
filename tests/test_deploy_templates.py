@@ -46,20 +46,8 @@ UNIT_TEMPLATE = DEPLOY / "gateclerk-agent@.service"
 PLIST_TEMPLATE = DEPLOY / "gateclerk-agent.plist"
 README = DEPLOY / "README.md"
 
-#: The whole surface this card owns. The first three are the systemd/launchd install;
-#: the container story (Dockerfile, compose, healthcheck, env example, doc) is the
-#: alternative install and is scanned by the same hygiene rules.
-OWNED_FILES = (
-    UNIT_TEMPLATE,
-    PLIST_TEMPLATE,
-    README,
-    DEPLOY / "Dockerfile",
-    DEPLOY / "compose.yaml",
-    DEPLOY / "container_healthcheck.sh",
-    DEPLOY / "gateclerk.env.example",
-    DEPLOY / "mnotify.toml.example",
-    DEPLOY / "CONTAINER.md",
-)
+#: The whole surface this card owns — a fourth file here is scope creep (card rule).
+OWNED_FILES = (UNIT_TEMPLATE, PLIST_TEMPLATE, README)
 
 #: The device hosts used anywhere in the deploy surface must be documentation-range
 #: placeholders (RFC 5737 TEST-NET), same allowlist as tests/test_repo_hygiene.py.
@@ -217,20 +205,12 @@ REMAINING_PLACEHOLDER = re.compile(r"<[A-Z][A-Z0-9_]*>")
 # --- 0. the surface is exactly the three static files this card owns -------------------
 
 
-def test_deploy_dir_holds_only_the_documented_artifacts() -> None:
+def test_deploy_dir_holds_only_the_three_static_artifacts() -> None:
     assert DEPLOY.is_dir(), "deploy/ must exist (this card owns it)"
     found = sorted(p.name for p in DEPLOY.iterdir() if p.is_file())
-    assert found == [
-        "CONTAINER.md",
-        "Dockerfile",
-        "README.md",
-        "compose.yaml",
-        "container_healthcheck.sh",
-        "gateclerk-agent.plist",
-        "gateclerk-agent@.service",
-        "gateclerk.env.example",
-        "mnotify.toml.example",
-    ], f"deploy/ holds an undocumented artifact: {found}"
+    assert found == ["README.md", "gateclerk-agent.plist", "gateclerk-agent@.service"], (
+        f"deploy/ must hold exactly the templates + README, found {found}"
+    )
 
 
 def test_deploy_surface_ships_no_runtime_code() -> None:
@@ -599,36 +579,6 @@ def test_readme_points_at_the_command_the_unit_runs(readme: str) -> None:
     assert "P2-07b" in step2, (
         "the render/install section must flag that `agent run` arrives in P2-07b"
     )
-
-
-# --- 5. container story: one default site, opt-in second, pinned notify build --------
-
-
-def test_compose_starts_only_site_a_by_default_and_gates_site_b() -> None:
-    """Production has one site: a bare `compose up -d` must not start site-b."""
-    text = deploy_text(DEPLOY / "compose.yaml")
-    site_a = text[text.index("  site-a:") : text.index("  # A second site")]
-    site_b = text[text.index("  site-b:") : text.index("\nvolumes:")]
-    assert "profiles:" not in site_a, "site-a must be in the default profile"
-    assert 'profiles: ["second-site"]' in site_b, (
-        "site-b must be opt-in; otherwise compose up starts a site nobody configured"
-    )
-
-
-def test_dockerfile_defaults_to_alerts_and_keeps_an_alertless_target() -> None:
-    text = deploy_text(DEPLOY / "Dockerfile")
-    pin = re.search(r"^ARG MICRO_NOTIFY_SHA=([0-9a-f]{40})$", text, re.MULTILINE)
-    assert pin, "micro-notify must be pinned by a full commit SHA build arg"
-    assert 'ARG GATECLERK_SITES="site-a site-b"' in text, (
-        "the documented site state dirs must exist in the image so named volumes inherit "
-        "uid 10001 instead of Docker's root-owned mount point"
-    )
-    assert "FROM runtime AS alerts" in text, "the default (last) stage must include alerts"
-    alerts = text[text.index("FROM runtime AS alerts") :]
-    assert "COPY --from=mnotify-build /opt/mnotify /opt/mnotify" in alerts
-    assert "MICRO_NOTIFY_SECRETS=file" in alerts
-    assert "MICRO_NOTIFY_SECRETS_DIR=/run/secrets/mnotify" in alerts
-    assert "MICRO_NOTIFY_CONFIG=/etc/mnotify/config.toml" in alerts
 
 
 # --- 5. hygiene scan over the whole deploy surface (card rule: no real hosts/IPs) -------
