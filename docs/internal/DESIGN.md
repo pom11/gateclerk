@@ -375,7 +375,10 @@ New sites = one more block; the keychain account is the host (`security
 find-generic-password -s gateclerk-hikvision -a <host>`), so `security add-generic-password
 -s gateclerk-hikvision -a <ip> -U` plugs site B/C in identically. Resolution order:
 `--user/--password` flags (debug only, discouraged) → env (`GATECLERK_<HOST>_USER/_PASSWORD`)
-→ Keychain. The client receives a credential *callable*, never a baked-in source.
+→ Keychain. Every shipped call site resolves this ladder eagerly and passes the values
+to the client; `config.credential_provider` exists for callers that want lazy
+re-resolution, but no `IsapiClient` consumes one yet (the eager rationale is in the
+t_a063374a prober comment at `doctor_cli.default_device_prober`).
 `.env` stays gitignored; `docs/` and fixtures must never contain a real password,
 nonce, serial or employee name (fixtures mask them — see tests/fixtures/README).
 
