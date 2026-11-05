@@ -60,9 +60,10 @@ docs/OBSERVED.md or docs/references/isapi-client-gotchas.md:
   `IsapiLocalNetworkError` naming the fix instead of a generic connect error.
 
 Deliberately **not** here: paging/cursor logic (p1-05), credential resolution
-(p1-02 — the client receives a password, whoever resolves it decides), the inter-page
-delay (p1-05's pacing), and TLS options (P1 is HTTP:80 on the LAN; if TLS ever comes,
-pin the device cert into a CA bundle — never `verify=False`, gotchas §4.1).
+(p1-02 — the client receives either a password or a provider, whoever resolves it
+decides), the inter-page delay (p1-05's pacing), and TLS options (P1 is HTTP:80 on
+the LAN; if TLS ever comes, pin the device cert into a CA bundle — never
+`verify=False`, gotchas §4.1).
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -84,6 +85,9 @@ from gateclerk.exceptions import (
     IsapiLocalNetworkError,
 )
 from gateclerk.isapi_response import envelope_to_error, parse_body, parse_envelope
+
+if TYPE_CHECKING:  # type-only: isapi_transport must stay config-free at runtime
+    from gateclerk.config import CredentialProvider
 
 __all__ = [
     "DEFAULT_AUTH_RECOVERY_BUDGET",
@@ -140,7 +144,21 @@ _TCC_MARKERS = ("no route to host", "operation not permitted")
 
 class IsapiClient:
     """Read-only ISAPI client for exactly one device. Not thread-safe by design:
-    the digest state below is unlocked, so create one client per worker thread."""
+    the digest state below is unlocked, so create one client per worker thread.
+
+    Credentials arrive one of exactly two ways: non-empty `username`/`password`
+    positionals, or a keyword `credentials=` provider (a zero-arg callable returning
+    `gateclerk.config.Credentials`). A provider is consulted at exactly three
+    lifetime points — once at construction (fail fast before any socket), inside
+    `_reset_auth_state()` when a nonce retires, and once when an open auth circuit
+    has expired — never per request and never per page. That is the rotation
+    self-heal seam (docs/internal/DECISION-credential-provider-seam.md).
+
+    With a provider the client still holds the LAST REVEALED PLAINTEXT PASSWORD for
+    as long as its `httpx.DigestAuth` lives, because httpx requires strings; it
+    replaces that value only at the three points above. A provider does not make the
+    client secret-free, only re-readable.
+    """
 
     def __init__(
         self,
@@ -148,6 +166,7 @@ class IsapiClient:
         username: str,
         password: str,
         *,
+        credentials: CredentialProvider | None = None,
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         read_timeout: float = DEFAULT_READ_TIMEOUT,
         busy_max_attempts: int = DEFAULT_BUSY_MAX_ATTEMPTS,
@@ -171,7 +190,36 @@ class IsapiClient:
                 f"base_url must include the scheme (http:// or https://); got {base_url!r}. "
                 "ISAPI is HTTP on 80 / HTTPS on 443 — port 8000 is the SDK protocol port."
             )
-        self._auth = httpx.DigestAuth(username, password)
+        # Exactly one credential source. This is deliberately stricter than the old
+        # silent accept of ("", ""): the resolver already refuses an empty password
+        # (config.py:890-895), so the constructor was the remaining hole. Presence,
+        # never values — a ValueError message must not leak a password.
+        if credentials is None:
+            if not username or not password:
+                raise ValueError(
+                    "IsapiClient needs exactly one credential source: non-empty "
+                    "username+password positionals, or credentials=<provider> with both "
+                    f"positionals empty. Got username={'set' if username else 'empty'}, "
+                    f"password={'set' if password else 'empty'}, credentials=None."
+                )
+            self._auth_user = username
+            self._auth_secret = password
+        else:
+            if username or password:
+                raise ValueError(
+                    "IsapiClient needs exactly one credential source: non-empty "
+                    "username+password positionals, or credentials=<provider> with both "
+                    f"positionals empty. Got username={'set' if username else 'empty'}, "
+                    f"password={'set' if password else 'empty'}, credentials=provided."
+                )
+            # Point (1) of the provider contract: once here, before any socket, so a
+            # missing credential keeps the pre-socket CredentialUnavailable -> exit 2
+            # law. Anything the provider raises propagates unchanged.
+            first = credentials()
+            self._auth_user = first.user
+            self._auth_secret = first.password.reveal()
+        self._credentials = credentials
+        self._auth = httpx.DigestAuth(self._auth_user, self._auth_secret)
         if client is None:
             # `trust_env=False` is doctor's own NO_PROXY promise (module docstring law) and
             # demo_walkthrough's (§4.1): httpx's default True would route a LAN-device GET
@@ -198,14 +246,15 @@ class IsapiClient:
         self._transport_retries = transport_retries
         self._circuit_fallback = circuit_fallback_seconds
         self._circuit_margin = circuit_margin_seconds
-        self._auth_user = username
-        self._auth_secret = password
         self._auth_recovery_budget = auth_recovery_budget
         self._auth_recovery_streak = auth_recovery_streak
         self._recovery_streak = 0
         self._sleep = sleep
         self._now = now
         self._circuit_until: float | None = None
+        #: True between a circuit-opening 401 and the first request that may knock
+        #: again: at that moment the provider is re-read once (rotation self-heal).
+        self._circuit_auth_stale = False
         self._owner_thread: int | None = None
         #: total challenge-less-401 recoveries this client has spent (observability:
         #: a long backfill that survives several nonce retirements leaves a number,
@@ -305,6 +354,10 @@ class IsapiClient:
         unlock = err.unlock_time
         seconds = unlock if (unlock and unlock > 0) else self._circuit_fallback
         self._circuit_until = self._now() + seconds + self._circuit_margin
+        # Point (3) of the provider contract: the episode may have been a rotated
+        # password. The first call that passes the circuit gate re-reads the source
+        # once, so the re-probe knocks with the CURRENT secret, not the stale one.
+        self._circuit_auth_stale = True
 
     # --- nonce-retirement recovery (t_a3521d8a) ----------------------------------------
 
@@ -371,7 +424,27 @@ class IsapiClient:
         makes, and the reason a search POST is safe here: the body bytes are untouched,
         so the `searchID`/cursor are unchanged and the device dedupes by cursor (module
         docstring, and pinned by the request-count test).
+
+        With a provider this is also point (2) of the provider contract: the rebuild
+        asks for a fresh credential, which is how a rotation becomes visible without a
+        restart. A `CredentialUnavailable` from the provider propagates unchanged; the
+        recovery counters this call already spent stay spent.
         """
+        self._rebuild_auth()
+
+    def _rebuild_auth(self) -> None:
+        """Replace the digest object, re-reading the provider when one was given.
+
+        The three sanctioned provider points are `__init__` (point 1, inline),
+        `_reset_auth_state` (point 2) and the post-circuit check in `_call` (point 3);
+        this helper serves the latter two. Keeping provider reads inside these
+        lifetime points — never in `get`/`search` — is the keychain-prompt budget
+        (each read can raise a macOS ACL prompt).
+        """
+        if self._credentials is not None:
+            fresh = self._credentials()
+            self._auth_user = fresh.user
+            self._auth_secret = fresh.password.reveal()
         self._auth = httpx.DigestAuth(self._auth_user, self._auth_secret)
 
     def _endpoint_call(
@@ -416,6 +489,13 @@ class IsapiClient:
                     f"stop (device lockout risk); no request was sent. "
                     f"reset_circuit() after verifying credentials by hand."
                 )
+            if self._circuit_auth_stale:
+                # Point (3): first call after the circuit closed (window elapsed, or
+                # an operator reset_circuit). Rebuild from the provider once so a
+                # rotated password is what knocks. Flag cleared only on success, so a
+                # CredentialUnavailable leaves the episode open for the next attempt.
+                self._rebuild_auth()
+                self._circuit_auth_stale = False
             try:
                 response = self._client.request(
                     expected.value,

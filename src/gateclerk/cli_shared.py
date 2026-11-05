@@ -329,7 +329,7 @@ def _client_for(
             read_timeout=timeout,
             trust_env=trust_env,
         )
-    except (ValueError, httpx.InvalidURL) as exc:
+    except (ValueError, httpx.InvalidURL, CredentialUnavailable) as exc:
         raise _config_exit(output, str(exc)) from exc
     if logger is None:
         return client
