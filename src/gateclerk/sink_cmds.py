@@ -83,10 +83,7 @@ SinkNameOpt = Annotated[
 ]
 SinkTypeOpt = Annotated[
     str,
-    typer.Option(
-        "--type",
-        help="Sink type: `https`, `csv`, `jsonl` or `mnotify` (the registered types).",
-    ),
+    typer.Option("--type", help="Sink type: `https`, `csv` or `jsonl` (the registered types)."),
 ]
 SinkUrlOpt = Annotated[
     str | None,
@@ -107,22 +104,6 @@ SinkPathOpt = Annotated[
 SinkRotationOpt = Annotated[
     str | None,
     typer.Option("--rotation", help="File-sink rotation: `daily` (the default) or `monthly`."),
-]
-SinkToOpt = Annotated[
-    str | None,
-    typer.Option(
-        "--to",
-        help="An mnotify alert sink's mail recipient. mnotify owns the transport, "
-        "credentials and allowlist; gateclerk only execs it.",
-    ),
-]
-SinkTimeoutOpt = Annotated[
-    float | None,
-    typer.Option(
-        "--timeout-s",
-        help="An mnotify alert sink's hard exec timeout in seconds (default 300, the "
-        "micro-notify mail budget).",
-    ),
 ]
 SinkTokenEnvOpt = Annotated[
     str | None,
@@ -242,8 +223,6 @@ def sink_add(
     rotation: SinkRotationOpt = None,
     token_env: SinkTokenEnvOpt = None,
     token_keychain: SinkTokenKeychainOpt = None,
-    to: SinkToOpt = None,
-    timeout_s: SinkTimeoutOpt = None,
     output: OutputOpt = OutputFormat.TABLE,
 ) -> None:
     """Append one `site.sink` block to the site's config, atomically.
@@ -272,8 +251,6 @@ def sink_add(
             rotation=rotation,
             token_env=token_env,
             token_keychain=token_keychain,
-            to=to,
-            timeout_s=timeout_s,
         )
     except sink_cli.SinkCliError as exc:
         raise _sink_cli_exit(output, str(exc)) from exc

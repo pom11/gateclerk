@@ -45,26 +45,6 @@ beyond the site label. That last one is not paranoia: the transport's own except
 strings embed the base URL (isapi_transport.py: ``request to {base_url} failed``),
 so alert notes are authored from safe pieces here and NEVER from ``str(exc)``.
 ``tests/test_p2_05_alerts.py`` scans the whole alert surface for the leak.
-
-Alert routing (card ALERT-SINK-MNOTIFY)
----------------------------------------
-The sink is an injected callable, so the policy has no transport of its own. With no
-sink configuration the default stays exactly the journald line above. A site may add ONE
-``[[site.sink]] type = "mnotify"`` block (the same typed-sink vocabulary the push
-sinks use; ``sink_cli.add_sink_block`` writes it): alerts then go to mnotify mail, whose
-argv/body-file/exit-code contract is micro-notify's docs/SERVICE-INTEGRATION.md. mnotify
-owns its credentials and daily counter; gateclerk only execs it (argv array, body in a
-file, one send at a time) and never passes a token.
-
-The fallback law is the reason the alert path bends and never breaks: the mnotify sink
-writes today's stderr line IMMEDIATELY on the calling thread, then hands the page to one
-daemon worker over a small bounded queue. A delivery failure — binary missing, timeout,
-non-zero exit, unparseable process trouble — only adds a warning; the line is not written
-twice, and nothing blocks or raises into ``handle_tick``/``_fire`` (a mail outage cannot
-stall polling). Journald is therefore still the evidence of record when the mail route is
-down; mnotify is an additional page, never a replacement for the local line. Only one
-alert route is allowed (two would page twice for one incident). On agent exit the sink
-drains accepted pages for a bounded time and warns about any page still in flight.
 """
 
 from __future__ import annotations
@@ -107,9 +87,6 @@ KIND_CLOCK_SKEW = "clock_skew"
 KIND_CHECKPOINT_STALL = "checkpoint_stall"
 #: db past the §2b keep-everything watermark.
 KIND_DB_WATERMARK = "db_watermark"
-#: A confirmed device serialNo reset (firmware upgrade or log clear). One critical
-#: per incident; the loop has already stored the new punches under a new epoch.
-KIND_SERIAL_RESET = "serial_reset"
 
 #: §2c verbatim: "slow re-probe e.g. every 30 min only after operator
 #: acknowledgement". 30 minutes, as seconds.
@@ -164,10 +141,6 @@ class Alert:
     device_serial: str | None
     at: str  # tz-aware ISO, from the injected clock — never a wall-clock surprise
     note: str
-    #: The park key the policy gated on (a serial, or `pending` before bootstrap).
-    device_key: str | None = None
-    #: Human-readable park state at fire time (unacked / acked grid / not parked).
-    park_state: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -175,8 +148,6 @@ class Alert:
             "kind": self.kind,
             "site": self.site,
             "device_serial": self.device_serial,
-            "device_key": self.device_key,
-            "park_state": self.park_state,
             "at": self.at,
             "note": self.note,
         }
@@ -262,7 +233,6 @@ class AlertPolicy:
             #: door whose polls succeed is not a stall (card STALL-ALERT-FALSE).
             "checkpoint_stall": 0,
             "db_watermark": 0,
-            "serial_reset": 0,
         }
         self._mem_parks: dict[str, dict[str, Any]] = {}
         # Consecutive non-auth failed polls per device. "ok" resets to 0; auth
@@ -278,10 +248,6 @@ class AlertPolicy:
         self._skew_open = False
         self._watermark_open = False
         self._stall_open_at: dict[str, str] = {}  # serial -> checkpoint updated_at seen
-        #: Confirmed reset episodes already paged: (old_serial, new_serial). A kill
-        #: before the checkpoint rewind can re-confirm the same reset next tick; the
-        #: operator must still see exactly one page for it.
-        self._serial_reset_seen: set[tuple[int, int]] = set()
 
     # --- park store ---------------------------------------------------------------------
 
@@ -487,25 +453,6 @@ class AlertPolicy:
             # shape) lifts. §2c's rationale for the slow re-probe over park-forever:
             # "a transient creds rotation self-heals without a site visit".
             self._unpark(serial)
-            reset = getattr(result, "serial_reset", None)
-            if reset is not None:
-                episode = (reset.old_serial, reset.new_serial)
-                if episode not in self._serial_reset_seen:
-                    self._serial_reset_seen.add(episode)
-                    old_fw = reset.old_firmware or "unknown"
-                    new_fw = reset.new_firmware or "unknown"
-                    fired.append(
-                        self._fire(
-                            LEVEL_CRITICAL,
-                            KIND_SERIAL_RESET,
-                            serial,
-                            f"device serialNo reset: checkpoint {reset.old_serial} -> "
-                            f"newest {reset.new_serial} (firmware {old_fw} -> {new_fw}); "
-                            "new punches are stored under a new serial epoch and the "
-                            "old rows are untouched — verify the device log was not "
-                            "cleared outside a planned upgrade",
-                        )
-                    )
             return fired
 
         if getattr(result, "skipped", False):
@@ -536,11 +483,6 @@ class AlertPolicy:
                 if self._read_park(PENDING_SERIAL) is None and (
                     serial is None or self._read_park(serial) is None
                 ):
-                    # Park BEFORE firing so the alert's park_state names the state the
-                    # operator will find on disk (the mnotify body carries it).
-                    self._park(
-                        PENDING_SERIAL if serial is None else serial, serial_for_record=serial
-                    )
                     fired.append(
                         self._fire(
                             LEVEL_CRITICAL,
@@ -550,6 +492,9 @@ class AlertPolicy:
                             "rotated; the device loop is PARKED (no re-probe until "
                             "`gateclerk agent ack`)",
                         )
+                    )
+                    self._park(
+                        PENDING_SERIAL if serial is None else serial, serial_for_record=serial
                     )
             return fired
 
@@ -743,24 +688,6 @@ class AlertPolicy:
     # --- internals --------------------------------------------------------------------------
 
     def _fire(self, level: str, kind: str, serial: str | None, note: str) -> Alert:
-        device_key = serial or PENDING_SERIAL
-        try:
-            record = self._read_park(device_key)
-            if record is None and serial is not None:
-                record = self._read_park(PENDING_SERIAL)
-            if record is None:
-                park_state = "not parked"
-            elif record.get("acked_at") is None:
-                park_state = "parked, unacked (operator ack required)"
-            else:
-                park_state = (
-                    f"parked, acked at {record.get('acked_at')} "
-                    f"(next re-probe {record.get('next_attempt_at')})"
-                )
-        except Exception:
-            # The alert path never raises: an unreadable park record is reported as
-            # unknown state, not as a reason to lose the alert.
-            park_state = "unknown (park record unreadable)"
         alert = Alert(
             level=level,
             kind=kind,
@@ -768,8 +695,6 @@ class AlertPolicy:
             device_serial=serial,
             at=_iso(self.now()),
             note=note,
-            device_key=device_key,
-            park_state=park_state,
         )
         self.counters[kind] = self.counters.get(kind, 0) + 1
         self.sink(alert)

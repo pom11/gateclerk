@@ -868,39 +868,3 @@ def test_stall_check_is_none_without_a_connection() -> None:
 
     policy = AlertPolicy(site=SITE, cadence_s=CADENCE_S, now=FakeClock(), sink=lambda a: None)
     assert policy.check_stall("ANY") is None, "no conn = no store to consult, not an alert"
-
-
-def test_confirmed_serial_reset_pages_once_and_names_both_serials(tmp_path: Path) -> None:
-    """The loop's confirmed reset is one critical page, not a per-tick nag."""
-    from gateclerk.agent_alert import AlertPolicy
-    from gateclerk.agent_loop import SerialReset, TickResult
-
-    events: list[Any] = []
-    policy = AlertPolicy(
-        site=SITE,
-        cadence_s=CADENCE_S,
-        now=FakeClock(),
-        sink=events.append,
-        park_dir=tmp_path / "park",
-    )
-    reset = SerialReset(
-        old_serial=5742,
-        new_serial=3,
-        old_firmware="V3.2.30",
-        new_firmware="V4.13.0",
-    )
-    first = policy.handle_tick(
-        TickResult(device_serial="MASKED-SER-1", ok=True, serial_reset=reset)
-    )
-    assert len(first) == 1
-    alert = first[0]
-    assert alert.level == "critical" and alert.kind == "serial_reset"
-    assert "5742" in alert.note and " 3 " in alert.note
-    assert "V3.2.30" in alert.note and "V4.13.0" in alert.note
-    assert len(events) == 1 and policy.counters["serial_reset"] == 1
-
-    # The same episode re-confirmed (e.g. a kill before the checkpoint rewind) is silent.
-    again = policy.handle_tick(
-        TickResult(device_serial="MASKED-SER-1", ok=True, serial_reset=reset)
-    )
-    assert again == [] and len(events) == 1

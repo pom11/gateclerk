@@ -57,14 +57,7 @@ from typing import Any
 from gateclerk.agent_db import connect
 from gateclerk.agent_push import Transport as PushTransport
 from gateclerk.agent_push import device_users_line
-from gateclerk.agent_store import (
-    Checkpoint,
-    CheckpointRegressionError,
-    advance_checkpoint,
-    read_checkpoint,
-    reset_checkpoint,
-    store_events,
-)
+from gateclerk.agent_store import Checkpoint, advance_checkpoint, read_checkpoint, store_events
 from gateclerk.config import DeviceTarget, resolve_credentials
 from gateclerk.exceptions import IsapiError
 from gateclerk.isapi_transport import IsapiClient
@@ -90,7 +83,6 @@ __all__ = [
     "DEFAULT_DEVICE_USERS_INTERVAL_S",
     "DeviceLoop",
     "DeviceUsersResult",
-    "SerialReset",
     "TickResult",
     "build_device_loop",
     "run_forever",
@@ -102,26 +94,6 @@ __all__ = [
 #: operator-invoked), not a systemd unit's first five minutes. The overlap margin on
 #: top means the first window and the second one still overlap like every later pair.
 _COLD_START_BACK = "cadence + overlap"
-
-#: A real serial reset starts serialNo over at (near) 0, so the device's newest serial
-#: lands thousands below the checkpoint. A completed overlap window ALWAYS contains
-#: the event that set the checkpoint, so a newest serial merely a few counts lower is
-#: not a reset candidate: it is a device glitch and the tick refuses (no rewind).
-#: This floor is the "far below" half of the evidence; a changed firmware version
-#: (deviceInfo, read fresh only on suspicion) is the other, and either one is enough
-#: once the newest serial is strictly below the checkpoint. 100 serials is ~100 min
-#: of site-a's 1/min noise stream, well above any overlap or paging jitter.
-RESET_MIN_SERIAL_DROP = 100
-
-
-@dataclass(frozen=True, slots=True)
-class SerialReset:
-    """One CONFIRMED serialNo reset: the checkpoint's generation and the new one."""
-
-    old_serial: int
-    new_serial: int
-    old_firmware: str | None
-    new_firmware: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,10 +137,6 @@ class TickResult:
     #: (paging.py:351) — the §2e `search_termination` observable: P2-06 reports it,
     #: so the loop hands it over instead of the health module re-walking anything.
     termination: str | None = None
-    #: Set ONLY on the tick that confirmed a serialNo reset and opened the new epoch.
-    #: P2-05 turns this into one critical alert naming both serials; later ticks leave
-    #: it None, so the incident never pages again.
-    serial_reset: SerialReset | None = None
 
 
 def _default_warn(text: str) -> None:
@@ -364,62 +332,9 @@ class DeviceLoop:
             counts = _WalkCounts()
             advanced = False
             checkpoint_serial: int | None = None
-            epoch = before.serial_epoch if before is not None else 0
-            current = before
-            reset: SerialReset | None = None
             for chunk_result in self._walk(since, until):
                 records = self._assemble(chunk_result)
-                newest, newest_time = _newest_serial_by_time(chunk_result.records)
-                if (
-                    current is not None
-                    and newest is not None
-                    and newest < current.checkpoint_serial
-                    and _is_after_checkpoint(newest_time, current, self.site_tz)
-                ):
-                    # A completed window whose newest serial is BELOW the checkpoint
-                    # means the device's counter moved backwards. That is never a mere
-                    # overlap (the checkpoint event is inside the overlap window). Only
-                    # confirmed evidence may rewind; otherwise fail loudly with the
-                    # checkpoint untouched and store nothing (a colliding new punch
-                    # must never overwrite an old row while the reset is unproven).
-                    evidence = self._reset_evidence(current, newest)
-                    if evidence is None:
-                        fresh_firmware = self._caps.firmware if self._caps is not None else None
-                        raise CheckpointRegressionError(
-                            f"device {self.device_serial!r} returned newest serial "
-                            f"{newest}, below checkpoint {current.checkpoint_serial}, "
-                            "but the fresh deviceInfo is not reset evidence (firmware "
-                            f"{current.firmware!r} -> {fresh_firmware!r}); "
-                            "refusing to rewind or store this chunk"
-                        )
-                    epoch = current.serial_epoch + 1
-                    stored, inserted, refreshed, unchanged = self._store_chunk(
-                        records, serial_epoch=epoch
-                    )
-                    counts.absorb(
-                        chunk_result, stored, inserted, refreshed, unchanged, len(records)
-                    )
-                    # Store first, then rewind: a kill in between leaves the new rows
-                    # durable under the new epoch and the old checkpoint intact. The
-                    # next tick re-confirms the reset; the fingerprint guard skips the
-                    # already-stored punches before it opens the next epoch.
-                    reset_checkpoint(
-                        self.conn,
-                        self.device_serial,
-                        expected_serial=current.checkpoint_serial,
-                        new_serial=newest,
-                        checkpoint_time=newest_time,
-                        firmware=self._caps.firmware if self._caps is not None else None,
-                        now=self._now(),
-                    )
-                    current = read_checkpoint(self.conn, self.device_serial)
-                    reset = evidence
-                    advanced = True
-                    checkpoint_serial = newest
-                    continue
-                stored, inserted, refreshed, unchanged = self._store_chunk(
-                    records, serial_epoch=epoch
-                )
+                stored, inserted, refreshed, unchanged = self._store_chunk(records)
                 counts.absorb(chunk_result, stored, inserted, refreshed, unchanged, len(records))
                 advance = advance_checkpoint(
                     self.conn,
@@ -428,15 +343,12 @@ class DeviceLoop:
                     completed=True,  # a yielded chunk IS completed (paging.py:612-615)
                     checkpoint_time=_device_time_of(chunk_result),
                     now=self._now(),
-                    serial_epoch=epoch,
-                    firmware=self._caps.firmware if self._caps is not None else None,
                 )
                 advanced = advanced or advance.advanced
                 if advance.checkpoint_serial is not None:
                     # Explicit None check: serial 0 is legitimate (serialNo counts up
                     # from 0; agent_store only refuses negatives) — `or` would drop it.
                     checkpoint_serial = advance.checkpoint_serial
-                current = read_checkpoint(self.conn, self.device_serial)
             checkpoint = read_checkpoint(self.conn, self.device_serial)
             return TickResult(
                 device_serial=self.device_serial,
@@ -457,7 +369,6 @@ class DeviceLoop:
                 checkpoint_time_before=(before.checkpoint_time if before else None),
                 advanced=advanced,
                 termination=counts.termination,
-                serial_reset=reset,
             )
         except Exception as exc:
             return self._failure(exc, since=since, until=until)
@@ -842,43 +753,6 @@ class DeviceLoop:
         self._claim_note = labels.note
         self._bootstrapped = True
 
-    def _reset_evidence(self, checkpoint: Checkpoint, newest: int) -> SerialReset | None:
-        """Confirm a serialNo reset from fresh deviceInfo — or return None.
-
-        The card's evidence, smallest form: the device's newest serial is STRICTLY
-        below the checkpoint (already checked by the caller) AND either the firmware
-        changed since the checkpoint was written, or the drop is far below it
-        (`RESET_MIN_SERIAL_DROP`). The firmware read is fresh and paid only on the
-        suspicious tick; it also refreshes capabilities because a new firmware can
-        change the advertised page limits. A same-firmware drop smaller than the floor
-        is a glitch, not a reset: the caller raises with the checkpoint untouched.
-        """
-        caps = read_capabilities(self.client, force_refresh=True)
-        if caps.serial != self.device_serial:
-            # The deviceInfo serialNumber is half the store key. Changing it is not
-            # an event-serial reset and silently adopting it would stamp new punches
-            # under the old identity; refuse until an operator resolves it.
-            raise IsapiError(
-                f"deviceInfo serialNumber changed from {self.device_serial!r} to "
-                f"{caps.serial!r}: that is a device identity change, not a serialNo "
-                "reset — refusing to store or rewind under the old identity"
-            )
-        self._caps = caps
-        old_firmware = checkpoint.firmware
-        new_firmware = caps.firmware
-        firmware_changed = (
-            old_firmware is not None and new_firmware is not None and old_firmware != new_firmware
-        )
-        far_below = checkpoint.checkpoint_serial - newest >= RESET_MIN_SERIAL_DROP
-        if not (firmware_changed or far_below):
-            return None
-        return SerialReset(
-            old_serial=checkpoint.checkpoint_serial,
-            new_serial=newest,
-            old_firmware=old_firmware,
-            new_firmware=new_firmware,
-        )
-
     def _window(self) -> tuple[datetime, datetime]:
         """`[checkpoint_time - overlap_s, now]`, or the cold-start floor (module doc).
 
@@ -958,9 +832,7 @@ class DeviceLoop:
             records.append(record)
         return records
 
-    def _store_chunk(
-        self, records: list[Any], *, serial_epoch: int = 0
-    ) -> tuple[int, int, int, int]:
+    def _store_chunk(self, records: list[Any]) -> tuple[int, int, int, int]:
         """Store one completed chunk; return (stored, inserted, refreshed, unchanged).
 
         `unchanged` is the card's "overlap re-read was FREE" counter. The
@@ -981,14 +853,13 @@ class DeviceLoop:
         fresh = []
         skipped = 0
         for record in records:
-            # Static SQL, indexed point lookup (events_key covers all three columns):
-            # the overlap pages are ~10-20 rows (§2a math), so a per-row probe beats
-            # any dynamic IN-list (and any reason for ruff's S608 to exist here).
+            # Static SQL, indexed point lookup (events_key covers both columns): the
+            # overlap pages are ~10-20 rows (§2a math), so a per-row probe beats any
+            # dynamic IN-list (and any reason for ruff's S608 to exist here).
             row = (
                 self.conn.execute(
-                    "SELECT jsonl FROM events WHERE device_serial = ?"
-                    " AND serial_epoch = ? AND serial_no = ?",
-                    (self.device_serial, serial_epoch, record.serial_no),
+                    "SELECT jsonl FROM events WHERE device_serial = ? AND serial_no = ?",
+                    (self.device_serial, record.serial_no),
                 ).fetchone()
                 if record.serial_no is not None
                 else None
@@ -998,7 +869,7 @@ class DeviceLoop:
                 skipped += 1  # identical bytes already durable (first-seen stamp kept)
                 continue
             fresh.append(record)
-        result = store_events(self.conn, fresh, now=self._now(), serial_epoch=serial_epoch)
+        result = store_events(self.conn, fresh, now=self._now())
         unchanged = skipped + result.unchanged
         stored_count = result.inserted + result.refreshed + unchanged
         return stored_count, result.inserted, result.refreshed, unchanged
@@ -1082,41 +953,6 @@ def _is_free_reread(stored_jsonl: str, record: Any) -> bool:
     return {k: v for k, v in stored.items() if k != "captured_at"} == {
         k: v for k, v in fresh.items() if k != "captured_at"
     }
-
-
-def _newest_serial_by_time(records: Sequence[Mapping[str, Any]]) -> tuple[int | None, str | None]:
-    """The serialNo and device-local `time` of the NEWEST-by-time record in a chunk.
-
-    Device pages are oldest-first (`timeReverseOrder=False`), so the last record with
-    an integer serialNo is the newest event the device holds up to `until`. That is the
-    number the reset check needs: `max(serialNo)` in an overlap window can still be an
-    OLD high serial while the new generation has restarted at 1, so it cannot answer
-    "did the counter move backwards?". A missing time is returned honestly as None.
-    """
-    for raw in reversed(records):
-        serial = raw.get("serialNo")
-        if isinstance(serial, int):
-            value = raw.get("time")
-            return serial, value.strip() if isinstance(value, str) and value.strip() else None
-    return None, None
-
-
-def _is_after_checkpoint(stamp: str | None, checkpoint: Checkpoint, site_tz: str | None) -> bool:
-    """True when `stamp` is strictly later than the checkpoint's device-local time.
-
-    Old overlap records can carry serials below the checkpoint (the checkpoint event
-    may sit in a later chunk); only a record whose DEVICE time is past the checkpoint
-    can be part of a new generation. An absent time cannot prove that, so it is not
-    evidence (the caller then treats the chunk as a normal overlap).
-    """
-    if stamp is None or checkpoint.checkpoint_time is None:
-        return False
-    try:
-        return _parse_stamp(stamp, site_tz=site_tz) > _parse_stamp(
-            checkpoint.checkpoint_time, site_tz=site_tz
-        )
-    except Exception:
-        return False
 
 
 def _device_time_of(chunk_result: ChunkResult) -> str | None:
