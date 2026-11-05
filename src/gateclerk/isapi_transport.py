@@ -162,6 +162,7 @@ class IsapiClient:
         now: Callable[[], float] = time.monotonic,
         transport: httpx.BaseTransport | None = None,
         client: httpx.Client | None = None,
+        trust_env: bool = True,
     ) -> None:
         if not base_url.startswith(("http://", "https://")):
             # ISAPI lives on 80/443. Port 8000 is Hikvision's private SDK protocol
@@ -171,17 +172,26 @@ class IsapiClient:
                 "ISAPI is HTTP on 80 / HTTPS on 443 — port 8000 is the SDK protocol port."
             )
         self._auth = httpx.DigestAuth(username, password)
-        self._client = client or httpx.Client(
-            base_url=base_url,
-            transport=transport,
-            timeout=httpx.Timeout(
-                read=read_timeout,
-                connect=connect_timeout,
-                write=connect_timeout,
-                pool=connect_timeout,
-            ),
-            headers={"User-Agent": "gateclerk/0.1 (read-only)"},
-        )
+        if client is None:
+            # `trust_env=False` is doctor's own NO_PROXY promise (module docstring law) and
+            # demo_walkthrough's (§4.1): httpx's default True would route a LAN-device GET
+            # through whatever proxy the operator's shell exports, and the failure reads as
+            # "device unreachable" (exit 4) when the device was never addressed. httpx's own
+            # Client parameter states it; the injected `transport`/`client` seams keep
+            # precedence for the offline suite and the write transports.
+            client = httpx.Client(
+                base_url=base_url,
+                transport=transport,
+                trust_env=trust_env,
+                timeout=httpx.Timeout(
+                    read=read_timeout,
+                    connect=connect_timeout,
+                    write=connect_timeout,
+                    pool=connect_timeout,
+                ),
+                headers={"User-Agent": "gateclerk/0.1 (read-only)"},
+            )
+        self._client = client
         self._busy_max_attempts = busy_max_attempts
         self._busy_base = busy_backoff_base
         self._busy_cap = busy_backoff_cap
