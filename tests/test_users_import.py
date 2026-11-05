@@ -41,6 +41,7 @@ from gateclerk.users_import import (
     run_import,
     write_template,
 )
+from test_cli import _clean as strip_ansi
 
 RECORDED = Path(__file__).parent / "fixtures/recorded/site-a-ds-k1t341amf-s"
 SAMPLE = Path(__file__).parent / "fixtures/users_import_sample.xlsx"
@@ -131,11 +132,14 @@ def test_template_headers_text_formats_and_reload(tmp_path: Path) -> None:
 
 def test_cli_help_and_template_command(tmp_path: Path) -> None:
     pytest.importorskip("openpyxl")
-    help_result = runner.invoke(cli_mod.app, ["users", "import", "--help"])
+    # Pin the render width so rich cannot wrap a flag mid-token, then strip the styling
+    # spans it inserts inside option names ("--" and "apply") before matching.
+    help_result = runner.invoke(cli_mod.app, ["users", "import", "--help"], env={"COLUMNS": "200"})
     assert help_result.exit_code == 0
-    assert "--apply" in help_result.stdout
-    assert "--expect-serial" in help_result.stdout
-    assert "--map" in help_result.stdout
+    help_output = strip_ansi(help_result.stdout)
+    assert "--apply" in help_output
+    assert "--expect-serial" in help_output
+    assert "--map" in help_output
 
     out = tmp_path / "blank.xlsx"
     result = runner.invoke(cli_mod.app, ["users", "template", str(out)])
