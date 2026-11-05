@@ -139,7 +139,9 @@ EXPECTED_LEAVES: set[str] = {
     "sink remove",
     "sink test",
     "status",
+    "users import",
     "users list",
+    "users template",
 }
 
 
@@ -150,11 +152,13 @@ EXPECTED_LEAVES: set[str] = {
 #: "`-o json` on every READ-ish command"; these are not reads — they start a process, so
 #: there is no record set to frame, only a startup line. `agent run` DOES carry `-o` (it
 #: renders its health/final snapshot through the shared renderer), so the exemption is not
-#: "anything long-running", it is "this command prints no records at all".
+#: "anything long-running", it is "this command prints no records at all". `users template`
+#: writes a local blank workbook and prints one path line, so it is not a record stream
+#: either.
 #:
 #: The list is asserted to be exactly these, so a new read command cannot join it as a way
 #: of dodging the guard: adding a name here is a visible, reviewable act.
-NO_OUTPUT_FLAG_LEAVES: frozenset[str] = frozenset({"demo device serve"})
+NO_OUTPUT_FLAG_LEAVES: frozenset[str] = frozenset({"demo device serve", "users template"})
 
 
 def test_every_leaf_command_declares_output_json() -> None:
@@ -168,8 +172,9 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 34 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 34
+    # 34 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
+    # `users import` / `users template`.
+    assert len(leaves) == len(EXPECTED_LEAVES) == 36
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"

@@ -1069,6 +1069,8 @@ _HISTORICAL_HEADS: tuple[str, ...] = ("device", "users", "creds", "events")
 #: recorded rather than silently normalized.
 AUTHORISED_GROUP_ADDITIONS: dict[str, set[str]] = {
     "creds": {"set", "get", "remove"},
+    # USERS-IMPORT-XLSX authorized the Excel front end on the existing users group.
+    "users": {"import", "template"},
 }
 
 
