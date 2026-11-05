@@ -229,6 +229,9 @@ class HealthSnapshot:
     agent_version: str
     status: str  # "ok" | "degraded"
     reasons: tuple[str, ...]
+    #: Threshold the health surface reports. The paging semantics live in
+    #: AlertPolicy.check_stall: "stall" now means EVIDENCE OF LOSS (a failing poll
+    #: or a rising oldest serial), never the mere silence of a quiet door.
     checkpoint_stall_s: float
     devices: tuple[DeviceHealth, ...]
     site_metrics: tuple[MetricLine, ...]

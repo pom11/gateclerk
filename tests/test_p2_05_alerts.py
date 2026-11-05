@@ -40,6 +40,7 @@ from gateclerk.isapi_transport import IsapiClient
 from gateclerk.tz import DeviceTime, compute_skew
 from test_p2_03_scheduler import (
     CADENCE_S,
+    EVENT_PATH,
     OVERLAP_S,
     SITE,
     SITE_TZ,
@@ -500,16 +501,13 @@ def test_skew_over_threshold_warns_under_is_silent(tmp_path: Path) -> None:
     assert [a.kind for a in h.alerts].count("clock_skew") == 2
 
 
-# --- DoD (7): stall detector fires at k=3 cadences, silences when checkpoint moves ---------
+# --- DoD (7): stall = EVIDENCE OF LOSS (failing poll / serial floor), never silence ---
 
 
-def test_checkpoint_stall_fires_at_three_cadences_and_silences_when_it_moves(
-    tmp_path: Path,
-) -> None:
-    """DESIGN OQ4: a checkpoint that stops moving means the ring is rolling — punches
-    are being LOST. k=3 cadences (module constant; no config key exists — see impl
-    comment): age over -> critical exactly once; checkpoint moves again -> episode
-    closed, and a later stall can fire fresh.
+def test_checkpoint_stall_is_quiet_on_a_quiet_device(tmp_path: Path) -> None:
+    """STALL-ALERT-FALSE: a checkpoint only moves on major=5 punches, so a quiet
+    door (night/lunch) looks frozen while every poll SUCCEEDS and returns nothing
+    newer. That is silence, not a stall — no alert however old the checkpoint gets.
     """
     device = seeded_device()
     seed_events(device, [device_event(60, "2026-10-19T09:58:00")])
@@ -521,28 +519,93 @@ def test_checkpoint_stall_fires_at_three_cadences_and_silences_when_it_moves(
     assert serial is not None
     assert h.policy.check_stall(serial) is None, "a fresh checkpoint is quiet"
 
-    # Boundary, watermark precedent (agent_store.check_db_watermark "exactly-at is
-    # not over"): age of EXACTLY k*cadence is still quiet; one second past fires.
-    # Without this pin, `<= threshold` mutated to `< threshold` would survive.
-    h.clock.advance(3 * CADENCE_S)  # updated_at was T0; age is now exactly 3*cadence
+    # Four quiet cadences: every poll succeeds, every poll is a FREE overlap re-read
+    # (advanced=False). The checkpoint is now older than k=3 cadences.
+    for _ in range(4):
+        h.clock.advance(CADENCE_S)
+        h.monotonic.advance(CADENCE_S)
+        quiet = h.tick()
+        assert quiet is not None and quiet.ok is True and quiet.advanced is False
+        assert h.policy.check_stall(serial) is None, "a successful quiet poll is not a stall"
+
+    assert h.alerts == []
+    assert h.policy.counters["checkpoint_stall"] == 0
+
+
+def test_checkpoint_stall_alerts_when_polls_fail(tmp_path: Path) -> None:
+    """A stale checkpoint PLUS a failing poll is evidence of loss: no successful poll
+    is proving the device has nothing newer. Boundary stays strictly-over k cadences.
+    """
+    device = seeded_device()
+    seed_events(device, [device_event(60, "2026-10-19T09:58:00")])
+    h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
+    first = h.tick()
+    serial = first.device_serial
+    assert serial is not None
+    assert h.policy.check_stall(serial) is None
+
+    # Break the event walk AFTER bootstrap, so the tick still knows its serial.
+    device.reset_raw("POST", EVENT_PATH, _bad_content())
+    h.clock.advance(3 * CADENCE_S)  # age is now exactly k*cadence: not OVER yet
+    h.monotonic.advance(3 * CADENCE_S)
+    failed = h.tick()
+    assert failed is not None and failed.ok is False and failed.device_serial == serial
+    assert isinstance(failed.exception, IsapiBadContent)
     assert h.policy.check_stall(serial) is None, "exactly k cadences is not OVER k"
+
     h.clock.advance(1)
+    h.monotonic.advance(1)
+    failed = h.tick()
+    assert failed is not None and failed.ok is False
     fired = h.policy.check_stall(serial)
     assert fired is not None and fired.kind == "checkpoint_stall"
     assert fired.level == "critical"
     assert [a.kind for a in h.alerts] == ["checkpoint_stall"]
+    assert "poll FAILED" in fired.note
     assert h.policy.check_stall(serial) is None, "one page per stall episode, not per check"
 
-    # Checkpoint moves again -> episode closed: quiet now... (the event lands
-    # inside the window this tick walks: [checkpoint 09:58 - overlap, 10:22:30]).
+    # Heal the walk and move the checkpoint: the episode closes, so a later stall can
+    # page fresh instead of being swallowed by the old key.
+    device.raw.pop(f"POST {EVENT_PATH}", None)
     device.add_events(device_event(61, "2026-10-19T10:15:00"))
-    moved = h.tick()
-    assert moved is not None and moved.ok is True and moved.advanced is True
+    healed = h.tick()
+    assert healed is not None and healed.ok is True and healed.advanced is True
     assert h.policy.check_stall(serial) is None
-    # ...and a SECOND stall is a new incident (fresh page, not the same one nagging).
-    h.clock.advance(4 * CADENCE_S)
+
+
+def test_checkpoint_stall_alerts_when_the_oldest_serial_rises(tmp_path: Path) -> None:
+    """Serial-gap arm, pinned to OBSERVED.md "Retention / gaps" (line 411): "a
+    monotonic increase of the minimum = rolling started = punches are being lost".
+    The store floor rising is the near-side form of that loss event.
+    """
+    device = seeded_device()
+    seed_events(
+        device,
+        [
+            device_event(60, "2026-10-19T09:58:00"),
+            device_event(61, "2026-10-19T09:59:00"),
+            device_event(62, "2026-10-19T10:00:00"),
+        ],
+    )
+    h = PolicyHarness(tmp_path, device, client_password=PASSWORD_OK)
+    first = h.tick()
+    serial = first.device_serial
+    assert serial is not None
+    assert h.policy.check_stall(serial) is None, "first check records the floor baseline"
+
+    # The floor moves from 60 to 61 while the checkpoint stays fresh: the events below
+    # it are gone, which is the loss signal regardless of checkpoint age.
+    h.conn.execute("DELETE FROM events WHERE device_serial = ? AND serial_no < ?", (serial, 61))
+    fired = h.policy.check_stall(serial)
+    assert fired is not None and fired.kind == "checkpoint_stall"
+    assert fired.level == "critical"
+    assert "oldest serialNo rose 60 -> 61" in fired.note
+    assert h.policy.check_stall(serial) is None, "a flat floor does not nag"
+
+    # A second rise is a NEW loss incident (fresh page).
+    h.conn.execute("DELETE FROM events WHERE device_serial = ? AND serial_no < ?", (serial, 62))
     again = h.policy.check_stall(serial)
-    assert again is not None and again.kind == "checkpoint_stall"
+    assert again is not None and "61 -> 62" in again.note
     assert [a.kind for a in h.alerts].count("checkpoint_stall") == 2
 
 

@@ -74,6 +74,7 @@ __all__ = [
     "event_jsonl",
     "event_rowid",
     "read_checkpoint",
+    "read_oldest_serial",
     "store_events",
 ]
 
@@ -344,6 +345,24 @@ SET checkpoint_serial = excluded.checkpoint_serial,
 WHERE excluded.checkpoint_serial > checkpoint.checkpoint_serial
 RETURNING checkpoint_serial
 """
+
+
+def read_oldest_serial(conn: sqlite3.Connection, device_serial: str) -> int | None:
+    """The store's floor for one device: ``MIN(serial_no)``, or None with no rows.
+
+    DESIGN.md OQ4 names this number as the ring-rolling detector's input: "the agent
+    must record oldest-serialNo per poll (a monotonic increase of the minimum =
+    rolling started = punches are being lost)". In THIS store (§2b keep-everything)
+    the minimum only rises when rows the agent already kept are gone — the same
+    loss event seen from the near side. P2-05's ``check_stall`` reads it as
+    evidence-of-loss; the health surface keeps its own metric line (agent_health
+    renders `oldest_serial` from the same table, NOTES-p2-06: "no fabrication").
+    """
+    row = conn.execute(
+        "SELECT MIN(serial_no) m FROM events WHERE device_serial = ?",
+        (device_serial,),
+    ).fetchone()
+    return row["m"]
 
 
 def advance_checkpoint(
