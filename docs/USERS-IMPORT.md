@@ -79,8 +79,20 @@ this import, and keep the `employeeNo` value identical on both sides.
    re-run reads first and skips what already landed, so an interrupted run is safe to
    resume.
 
+Every plan prints the target's model and serial (read from `System/deviceInfo`).
+`--apply` requires `--expect-serial SERIAL`: copy the serial from the dry run, and a
+different terminal is refused before any write with a non-zero exit. This is the guard
+against enrolling cards on the wrong door when both the old and new units are reachable.
+
 Card numbers are masked to the last four characters in plans and logs. The per-row audit
 CSV (`--results`, default next to the workbook) is the only output with full card numbers.
+
+`employeeNo` and `cardNo` cells must be **Text** in Excel. A numeric cell is refused with
+a "format the column as Text" reason rather than silently rounding a 19-digit card
+number or dropping leading zeros. `gateclerk users template` pre-formats both columns as
+Text. Date/datetime cells in `validFrom`/`validTo` are converted to the device's
+`YYYY-MM-DDTHH:MM:SS` form; text cells must already use that form, and
+`validFrom >= validTo` is refused.
 
 ## Examples
 
@@ -90,16 +102,17 @@ Dry run (default — no device write):
 gateclerk users import users.xlsx --host <device-host> --user admin
 ```
 
-Apply:
+Apply (the serial is the one the dry run printed):
 
 ```bash
-gateclerk users import users.xlsx --host <device-host> --user admin --apply
+gateclerk users import users.xlsx --host <device-host> --user admin \
+  --apply --expect-serial <serial-from-the-dry-run>
 ```
 
 Choose where the journal and audit file go:
 
 ```bash
-gateclerk users import users.xlsx --apply \
+gateclerk users import users.xlsx --apply --expect-serial <serial> \
   --journal ./private/users.journal.jsonl \
   --results ./private/users.results.csv
 ```

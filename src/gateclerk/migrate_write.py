@@ -859,8 +859,17 @@ def _check_vocabulary(body: dict[str, Any], *, probe: CapabilityMatrix | None) -
     """userType / Valid.timeType against the probe's caps ``@opt`` vocabulary."""
     if probe is None:
         return
-    caps = probe.caps_raw.get("user_info_capabilities")
-    section = caps.get("UserInfoCap") if isinstance(caps, Mapping) else None
+    section: Mapping[str, Any] | None = None
+    for key in ("caps_user_info", "user_info_capabilities"):
+        caps = probe.caps_raw.get(key)
+        if not isinstance(caps, Mapping):
+            continue
+        # Real device document: {"UserInfo": {...}}; keep the old spelling readable
+        # for hand-assembled matrices.
+        candidate = caps.get("UserInfo") or caps.get("UserInfoCap")
+        if isinstance(candidate, Mapping):
+            section = candidate
+            break
     if not isinstance(section, Mapping):
         return
     _check_opt(body.get("userType"), section.get("userType"), "userType", probe)

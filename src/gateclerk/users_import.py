@@ -27,14 +27,16 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from pathlib import Path
 from time import sleep as _sleep
 from typing import Any
 
+from gateclerk.capabilities import device_identity
 from gateclerk.exceptions import GateClerkError
 from gateclerk.migrate_apply import CardWriteTransport, UserWriteTransport, reader_for
 from gateclerk.migrate_diff import DEFAULT_CARRIED_TEMPLATE_NO
@@ -70,8 +72,13 @@ __all__ = [
     "DEFAULT_COLUMNS",
     "DEFAULT_VALID_FROM",
     "DEFAULT_VALID_TO",
+    "DEVICE_TIME_FORMAT",
+    "DEVICE_TIME_HUMAN",
     "JOURNAL_PHASE",
     "OPTIONAL_COLUMNS",
+    "TEMPLATE_TEXT_ROWS",
+    "DeviceMismatchError",
+    "DeviceSerialRequiredError",
     "DialectVerdict",
     "ExcelExtraMissingError",
     "ImportAction",
@@ -106,6 +113,15 @@ DEFAULT_CARD_TYPE = "normalCard"
 DEFAULT_VALID_FROM = "2000-01-01T00:00:00"
 DEFAULT_VALID_TO = "2037-12-31T23:59:59"
 
+#: The device's own wall-time spelling (`Valid.beginTime`/`endTime`).
+DEVICE_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+DEVICE_TIME_HUMAN = "YYYY-MM-DDTHH:MM:SS"
+_DEVICE_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\Z")
+
+#: How far down the template pre-formats employeeNo/cardNo as Text. Excel's default
+#: for a general cell is Number, and a 19-digit card silently rounds past 2^53.
+TEMPLATE_TEXT_ROWS = 1000
+
 JOURNAL_PHASE = "users-import"
 
 #: The captured user vocabulary (users_setup_add_request.json). Only these values
@@ -129,6 +145,14 @@ class ImportFileError(UsersImportError):
 
 class DialectRefusedError(UsersImportError):
     """The device caps did not confirm the captured flat SetUp wrapper."""
+
+
+class DeviceSerialRequiredError(UsersImportError):
+    """``--apply`` was requested without the serial guard that names the target."""
+
+
+class DeviceMismatchError(UsersImportError):
+    """The target device is not the serial the operator expected; nothing written."""
 
 
 def _require_openpyxl() -> Any:
@@ -159,6 +183,63 @@ def _cell_text(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def _text_identity_cell(value: Any, field: str) -> tuple[str, str | None]:
+    """employeeNo/cardNo must be TEXT; a numeric cell has already lost digits.
+
+    Excel stores a general cell as a float, so 1234567890123456789 becomes
+    1234567890123457024 (and leading zeros vanish) before this code sees it. There is
+    no safe way to recover the operator's intent, so the row is refused, never guessed.
+    """
+    if value is None:
+        return "", None
+    if isinstance(value, str):
+        return value.strip(), None
+    return (
+        "",
+        f"{field} cell is not text (Excel type {type(value).__name__}); format the "
+        f"{field} column as Text before importing so digits and leading zeros survive",
+    )
+
+
+def _device_time_cell(value: Any, field: str) -> tuple[str | None, str | None]:
+    """An Excel date/datetime cell -> the device's ``YYYY-MM-DDTHH:MM:SS`` form.
+
+    Text is accepted only in exactly that form and must be a real calendar instant.
+    Anything else is a row problem: a silently mangled validity window can disable a
+    card without an error at write time.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, datetime):
+        return value.strftime(DEVICE_TIME_FORMAT), None
+    if isinstance(value, date):
+        return f"{value.strftime('%Y-%m-%d')}T00:00:00", None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None, None
+        if not _DEVICE_TIME_RE.fullmatch(text):
+            return (
+                None,
+                f"{field} {text!r} is not {DEVICE_TIME_HUMAN}; format the cell as Text "
+                "using that form",
+            )
+        try:
+            datetime.strptime(text, DEVICE_TIME_FORMAT).replace(tzinfo=UTC)
+        except ValueError:
+            return (
+                None,
+                f"{field} {text!r} is not a real date/time; format the cell as Text "
+                f"using {DEVICE_TIME_HUMAN}",
+            )
+        return text, None
+    return (
+        None,
+        f"{field} cell is neither text nor an Excel date; format the column as Text "
+        f"using {DEVICE_TIME_HUMAN}",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,32 +338,51 @@ def read_import_rows(
         for line, values in enumerate(rows, start=2):
             if not any(_cell_text(value) for value in values):
                 continue
-            fields = {
-                name: _cell_text(values[index]) if index < len(values) else ""
+            raw = {
+                name: values[index] if index < len(values) else None
                 for name, index in index_of.items()
             }
-            employee_no = fields.get("employeeNo", "")
-            name = fields.get("name", "")
-            card_no = fields.get("cardNo", "")
+            employee_no, employee_problem = _text_identity_cell(raw.get("employeeNo"), "employeeNo")
+            card_no, card_problem = _text_identity_cell(raw.get("cardNo"), "cardNo")
+            name = _cell_text(raw.get("name"))
+            valid_from, from_problem = _device_time_cell(raw.get("validFrom"), "validFrom")
+            valid_to, to_problem = _device_time_cell(raw.get("validTo"), "validTo")
+            problems = [
+                problem
+                for problem in (
+                    employee_problem,
+                    card_problem,
+                    from_problem,
+                    to_problem,
+                )
+                if problem
+            ]
             missing = [
                 label
-                for label, value in (
-                    ("employeeNo", employee_no),
-                    ("name", name),
-                    ("cardNo", card_no),
+                for label, value, problem in (
+                    ("employeeNo", employee_no, employee_problem),
+                    ("name", name, None),
+                    ("cardNo", card_no, card_problem),
                 )
-                if not value
+                if not value and problem is None
             ]
+            if missing:
+                problems.append("missing " + ", ".join(missing))
+            if from_problem is None and to_problem is None:
+                effective_from = valid_from or DEFAULT_VALID_FROM
+                effective_to = valid_to or DEFAULT_VALID_TO
+                if effective_from >= effective_to:
+                    problems.append("validFrom must be before validTo")
             parsed.append(
                 ImportRow(
                     line=line,
                     employee_no=employee_no,
                     name=name,
                     card_no=card_no,
-                    card_type=fields.get("cardType") or DEFAULT_CARD_TYPE,
-                    valid_from=fields.get("validFrom") or None,
-                    valid_to=fields.get("validTo") or None,
-                    problem=("missing " + ", ".join(missing) if missing else None),
+                    card_type=_cell_text(raw.get("cardType")) or DEFAULT_CARD_TYPE,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    problem="; ".join(problems) if problems else None,
                 )
             )
     finally:
@@ -319,6 +419,11 @@ def write_template(path: str | os.PathLike[str]) -> Path:
     worksheet = workbook.active
     worksheet.title = "users"
     worksheet.append(list(ALL_COLUMNS))
+    # Text-format the join key and credential columns far enough down that an
+    # operator pasting a roster cannot silently float a 19-digit card number.
+    for row in range(1, TEMPLATE_TEXT_ROWS + 1):
+        worksheet.cell(row=row, column=1).number_format = "@"
+        worksheet.cell(row=row, column=3).number_format = "@"
     workbook.save(target)
     return target
 
@@ -383,22 +488,31 @@ class DialectVerdict:
         }
 
 
-def _caps_section(caps: Mapping[str, Any] | None, *keys: str) -> Mapping[str, Any] | None:
+def _caps_section(
+    caps: Mapping[str, Any] | None, section_name: str, *keys: str
+) -> Mapping[str, Any] | None:
+    """The real device documents wrap the body as ``{"UserInfo": {...}}`` /
+    ``{"CardInfo": {...}}`` (captured docs, not the invented ``*Cap`` spelling)."""
     if not isinstance(caps, Mapping):
         return None
+    bodies: list[Mapping[str, Any]] = []
     for key in keys:
         body = caps.get(key)
         if isinstance(body, Mapping):
-            section = body.get("UserInfoCap") or body.get("CardInfoCap")
-            if isinstance(section, Mapping):
-                return section
+            bodies.append(body)
+    if any(name in caps for name in ("UserInfo", "CardInfo")):
+        bodies.append(caps)
+    for body in bodies:
+        section = body.get(section_name)
+        if isinstance(section, Mapping):
+            return section
     return None
 
 
 def dialect_verdict(caps_raw: Mapping[str, Any] | None) -> DialectVerdict:
     """Confirm the captured flat ``SetUp`` wrapper from the device's caps claims."""
-    user_section = _caps_section(caps_raw, "user_info_capabilities", "caps_user_info")
-    card_section = _caps_section(caps_raw, "card_info_capabilities", "caps_card_info")
+    user_section = _caps_section(caps_raw, "UserInfo", "user_info_capabilities", "caps_user_info")
+    card_section = _caps_section(caps_raw, "CardInfo", "card_info_capabilities", "caps_card_info")
 
     def _set_up(section: Mapping[str, Any] | None) -> bool:
         if section is None:
@@ -466,14 +580,14 @@ def assess_dialect(caps_raw: Mapping[str, Any] | None, note: str | None = None) 
 def card_capacity_from_caps(probe: CapabilityMatrix | None) -> int | None:
     """Per-person card capacity where the caps advertise it; None when they do not.
 
-    No committed bench-A capture names a per-person card maximum (CardInfoCap's
+    No committed real capture names a per-person card maximum (``CardInfo``'s
     ``maxRecordNum`` is the search page cap, not capacity), so silence stays None and
     the plan says so. A device that DOES advertise ``numOfCard``/``maxCardNum`` is
     enforced before any write.
     """
     caps = getattr(probe, "caps_raw", None)
-    user_section = _caps_section(caps, "user_info_capabilities", "caps_user_info")
-    card_section = _caps_section(caps, "card_info_capabilities", "caps_card_info")
+    user_section = _caps_section(caps, "UserInfo", "user_info_capabilities", "caps_user_info")
+    card_section = _caps_section(caps, "CardInfo", "card_info_capabilities", "caps_card_info")
     for section, name in (
         (user_section, "numOfCard"),
         (user_section, "maxCardNum"),
@@ -524,6 +638,8 @@ class ImportPlan:
     card_capacity: int | None = None
     users_skipped: tuple[tuple[str, str], ...] = ()
     notes: tuple[str, ...] = ()
+    device_model: str | None = None
+    device_serial: str | None = None
 
     @property
     def users(self) -> tuple[UserWrite, ...]:
@@ -549,6 +665,7 @@ class ImportPlan:
             "counts": self.counts(),
             "dialect": self.dialect.summary(),
             "cardCapacity": self.card_capacity,
+            "device": {"model": self.device_model, "serial": self.device_serial},
             "notes": list(self.notes),
         }
 
@@ -589,6 +706,8 @@ def plan_import(
     probe: CapabilityMatrix | None = None,
     dialect: DialectVerdict | None = None,
     capacity: int | None = None,
+    device_model: str | None = None,
+    device_serial: str | None = None,
 ) -> ImportPlan:
     """Classify every row against the device's CURRENT users and cards.
 
@@ -722,6 +841,8 @@ def plan_import(
         card_capacity=cap,
         users_skipped=tuple(skipped_users),
         notes=tuple(notes),
+        device_model=device_model,
+        device_serial=device_serial,
     )
 
 
@@ -881,12 +1002,36 @@ def run_import(
     sheet: str | None = None,
     mapping: Mapping[str, str] | None = None,
     apply: bool = False,
+    expect_serial: str | None = None,
     journal_path: str | os.PathLike[str] | None = None,
     results_path: str | os.PathLike[str] | None = None,
     sleep: Callable[[float], None] = _sleep,
 ) -> ImportReport:
     """Read the workbook and the target, plan, and (only with ``apply``) write."""
+    if apply and not (expect_serial and expect_serial.strip()):
+        raise DeviceSerialRequiredError(
+            "--apply requires --expect-serial SERIAL: run the dry run first and copy "
+            "the target serial it prints, so an import cannot land on the wrong terminal"
+        )
     rows = read_import_rows(xlsx, sheet=sheet, mapping=mapping)
+    try:
+        identity_body = client.get("device_info")
+    except GateClerkError as exc:
+        raise UsersImportError(f"cannot read deviceInfo to guard the target: {exc}") from exc
+    serial, _firmware, model = device_identity(identity_body)
+    serial = serial.strip() if serial else None
+    expected = expect_serial.strip() if expect_serial else None
+    if apply:
+        if serial is None:
+            raise DeviceMismatchError(
+                "deviceInfo carried no serialNumber, so the --expect-serial guard cannot "
+                "confirm this is the intended terminal; nothing was written"
+            )
+        if serial != expected:
+            raise DeviceMismatchError(
+                f"refusing to write: target serial {serial!r} does not match "
+                f"--expect-serial {expected!r}; nothing was written"
+            )
     caps_raw, caps_note = read_device_caps(client)
     verdict = assess_dialect(caps_raw, caps_note)
     probe = CapabilityMatrix(
@@ -902,6 +1047,8 @@ def run_import(
         target_cards=state.cards,
         probe=probe,
         dialect=verdict,
+        device_model=model,
+        device_serial=serial,
     )
     if not apply:
         return ImportReport(confirm=False, plan=plan)

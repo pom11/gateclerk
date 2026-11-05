@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,9 @@ from fakedevice import BASE_URL, FakeDevice
 from gateclerk.isapi_transport import IsapiClient
 from gateclerk.migrate_probe import CapabilityMatrix
 from gateclerk.users_import import (
+    TEMPLATE_TEXT_ROWS,
+    DeviceMismatchError,
+    DeviceSerialRequiredError,
     DialectRefusedError,
     DialectVerdict,
     ExcelExtraMissingError,
@@ -29,6 +33,8 @@ from gateclerk.users_import import (
     ImportFileError,
     ImportRow,
     build_user_record,
+    card_capacity_from_caps,
+    dialect_verdict,
     plan_import,
     read_import_rows,
     render_plan_rows,
@@ -38,13 +44,22 @@ from gateclerk.users_import import (
 
 RECORDED = Path(__file__).parent / "fixtures/recorded/site-a-ds-k1t341amf-s"
 SAMPLE = Path(__file__).parent / "fixtures/users_import_sample.xlsx"
+REAL_CAPS = json.loads((Path(__file__).parent / "fixtures/users_import_real_caps.json").read_text())
+TARGET_MODEL = "DS-K1T341AMF-S"
+TARGET_SERIAL = "MASKED-SER-1"
 runner = CliRunner()
 
 
 def _device(*, users: list[dict] | None = None, cards: list[dict] | None = None, **caps: Any):
     device = FakeDevice(password=FAKE_PW)
     device.xml_ok("GET", DEVICE_INFO_PATH, (RECORDED / "device_info.xml").read_text())
-    device.install_enrollment(users=users or [], cards=cards or [], **caps)
+    device.install_enrollment(
+        users=users or [],
+        cards=cards or [],
+        caps_user_info=caps.pop("caps_user_info", REAL_CAPS["user_info_capabilities"]),
+        caps_card_info=caps.pop("caps_card_info", REAL_CAPS["card_info_capabilities"]),
+        **caps,
+    )
     device.install_write_capture(users=users or [], cards=cards or [])
     return device
 
@@ -77,14 +92,20 @@ def _ok_dialect() -> DialectVerdict:
 # --- template and optional extra ---------------------------------------------------------------
 
 
-def test_template_headers_and_missing_extra_message(tmp_path: Path, monkeypatch) -> None:
-    template = write_template(tmp_path / "template.xlsx")
-    rows = read_import_rows(template)
-    assert rows == ()
+def test_missing_extra_message_is_clean(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "openpyxl", None)
+    with pytest.raises(ExcelExtraMissingError, match=r"gateclerk\[excel\]"):
+        read_import_rows(tmp_path / "does-not-need-to-exist.xlsx")
 
+
+def test_template_headers_text_formats_and_reload(tmp_path: Path) -> None:
     openpyxl = pytest.importorskip("openpyxl")
-    workbook = openpyxl.load_workbook(template, read_only=True)
-    assert list(next(workbook.active.iter_rows(values_only=True))) == [
+    template = write_template(tmp_path / "template.xlsx")
+    assert read_import_rows(template) == ()
+
+    workbook = openpyxl.load_workbook(template)
+    worksheet = workbook.active
+    assert list(next(worksheet.iter_rows(values_only=True))) == [
         "employeeNo",
         "name",
         "cardNo",
@@ -92,23 +113,50 @@ def test_template_headers_and_missing_extra_message(tmp_path: Path, monkeypatch)
         "validFrom",
         "validTo",
     ]
+    for coordinate in ("A2", "C2", f"A{TEMPLATE_TEXT_ROWS}", f"C{TEMPLATE_TEXT_ROWS}"):
+        assert worksheet[coordinate].number_format == "@"
+
+    worksheet["A2"] = "000123"
+    worksheet["B2"] = "User E123"
+    worksheet["C2"] = "00123456789012345678"
+    workbook.save(template)
     workbook.close()
 
-    monkeypatch.setitem(sys.modules, "openpyxl", None)
-    with pytest.raises(ExcelExtraMissingError, match=r"gateclerk\[excel\]"):
-        read_import_rows(template)
+    rows = read_import_rows(template)
+    assert len(rows) == 1
+    assert rows[0].employee_no == "000123"
+    assert rows[0].card_no == "00123456789012345678"
+    assert rows[0].problem is None
 
 
 def test_cli_help_and_template_command(tmp_path: Path) -> None:
+    pytest.importorskip("openpyxl")
     help_result = runner.invoke(cli_mod.app, ["users", "import", "--help"])
     assert help_result.exit_code == 0
     assert "--apply" in help_result.stdout
+    assert "--expect-serial" in help_result.stdout
     assert "--map" in help_result.stdout
 
     out = tmp_path / "blank.xlsx"
     result = runner.invoke(cli_mod.app, ["users", "template", str(out)])
     assert result.exit_code == 0, result.stdout
     assert out.exists()
+
+
+def test_cli_apply_without_expect_serial_exits_nonzero(tmp_path: Path) -> None:
+    result = runner.invoke(
+        cli_mod.app,
+        [
+            "users",
+            "import",
+            str(tmp_path / "not-read.xlsx"),
+            "--host",
+            "127.0.0.1",
+            "--apply",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--expect-serial" in result.output
 
 
 # --- reading and mapping -----------------------------------------------------------------------
@@ -135,6 +183,64 @@ def test_read_rows_maps_headers_and_reports_bad_rows(tmp_path: Path) -> None:
 
     with pytest.raises(ImportFileError, match="missing required column"):
         read_import_rows(_workbook(tmp_path / "thin.xlsx", [], headers=["employeeNo", "name"]))
+
+
+def test_numeric_identity_cells_are_refused_not_rounded(tmp_path: Path) -> None:
+    path = _workbook(
+        tmp_path / "numeric.xlsx",
+        [
+            [1234567890123456789, "User E91", "90000091"],
+            ["92", "User E92", 1.23456789012e15],
+            ["00123", "User E123", "000456"],
+        ],
+    )
+    rows = read_import_rows(path)
+    assert rows[0].employee_no == ""
+    assert "employeeNo cell is not text" in (rows[0].problem or "")
+    assert "format the employeeNo column as Text" in (rows[0].problem or "")
+    assert "1234567890123457024" not in (rows[0].problem or "")
+    assert rows[1].card_no == ""
+    assert "cardNo cell is not text" in (rows[1].problem or "")
+    assert "format the cardNo column as Text" in (rows[1].problem or "")
+    assert rows[2].employee_no == "00123"
+    assert rows[2].card_no == "000456"
+    assert rows[2].problem is None
+
+
+def test_date_cells_normalize_and_invalid_windows_are_refused(tmp_path: Path) -> None:
+    path = _workbook(
+        tmp_path / "dates.xlsx",
+        [
+            [
+                "91",
+                "User E91",
+                "90000091",
+                "normalCard",
+                datetime(2026, 1, 1),  # noqa: DTZ001 - Excel dates are naive wall time
+                datetime(2026, 1, 2, 3, 4, 5),  # noqa: DTZ001 - Excel wall time
+            ],
+            ["92", "User E92", "90000092", "normalCard", "bad-date", "2037-12-31T23:59:59"],
+            [
+                "93",
+                "User E93",
+                "90000093",
+                "normalCard",
+                "2026-02-01T00:00:00",
+                "2026-01-01T00:00:00",
+            ],
+            ["94", "User E94", "90000094", "normalCard", date(2026, 3, 4), None],
+        ],
+        headers=["employeeNo", "name", "cardNo", "cardType", "validFrom", "validTo"],
+    )
+    rows = read_import_rows(path)
+    assert rows[0].valid_from == "2026-01-01T00:00:00"
+    assert rows[0].valid_to == "2026-01-02T03:04:05"
+    assert rows[0].problem is None
+    assert "validFrom 'bad-date'" in (rows[1].problem or "")
+    assert "YYYY-MM-DDTHH:MM:SS" in (rows[1].problem or "")
+    assert "validFrom must be before validTo" in (rows[2].problem or "")
+    assert rows[3].valid_from == "2026-03-04T00:00:00"
+    assert rows[3].problem is None
 
 
 # --- plan classification -----------------------------------------------------------------------
@@ -180,9 +286,33 @@ def test_plan_classifies_add_present_update_and_refusals() -> None:
     assert len(plan.cards) == 1
 
 
-def test_capacity_is_read_from_device_caps() -> None:
+def test_real_caps_confirm_dialect_and_have_no_per_person_capacity() -> None:
+    verdict = dialect_verdict(REAL_CAPS)
+    assert verdict.ok
+    assert verdict.user_caps and verdict.card_caps
+    assert verdict.user_setup and verdict.card_setup
+
     probe = CapabilityMatrix(
-        caps_raw={"user_info_capabilities": {"UserInfoCap": {"numOfCard": {"@max": 0}}}}
+        caps_raw={
+            "user_info_capabilities": REAL_CAPS["user_info_capabilities"],
+            "card_info_capabilities": REAL_CAPS["card_info_capabilities"],
+        }
+    )
+    assert card_capacity_from_caps(probe) is None
+    plan = plan_import(
+        [ImportRow(2, "91", "User E91", "90000091")],
+        target_users=[],
+        target_cards=[],
+        probe=probe,
+    )
+    assert plan.card_capacity is None
+    assert plan.rows[0].action is ImportAction.ADD_USER
+    assert any("did not advertise a per-person card capacity" in note for note in plan.notes)
+
+
+def test_capacity_is_enforced_when_the_device_advertises_it() -> None:
+    probe = CapabilityMatrix(
+        caps_raw={"user_info_capabilities": {"UserInfo": {"numOfCard": {"@max": 0}}}}
     )
     plan = plan_import(
         [ImportRow(2, "91", "User E91", "90000091")],
@@ -200,6 +330,7 @@ def test_capacity_is_read_from_device_caps() -> None:
 
 
 def test_dry_run_masks_card_and_writes_nothing(tmp_path: Path) -> None:
+    pytest.importorskip("openpyxl")
     device = _device()
     factory = _factory(device)
     client = factory()
@@ -216,6 +347,10 @@ def test_dry_run_masks_card_and_writes_nothing(tmp_path: Path) -> None:
     finally:
         client.close()
     assert report.plan.counts()[ImportAction.ADD_USER.value] == 1
+    assert report.summary()["plan"]["device"] == {
+        "model": TARGET_MODEL,
+        "serial": TARGET_SERIAL,
+    }
     payload = json.dumps(report.summary())
     assert "90000090" not in payload
     assert "0090" in payload
@@ -224,7 +359,53 @@ def test_dry_run_masks_card_and_writes_nothing(tmp_path: Path) -> None:
     assert not (tmp_path / "results.csv").exists()
 
 
+def test_apply_refuses_wrong_serial_before_writing(tmp_path: Path) -> None:
+    pytest.importorskip("openpyxl")
+    device = _device()
+    factory = _factory(device)
+    journal = tmp_path / "private/journal.jsonl"
+    results = tmp_path / "private/results.csv"
+    client = factory()
+    try:
+        with pytest.raises(DeviceMismatchError, match="does not match"):
+            run_import(
+                SAMPLE,
+                client=client,
+                client_factory=factory,
+                apply=True,
+                expect_serial="SOME-OTHER-DOOR",
+                journal_path=journal,
+                results_path=results,
+                sleep=lambda _s: None,
+            )
+    finally:
+        client.close()
+    assert not journal.exists()
+    assert not results.exists()
+
+
+def test_apply_requires_expect_serial(tmp_path: Path) -> None:
+    device = _device()
+    factory = _factory(device)
+    journal = tmp_path / "private/journal.jsonl"
+    client = factory()
+    try:
+        with pytest.raises(DeviceSerialRequiredError, match="expect-serial"):
+            run_import(
+                tmp_path / "not-read.xlsx",
+                client=client,
+                client_factory=factory,
+                apply=True,
+                journal_path=journal,
+                sleep=lambda _s: None,
+            )
+    finally:
+        client.close()
+    assert not journal.exists()
+
+
 def test_apply_writes_via_journal_and_rerun_skips_present(tmp_path: Path) -> None:
+    pytest.importorskip("openpyxl")
     device = _device()
     factory = _factory(device)
     journal = tmp_path / "private/journal.jsonl"
@@ -236,6 +417,7 @@ def test_apply_writes_via_journal_and_rerun_skips_present(tmp_path: Path) -> Non
             client=client,
             client_factory=factory,
             apply=True,
+            expect_serial=TARGET_SERIAL,
             journal_path=journal,
             results_path=results,
             sleep=lambda _s: None,
@@ -257,6 +439,7 @@ def test_apply_writes_via_journal_and_rerun_skips_present(tmp_path: Path) -> Non
             client=client,
             client_factory=factory,
             apply=True,
+            expect_serial=TARGET_SERIAL,
             journal_path=journal,
             results_path=results,
             sleep=lambda _s: None,
@@ -268,6 +451,7 @@ def test_apply_writes_via_journal_and_rerun_skips_present(tmp_path: Path) -> Non
 
 
 def test_auth_failure_aborts_and_journal_resumes(tmp_path: Path) -> None:
+    pytest.importorskip("openpyxl")
     device = _device()
     read_factory = _factory(device)
     write_factory = _factory(device, password="fakepw-wrong")
@@ -280,6 +464,7 @@ def test_auth_failure_aborts_and_journal_resumes(tmp_path: Path) -> None:
             client=client,
             client_factory=write_factory,
             apply=True,
+            expect_serial=TARGET_SERIAL,
             journal_path=journal,
             results_path=results,
             sleep=lambda _s: None,
@@ -299,6 +484,7 @@ def test_auth_failure_aborts_and_journal_resumes(tmp_path: Path) -> None:
             client=client,
             client_factory=read_factory,
             apply=True,
+            expect_serial=TARGET_SERIAL,
             journal_path=journal,
             results_path=results,
             sleep=lambda _s: None,
@@ -314,9 +500,10 @@ def test_auth_failure_aborts_and_journal_resumes(tmp_path: Path) -> None:
 
 
 def test_dialect_refusal_blocks_all_writes(tmp_path: Path) -> None:
+    pytest.importorskip("openpyxl")
     device = _device(
         caps_user_info={
-            "UserInfoCap": {
+            "UserInfo": {
                 "maxRecordNum": 3000,
                 "supportFunction": {"@opt": "faceCapture,fpCapture"},
             }
@@ -332,6 +519,7 @@ def test_dialect_refusal_blocks_all_writes(tmp_path: Path) -> None:
                 client=client,
                 client_factory=factory,
                 apply=True,
+                expect_serial=TARGET_SERIAL,
                 journal_path=journal,
                 results_path=tmp_path / "private/results.csv",
                 sleep=lambda _s: None,

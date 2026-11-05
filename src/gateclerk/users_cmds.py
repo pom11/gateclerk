@@ -205,6 +205,14 @@ def users_import(
             "dry run that prints the exact plan and the device dialect verdict.",
         ),
     ] = False,
+    expect_serial: Annotated[
+        str | None,
+        typer.Option(
+            "--expect-serial",
+            help="REQUIRED with --apply: the serial the dry run printed. The write is "
+            "refused before any request if the target is a different terminal.",
+        ),
+    ] = None,
     journal: Annotated[
         str | None,
         typer.Option(
@@ -245,6 +253,12 @@ def users_import(
         mapping = _parse_map(map_pairs)
     except typer.BadParameter as exc:
         raise _config_exit(fmt, str(exc)) from exc
+    if apply_writes and not (expect_serial and expect_serial.strip()):
+        raise _config_exit(
+            fmt,
+            "--apply requires --expect-serial SERIAL: the dry run prints the target "
+            "serial to copy, and a mismatch refuses before any write",
+        )
     _site_config, client, client_factory = _migrate_client(
         host=host,
         site=site,
@@ -267,6 +281,7 @@ def users_import(
                 sheet=sheet,
                 mapping=mapping,
                 apply=apply_writes,
+                expect_serial=expect_serial,
                 journal_path=journal_path,
                 results_path=results_path,
             )
@@ -279,6 +294,10 @@ def users_import(
         from gateclerk.output import make_console
 
         console = make_console()
+        console.print(
+            f"device: model={report.plan.device_model!r} serial={report.plan.device_serial!r}",
+            markup=False,
+        )
         console.print(f"users import applied: {report.plan.counts()}", markup=False)
         console.print(f"dialect: {report.plan.dialect.note}", markup=False)
         console.print(f"journal: {report.journal_path}", markup=False)
@@ -290,6 +309,9 @@ def users_import(
             render_plan_rows(report.plan),
             fmt="table",
             columns=("line", "employeeNo", "cardNo", "action", "reason"),
+        )
+        typer.echo(
+            f"device: model={report.plan.device_model!r} serial={report.plan.device_serial!r}"
         )
         typer.echo(f"dialect: {'confirmed' if report.plan.dialect.ok else 'REFUSED'}")
         typer.echo(report.plan.dialect.note)
