@@ -1,0 +1,76 @@
+# deploy/compose.yaml — one service and one state volume per site.
+#
+# This mirrors deploy/gateclerk-agent@.service: one site = one process = one sqlite
+# store = one push target. Do not put two --site values in one service.
+#
+# Fill deploy/gateclerk.env from deploy/gateclerk.env.example (keep it mode 0600 and out
+# of git), copy sites.toml beside it, then from the repository root:
+#
+#   docker compose -f deploy/compose.yaml up -d --build
+#
+# The named volumes hold everything under --state-root: the store, park/ and health/.
+# The container root filesystem stays read-only; only the state volume and /tmp write.
+
+name: gateclerk
+
+x-agent: &agent
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  image: gateclerk-agent:local
+  env_file:
+    - ./gateclerk.env
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  site-a:
+    <<: *agent
+    command:
+      - agent
+      - run
+      - --site
+      - site-a
+      - --config
+      - /etc/gateclerk/sites.toml
+      - --state-root
+      - /var/lib/gateclerk/site-a
+    environment:
+      TZ: Europe/Bucharest
+      GATECLERK_HEALTH_FILE: /var/lib/gateclerk/site-a/health/agent.json
+    volumes:
+      - ./sites.toml:/etc/gateclerk/sites.toml:ro
+      - site-a-state:/var/lib/gateclerk/site-a
+
+  # A second site is the same block with its own name, config block, env vars and
+  # volume. Keep both services in one compose file only if both sites share a host;
+  # otherwise use one compose project per host, exactly like one unit per site.
+  site-b:
+    <<: *agent
+    command:
+      - agent
+      - run
+      - --site
+      - site-b
+      - --config
+      - /etc/gateclerk/sites.toml
+      - --state-root
+      - /var/lib/gateclerk/site-b
+    environment:
+      TZ: Europe/Bucharest
+      GATECLERK_HEALTH_FILE: /var/lib/gateclerk/site-b/health/agent.json
+    volumes:
+      - ./sites.toml:/etc/gateclerk/sites.toml:ro
+      - site-b-state:/var/lib/gateclerk/site-b
+
+volumes:
+  site-a-state:
+  site-b-state:

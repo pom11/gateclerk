@@ -46,8 +46,19 @@ UNIT_TEMPLATE = DEPLOY / "gateclerk-agent@.service"
 PLIST_TEMPLATE = DEPLOY / "gateclerk-agent.plist"
 README = DEPLOY / "README.md"
 
-#: The whole surface this card owns — a fourth file here is scope creep (card rule).
-OWNED_FILES = (UNIT_TEMPLATE, PLIST_TEMPLATE, README)
+#: The whole surface this card owns. The first three are the systemd/launchd install;
+#: the container story (Dockerfile, compose, healthcheck, env example, doc) is the
+#: alternative install and is scanned by the same hygiene rules.
+OWNED_FILES = (
+    UNIT_TEMPLATE,
+    PLIST_TEMPLATE,
+    README,
+    DEPLOY / "Dockerfile",
+    DEPLOY / "compose.yaml",
+    DEPLOY / "container_healthcheck.sh",
+    DEPLOY / "gateclerk.env.example",
+    DEPLOY / "CONTAINER.md",
+)
 
 #: The device hosts used anywhere in the deploy surface must be documentation-range
 #: placeholders (RFC 5737 TEST-NET), same allowlist as tests/test_repo_hygiene.py.
@@ -205,12 +216,19 @@ REMAINING_PLACEHOLDER = re.compile(r"<[A-Z][A-Z0-9_]*>")
 # --- 0. the surface is exactly the three static files this card owns -------------------
 
 
-def test_deploy_dir_holds_only_the_three_static_artifacts() -> None:
+def test_deploy_dir_holds_only_the_documented_artifacts() -> None:
     assert DEPLOY.is_dir(), "deploy/ must exist (this card owns it)"
     found = sorted(p.name for p in DEPLOY.iterdir() if p.is_file())
-    assert found == ["README.md", "gateclerk-agent.plist", "gateclerk-agent@.service"], (
-        f"deploy/ must hold exactly the templates + README, found {found}"
-    )
+    assert found == [
+        "CONTAINER.md",
+        "Dockerfile",
+        "README.md",
+        "compose.yaml",
+        "container_healthcheck.sh",
+        "gateclerk-agent.plist",
+        "gateclerk-agent@.service",
+        "gateclerk.env.example",
+    ], f"deploy/ holds an undocumented artifact: {found}"
 
 
 def test_deploy_surface_ships_no_runtime_code() -> None:

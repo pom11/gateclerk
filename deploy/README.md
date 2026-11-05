@@ -8,6 +8,12 @@ not an install you can copy blind:
 | `gateclerk-agent@.service` | the supported deploy target: one systemd unit **per site** (Linux agent hosts) |
 | `gateclerk-agent.plist` | **EXAMPLE ONLY**: the same seams for launchd, for a developer's macOS laptop |
 
+A container alternative ships beside the unit: `deploy/Dockerfile` (Alpine/musl,
+non-root), `deploy/compose.yaml` (one service and one state volume per site) and
+`deploy/CONTAINER.md` (build, credentials env-file, volume and healthcheck). It runs the
+same `gateclerk agent run` surface and keeps the same references-never-values rule; use
+that document when the production host is Alpine in Docker instead of systemd.
+
 Windows agent hosts have no unit file here (the supported route is a Task Scheduler task
 running the same `agent run` command line; see step 6). The spec is explicit about this
 split: `docs/P2-SITE-AGENT.md` §2d — agents run on Linux/Windows, macOS is the dev box, so
