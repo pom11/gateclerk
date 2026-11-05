@@ -1,4 +1,4 @@
-"""ALERT-SINK-MNOTIFY: the typed alert route and its never-break fallback.
+"""ALERT-SINK-MNOTIFY: the typed alert route and its never-block fallback.
 
 The contract is micro-notify's ``docs/SERVICE-INTEGRATION.md``: argv array, body in a
 file, exit code is the verdict, no retry here, secrets stay in mnotify's own backend.
@@ -86,12 +86,37 @@ class Runner:
                 self.active -= 1
 
 
-def _sink_with(runner: Runner, *, fallback: list[Alert], warns: list[str]) -> MnotifySink:
+class BlockingRunner:
+    """A runner that proves the caller is not waiting on the exec."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str], **kwargs: object) -> object:
+        del kwargs
+        self.calls.append(list(argv))
+        self.started.set()
+        assert self.release.wait(5), "the test must release the blocked runner"
+        self.finished.set()
+        return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true}', stderr="")
+
+
+def _sink_with(
+    runner: Runner | BlockingRunner,
+    *,
+    fallback: list[Alert],
+    warns: list[str],
+    **kwargs: object,
+) -> MnotifySink:
     return MnotifySink(
         to=TO,
         warn=warns.append,
         fallback=fallback.append,
         runner=runner,
+        **kwargs,
     )
 
 
@@ -109,8 +134,10 @@ def test_success_sends_one_argv_only_mail_with_the_body_in_a_file(
     alert = _alert()
 
     sink(alert)
+    sink.close()
 
-    assert warns == [] and fallback == []
+    assert warns == []
+    assert fallback == [alert], "the local evidence line is written before the page is queued"
     assert len(runner.calls) == 1
     argv = runner.calls[0]
     assert argv[:4] == ["mnotify", "mail", "send", "--to"]
@@ -129,8 +156,11 @@ def test_subject_and_body_carry_the_operator_restart_hint_and_park_state() -> No
     assert "CRITICAL" in subject and "auth_terminal" in subject and SERIAL in subject
     assert "park_state: parked, unacked" in body
     assert "device_key: " + SERIAL in body
-    assert "operator only: restart gateclerk-agent@site-a" in body
+    assert "operator only: restart the site's service" in body
+    assert "systemd unit gateclerk-agent@site-a" in body
+    assert "compose service site-a" in body
     assert "a restart does NOT clear a park" in body
+    assert "`gateclerk agent ack --site site-a`" in body
 
 
 def test_timeout_falls_back_to_stderr_and_warns_without_raising() -> None:
@@ -138,12 +168,15 @@ def test_timeout_falls_back_to_stderr_and_warns_without_raising() -> None:
     fallback: list[Alert] = []
     warns: list[str] = []
     alert = _alert()
+    sink = _sink_with(runner, fallback=fallback, warns=warns)
 
-    _sink_with(runner, fallback=fallback, warns=warns)(alert)
+    sink(alert)
+    sink.close()
 
     assert fallback == [alert]
-    assert len(warns) == 1 and "timed out" in warns[0] and "stderr" in warns[0]
+    assert len(warns) == 1 and "timed out" in warns[0]
     assert "UNKNOWN" in warns[0]
+    assert "local alert line was already written" in warns[0]
 
 
 def test_non_zero_exit_falls_back_with_the_exit_code_and_no_retry() -> None:
@@ -158,23 +191,27 @@ def test_non_zero_exit_falls_back_with_the_exit_code_and_no_retry() -> None:
     fallback: list[Alert] = []
     warns: list[str] = []
     alert = _alert()
+    sink = _sink_with(runner, fallback=fallback, warns=warns)
 
-    _sink_with(runner, fallback=fallback, warns=warns)(alert)
+    sink(alert)
+    sink.close()
 
-    assert fallback == [alert]
+    assert fallback == [alert], "the evidence line is written exactly once, before the send"
     assert len(runner.calls) == 1, "the contract forbids a blind retry"
     assert "exit 5" in warns[0] and "webhook 503" in warns[0]
-    assert "stderr fallback" in warns[0]
+    assert "local alert line was already written" in warns[0]
 
 
 def test_missing_binary_falls_back_to_stderr() -> None:
     runner = Runner(raises=FileNotFoundError("mnotify"))
     fallback: list[Alert] = []
     warns: list[str] = []
+    sink = _sink_with(runner, fallback=fallback, warns=warns)
 
-    _sink_with(runner, fallback=fallback, warns=warns)(_alert())
+    sink(_alert())
+    sink.close()
 
-    assert len(fallback) == 1
+    assert fallback == [_alert()]
     assert "not found on PATH" in warns[0]
 
 
@@ -182,8 +219,10 @@ def test_any_unexpected_runner_failure_falls_back_and_never_raises() -> None:
     runner = Runner(raises=RuntimeError("boom"))
     fallback: list[Alert] = []
     warns: list[str] = []
+    sink = _sink_with(runner, fallback=fallback, warns=warns)
 
-    _sink_with(runner, fallback=fallback, warns=warns)(_alert())
+    sink(_alert())
+    sink.close()
 
     assert len(fallback) == 1
     assert "RuntimeError: boom" in warns[0]
@@ -193,10 +232,70 @@ def test_exit_zero_wins_over_unparseable_stdout() -> None:
     runner = Runner(result=subprocess.CompletedProcess([], 0, stdout="not json", stderr=""))
     fallback: list[Alert] = []
     warns: list[str] = []
+    sink = _sink_with(runner, fallback=fallback, warns=warns)
 
-    _sink_with(runner, fallback=fallback, warns=warns)(_alert())
+    sink(_alert())
+    sink.close()
 
-    assert fallback == [] and warns == []
+    assert fallback == [_alert()] and warns == []
+
+
+def test_call_returns_promptly_while_the_runner_blocks() -> None:
+    runner = BlockingRunner()
+    fallback: list[Alert] = []
+    warns: list[str] = []
+    sink = _sink_with(runner, fallback=fallback, warns=warns, drain_timeout_s=2.0)
+    alert = _alert()
+
+    started = time.monotonic()
+    sink(alert)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, "__call__ must not wait for mnotify"
+    assert fallback == [alert], "the evidence line goes out before the worker is asked"
+    assert runner.started.wait(2), "the daemon worker should pick the page up"
+    assert not runner.finished.is_set(), "the exec is deliberately still blocked"
+
+    runner.release.set()
+    sink.close()
+    assert runner.finished.is_set() and warns == []
+
+
+def test_queue_full_warns_and_drops_the_page_but_keeps_the_evidence_line() -> None:
+    runner = BlockingRunner()
+    fallback: list[Alert] = []
+    warns: list[str] = []
+    sink = _sink_with(runner, fallback=fallback, warns=warns, queue_max=1, drain_timeout_s=2.0)
+
+    sink(_alert(kind="first"))
+    assert runner.started.wait(2), "the one worker is busy, so the queue slot is free"
+    sink(_alert(kind="second"))
+    sink(_alert(kind="third"))
+
+    assert len(fallback) == 3, "every alert leaves a local line, queued or not"
+    assert any("queue full" in text and "dropped the page" in text for text in warns)
+
+    runner.release.set()
+    sink.close()
+    assert len(runner.calls) == 2, "the in-flight page and the one queued page are sent"
+
+
+def test_exit_warns_when_a_page_is_still_in_flight() -> None:
+    runner = BlockingRunner()
+    fallback: list[Alert] = []
+    warns: list[str] = []
+    sink = _sink_with(runner, fallback=fallback, warns=warns, drain_timeout_s=0.05)
+
+    sink(_alert())
+    assert runner.started.wait(2)
+    sink.close()
+
+    assert not runner.finished.is_set(), "close must not wait past its bounded timeout"
+    assert any("page unfinished" in text and "already written" in text for text in warns)
+
+    runner.release.set()
+    assert runner.finished.wait(2)
+    assert fallback == [_alert()]
 
 
 def test_sends_are_serialised_one_writer_at_a_time() -> None:
@@ -208,6 +307,7 @@ def test_sends_are_serialised_one_writer_at_a_time() -> None:
         thread.start()
     for thread in threads:
         thread.join()
+    sink.close()
 
     assert len(runner.calls) == 4
     assert runner.max_active == 1, "mnotify's unlocked daily counter needs one writer"

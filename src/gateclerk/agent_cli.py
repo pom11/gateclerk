@@ -775,7 +775,15 @@ class SiteAgent:
         )
 
     def close(self) -> None:
-        """Release every device client and the db (the unit's SIGTERM path)."""
+        """Release the alert worker, every device client and the db (SIGTERM path).
+
+        The mnotify sink is drained for its own bounded time so `--once` and a SIGTERM
+        both give an accepted page a chance to finish; a still-running page only warns
+        (the local evidence line was already written before it was queued).
+        """
+        close_sink = getattr(getattr(self.policy, "sink", None), "close", None)
+        if callable(close_sink):
+            close_sink()
         for loop in self.loops:
             loop.client.close()
         self.conn.close()
@@ -1170,8 +1178,11 @@ def resolve_state_root(site: SiteConfig, state_root: Path | str | None) -> Path:
 def _alert_sink_for(site: SiteConfig, *, warn: Callable[[str], None]) -> Callable[[Alert], None]:
     """The site's alert route: its one `mnotify` sink, else P2-05's stderr default.
 
-    `mnotify` is an ADDITIONAL page, not a replacement for the local line: the sink itself
-    falls back to `default_sink` on every delivery failure (agent_mnotify's fallback law).
+    `mnotify` is an ADDITIONAL page, not a replacement for the local line: the sink writes
+    `default_sink`'s line immediately on the alert thread, then queues the mail to one
+    daemon worker (so a mail outage cannot stall polling). A delivery failure only warns —
+    the line is never written twice (agent_mnotify's fallback law). `SiteAgent.close`
+    drains accepted pages for a bounded time at exit.
     """
     spec = site.alert_sink
     if spec is None or not spec.to:

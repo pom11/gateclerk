@@ -56,12 +56,15 @@ argv/body-file/exit-code contract is micro-notify's docs/SERVICE-INTEGRATION.md.
 owns its credentials and daily counter; gateclerk only execs it (argv array, body in a
 file, one send at a time) and never passes a token.
 
-The fallback law is the reason the alert path bends and never breaks: on ANY delivery
-failure — binary missing, timeout, non-zero exit, unparseable process trouble — the
-mnotify sink writes today's stderr line and a warning, and NEVER raises into
-``handle_tick``/``_fire``. Journald is therefore still the evidence of record when the
-mail route is down; mnotify is an additional page, never a replacement for the local
-line. Only one alert route is allowed (two would page twice for one incident).
+The fallback law is the reason the alert path bends and never breaks: the mnotify sink
+writes today's stderr line IMMEDIATELY on the calling thread, then hands the page to one
+daemon worker over a small bounded queue. A delivery failure — binary missing, timeout,
+non-zero exit, unparseable process trouble — only adds a warning; the line is not written
+twice, and nothing blocks or raises into ``handle_tick``/``_fire`` (a mail outage cannot
+stall polling). Journald is therefore still the evidence of record when the mail route is
+down; mnotify is an additional page, never a replacement for the local line. Only one
+alert route is allowed (two would page twice for one incident). On agent exit the sink
+drains accepted pages for a bounded time and warns about any page still in flight.
 """
 
 from __future__ import annotations
