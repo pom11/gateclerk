@@ -574,13 +574,13 @@ class SiteAgent:
         self.push_target = site.push_target
         self._push_transport = push_transport
         # --- SINKS-WIRING: the fan-out ------------------------------------------------------
-        # `effective_sinks` is the whole upgrade story in one property: a site that declares
-        # `[[site.sink]]` blocks gets those, a site with only `push_target` gets the single
-        # implicit `legacy` sink aimed at exactly that ref, and a site with neither is the
-        # pusher being off. Nothing below branches on "is this the legacy case" — the legacy
-        # site is one sink in a list of one, which is why the pre-sinks behaviour is unchanged
-        # rather than duplicated.
-        self.sinks: tuple[SinkSpec, ...] = site.effective_sinks
+        # `event_sinks` is `effective_sinks` minus the alert-only `mnotify` route: a site
+        # with `[[site.sink]]` blocks gets those, a site with only `push_target` gets the
+        # single implicit `legacy` sink aimed at exactly that ref, and a site with neither
+        # is the pusher being off. Nothing below branches on "is this the legacy case" —
+        # the legacy site is one sink in a list of one, which is why the pre-sinks
+        # behaviour is unchanged rather than duplicated.
+        self.sinks: tuple[SinkSpec, ...] = site.event_sinks
         #: Injected per-sink transports (tests, owner-wired); an injected one always wins over
         #: what `_sink_transport` would build. Keyed by sink NAME — the identity — never by
         #: ref, because two sinks may share one ref and must not share one transport object.
@@ -595,9 +595,9 @@ class SiteAgent:
             # This is a warn, not a refusal — §3 forbids defaulting an endpoint, and "no
             # push" is a legitimate configuration the operator is entitled to choose.
             self._warn(
-                f"warning: site {self.site.name!r} has no sinks: neither push_target nor "
-                "[[site.sink]] is declared, so nothing this site polls will be pushed. "
-                "Queued events stay queued (and nothing gets queued)."
+                f"warning: site {self.site.name!r} has no event sinks: neither push_target "
+                "nor a non-alert [[site.sink]] is declared, so nothing this site polls will "
+                "be pushed. Queued events stay queued (and nothing gets queued)."
             )
         # The poller's sent/gone ledger (class docstring on `PushLedger`). None means "no
         # ledger" — the pure-API shape tests use when they want the raw P2-04 behaviour.
@@ -1167,6 +1167,24 @@ def resolve_state_root(site: SiteConfig, state_root: Path | str | None) -> Path:
 # --- the composition (no socket opens, no credential values kept) ----------------------------
 
 
+def _alert_sink_for(site: SiteConfig, *, warn: Callable[[str], None]) -> Callable[[Alert], None]:
+    """The site's alert route: its one `mnotify` sink, else P2-05's stderr default.
+
+    `mnotify` is an ADDITIONAL page, not a replacement for the local line: the sink itself
+    falls back to `default_sink` on every delivery failure (agent_mnotify's fallback law).
+    """
+    spec = site.alert_sink
+    if spec is None or not spec.to:
+        return default_sink
+    from gateclerk.agent_mnotify import MNOTIFY_TIMEOUT_S, MnotifySink
+
+    return MnotifySink(
+        to=spec.to,
+        timeout_s=spec.timeout_s if spec.timeout_s is not None else MNOTIFY_TIMEOUT_S,
+        warn=warn,
+    )
+
+
 def build_site_agent(
     site: SiteConfig,
     *,
@@ -1298,7 +1316,7 @@ def build_site_agent(
         now=clock,
         conn=conn,
         park_dir=parks,
-        sink=sink if sink is not None else default_sink,
+        sink=sink if sink is not None else _alert_sink_for(site, warn=funnel),
     )
     return SiteAgent(
         site=site,

@@ -45,6 +45,23 @@ beyond the site label. That last one is not paranoia: the transport's own except
 strings embed the base URL (isapi_transport.py: ``request to {base_url} failed``),
 so alert notes are authored from safe pieces here and NEVER from ``str(exc)``.
 ``tests/test_p2_05_alerts.py`` scans the whole alert surface for the leak.
+
+Alert routing (card ALERT-SINK-MNOTIFY)
+---------------------------------------
+The sink is an injected callable, so the policy has no transport of its own. With no
+sink configuration the default stays exactly the journald line above. A site may add ONE
+``[[site.sink]] type = "mnotify"`` block (the same typed-sink vocabulary the push
+sinks use; ``sink_cli.add_sink_block`` writes it): alerts then go to mnotify mail, whose
+argv/body-file/exit-code contract is micro-notify's docs/SERVICE-INTEGRATION.md. mnotify
+owns its credentials and daily counter; gateclerk only execs it (argv array, body in a
+file, one send at a time) and never passes a token.
+
+The fallback law is the reason the alert path bends and never breaks: on ANY delivery
+failure — binary missing, timeout, non-zero exit, unparseable process trouble — the
+mnotify sink writes today's stderr line and a warning, and NEVER raises into
+``handle_tick``/``_fire``. Journald is therefore still the evidence of record when the
+mail route is down; mnotify is an additional page, never a replacement for the local
+line. Only one alert route is allowed (two would page twice for one incident).
 """
 
 from __future__ import annotations
@@ -141,6 +158,10 @@ class Alert:
     device_serial: str | None
     at: str  # tz-aware ISO, from the injected clock — never a wall-clock surprise
     note: str
+    #: The park key the policy gated on (a serial, or `pending` before bootstrap).
+    device_key: str | None = None
+    #: Human-readable park state at fire time (unacked / acked grid / not parked).
+    park_state: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +169,8 @@ class Alert:
             "kind": self.kind,
             "site": self.site,
             "device_serial": self.device_serial,
+            "device_key": self.device_key,
+            "park_state": self.park_state,
             "at": self.at,
             "note": self.note,
         }
@@ -483,6 +506,11 @@ class AlertPolicy:
                 if self._read_park(PENDING_SERIAL) is None and (
                     serial is None or self._read_park(serial) is None
                 ):
+                    # Park BEFORE firing so the alert's park_state names the state the
+                    # operator will find on disk (the mnotify body carries it).
+                    self._park(
+                        PENDING_SERIAL if serial is None else serial, serial_for_record=serial
+                    )
                     fired.append(
                         self._fire(
                             LEVEL_CRITICAL,
@@ -492,9 +520,6 @@ class AlertPolicy:
                             "rotated; the device loop is PARKED (no re-probe until "
                             "`gateclerk agent ack`)",
                         )
-                    )
-                    self._park(
-                        PENDING_SERIAL if serial is None else serial, serial_for_record=serial
                     )
             return fired
 
@@ -688,6 +713,24 @@ class AlertPolicy:
     # --- internals --------------------------------------------------------------------------
 
     def _fire(self, level: str, kind: str, serial: str | None, note: str) -> Alert:
+        device_key = serial or PENDING_SERIAL
+        try:
+            record = self._read_park(device_key)
+            if record is None and serial is not None:
+                record = self._read_park(PENDING_SERIAL)
+            if record is None:
+                park_state = "not parked"
+            elif record.get("acked_at") is None:
+                park_state = "parked, unacked (operator ack required)"
+            else:
+                park_state = (
+                    f"parked, acked at {record.get('acked_at')} "
+                    f"(next re-probe {record.get('next_attempt_at')})"
+                )
+        except Exception:
+            # The alert path never raises: an unreadable park record is reported as
+            # unknown state, not as a reason to lose the alert.
+            park_state = "unknown (park record unreadable)"
         alert = Alert(
             level=level,
             kind=kind,
@@ -695,6 +738,8 @@ class AlertPolicy:
             device_serial=serial,
             at=_iso(self.now()),
             note=note,
+            device_key=device_key,
+            park_state=park_state,
         )
         self.counters[kind] = self.counters.get(kind, 0) + 1
         self.sink(alert)

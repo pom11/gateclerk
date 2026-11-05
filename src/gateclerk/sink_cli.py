@@ -44,10 +44,12 @@ the counts it left behind.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -357,6 +359,8 @@ def add_sink_block(
     rotation: str | None = None,
     token_env: str | None = None,
     token_keychain: str | None = None,
+    to: str | None = None,
+    timeout_s: float | None = None,
 ) -> SinkEdit:
     """Append one `[[site.sink]]` block to `site`'s block, atomically. Refuses loudly first.
 
@@ -397,10 +401,22 @@ def add_sink_block(
             f"sink name {IMPLICIT_SINK_NAME!r} is reserved: it is the implicit sink a site "
             "gets from `push_target` alone, and cannot be declared"
         )
-    if (url is None) == (path is None):
+    if (url is None) == (path is None) and sink_type != "mnotify":
         raise SinkCliError(
             "exactly one of --url (an https sink) or --path (a csv/jsonl sink) is required"
         )
+    if sink_type == "mnotify":
+        if url is not None or path is not None or rotation is not None:
+            raise SinkCliError(
+                "an mnotify sink takes --to (and optional --timeout-s); it is an alert "
+                "route, not an event endpoint or file"
+            )
+        if to is None or not to.strip():
+            raise SinkCliError("--to is required for an mnotify alert sink")
+    elif to is not None or timeout_s is not None:
+        raise SinkCliError("--to/--timeout-s are only valid for an mnotify sink")
+    if timeout_s is not None and timeout_s <= 0:
+        raise SinkCliError("--timeout-s must be > 0")
     if url is not None:
         _check_sink_url(url, sink=name)
     if rotation is not None:
@@ -445,6 +461,10 @@ def add_sink_block(
         block.append(f"  token_env = {token_env!r}")
     if token_keychain is not None:
         block.append(f"  token_keychain = {token_keychain!r}")
+    if to is not None:
+        block.append(f"  to = {to!r}")
+    if timeout_s is not None:
+        block.append(f"  timeout_s = {timeout_s!r}")
 
     edited = lines[:end] + block + lines[end:]
     wanted = tuple(sorted(declared | {name}))
@@ -801,6 +821,23 @@ def check_sink(
         checks.append(_check_token_refs(site, spec, env=env, keychain_probe=keychain_probe))
         return tuple(checks)
 
+    if spec.type == "mnotify":
+        recipient = spec.to or ""
+        ok = bool(recipient.strip()) and "\n" not in recipient and "\r" not in recipient
+        checks.append(
+            SinkCheck(
+                sink=spec.name,
+                check="recipient",
+                ok=ok,
+                detail=(
+                    f"mnotify mail to {recipient}"
+                    if ok
+                    else "no usable `to` recipient — alerts would fall back to stderr"
+                ),
+            )
+        )
+        return tuple(checks)
+
     # csv / jsonl: the path is a directory the agent must be able to write, a rotation the
     # writer has a rule for, and a target no other sink shares.
     path = Path(spec.path or "")
@@ -1076,11 +1113,98 @@ def probe_sink(
         return _probe_https(site, spec, send=send, env=env, keychain=keychain, client=client)
     if spec.type in ("csv", "jsonl"):
         return _probe_file(site, spec)
+    if spec.type == "mnotify":
+        return _probe_mnotify(spec)
     return ProbeResult(
         sink=spec.name,
         ok=False,
         summary=f"type {spec.type!r} is not registered, so nothing can be probed",
     )
+
+
+def _probe_mnotify(spec: Any) -> ProbeResult:
+    """A no-network `mnotify ... --dry-run --json` probe (the contract's own dry-run).
+
+    The body still goes in a file (the real call's shape), the argv is still a list, and
+    mnotify performs no token or network call. Exit 0 means the CLI accepted the target
+    and config; a non-zero code is reported as the sink's problem, with the document's
+    message when mnotify supplied one.
+    """
+    from gateclerk.agent_mnotify import MNOTIFY_BINARY
+
+    if not spec.to:
+        return ProbeResult(sink=spec.name, ok=False, summary="no `to` recipient configured")
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix="gateclerk-sink-probe-",
+        suffix=".md",
+        delete=False,
+    ) as handle:
+        handle.write("gateclerk sink test (dry run; nothing is sent)\n")
+        body_path = handle.name
+    try:
+        argv = [
+            MNOTIFY_BINARY,
+            "mail",
+            "send",
+            "--to",
+            spec.to,
+            "--subject",
+            "gateclerk sink test",
+            "--body-file",
+            body_path,
+            "--dry-run",
+            "--json",
+        ]
+        try:
+            proc = subprocess.run(  # noqa: S603 - fixed argv, no shell, mnotify's own CLI
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=min(spec.timeout_s or 30.0, 30.0),
+                check=False,
+            )
+        except FileNotFoundError:
+            return ProbeResult(
+                sink=spec.name,
+                ok=False,
+                summary=f"{MNOTIFY_BINARY!r} not found on PATH — alerts fall back to stderr",
+            )
+        except subprocess.TimeoutExpired:
+            return ProbeResult(
+                sink=spec.name, ok=False, summary="mnotify dry-run timed out; nothing was sent"
+            )
+        except OSError as exc:
+            return ProbeResult(
+                sink=spec.name,
+                ok=False,
+                summary=f"could not run {MNOTIFY_BINARY!r} ({type(exc).__name__}: {exc})",
+            )
+        if proc.returncode == 0:
+            return ProbeResult(
+                sink=spec.name,
+                ok=True,
+                summary="mnotify dry-run accepted the command (no token or network call)",
+            )
+        message = ""
+        try:
+            import json
+
+            document = json.loads(proc.stdout) if proc.stdout.strip() else {}
+            if isinstance(document, dict):
+                message = str(document.get("message") or "")
+        except ValueError:
+            message = (proc.stderr or "").strip()
+        detail = f"mnotify dry-run exited {proc.returncode}"
+        return ProbeResult(
+            sink=spec.name,
+            ok=False,
+            summary=f"{detail}: {' '.join(message.split()) or 'no message'}",
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            Path(body_path).unlink(missing_ok=True)
 
 
 def _probe_https(
