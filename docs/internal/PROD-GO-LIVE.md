@@ -157,7 +157,7 @@ Source: `deploy/README.md:178`.
 
 ## 3. Ingest token for BC push
 
-BC keeps the same Gateclerk ingest endpoint and the same Secret Manager name; the token is
+BC keeps the same ingest endpoint and the same Secret Manager name; the token is
 supplied by the operator and its **value never appears in this doc, in `sites.toml`, or in
 a unit file** (`sites.toml.example:64-80`).
 
@@ -322,13 +322,13 @@ to BC, does not run a job, and does not write a row.
 
 ### 8a. Register the new device under SITE-A
 
-Use the **Attendance Devices** list page, **page 70604**
-(`Gateclerk/Pages/AttendanceDevicesEfsPOM.Page.al:2`; BC source, not vendored in this repo). Its
-source table is `AttendanceDeviceEfsPOM` (table 70602), with the fields that matter here:
+Use the **device list page (ID 70604)**
+(the repo's Pages directory, file for page ID 70604, line 2; BC source, not vendored in this
+repo). Its source table is the **device table (ID 70602)**, with the fields that matter here:
 
-- `Code` — the BC device code (`Gateclerk/Tables/AttendanceDeviceEfsPOM.Table.al:14-18`);
-- `Site Code` — `SITE-A` (`Gateclerk/Tables/AttendanceDeviceEfsPOM.Table.al:19-24`);
-- `Serial No.` — the new unit's serial (`Gateclerk/Tables/AttendanceDeviceEfsPOM.Table.al:25-29`).
+- `Code` — the BC device code (the repo's Tables directory, file for table ID 70602, lines 14-18);
+- `Site Code` — `SITE-A` (the repo's Tables directory, file for table ID 70602, lines 19-24);
+- `Serial No.` — the new unit's serial (the repo's Tables directory, file for table ID 70602, lines 25-29).
 
 **[OPERATOR-ONLY]** Create the row **before the production agent's first push**. The ingest
 needs the new device row on its side before it can accept a scan for that device. Record the
@@ -337,11 +337,11 @@ needs the new device row on its side before it can accept a scan for that device
 
 ### 8b. Relink device users
 
-The roster/link work is on **page 70610**, `AttendanceDeviceUsersEfsPOM`
-(`Gateclerk/Pages/AttendanceDeviceUsersEfsPOM.Page.al:10`), whose link action opens **page
-70613**, `AttendanceLinkDeviceUserEfsPOM`
-(`Gateclerk/Pages/AttendanceDeviceUsersEfsPOM.Page.al:66-71`,
-`Gateclerk/Pages/AttendanceLinkDeviceUserEfsPOM.Page.al:10`). **[OPERATOR-ONLY]** — these are live
+The roster/link work is on **page 70610**, the device-user list page
+(the repo's Pages directory, file for page ID 70610, line 10), whose link action opens **page
+70613**, the device-user link page
+(the repo's Pages directory, file for page ID 70610, lines 66-71,
+and file for page ID 70613, line 10). **[OPERATOR-ONLY]** — these are live
 BC link rows. The new unit has nobody linked to it yet.
 
 ### 8c. Enrollment on the new unit
@@ -357,8 +357,8 @@ opted-in write path is separately gated (`README.md:16-19`).
 Scans already pushed from the old unit are normal, permanent BC rows. The ingest's
 `InsertDeviceScan` only inserts; on a replay it finds the existing
 `(Device Code, Fingerprint)` row and exits `false` without writing
-(`Gateclerk/Codeunits/AttendanceScanMgtEfsPOM.Codeunit.al:75-83`; the unique-key contract is
-documented at `Gateclerk/Codeunits/AttendanceScanMgtEfsPOM.Codeunit.al:22-28`). Nothing in that
+(the repo's Codeunits directory, scan-management codeunit, lines 75-83; the unique-key contract is
+documented in the same codeunit at lines 22-28). Nothing in that
 path deletes the old rows.
 
 The fate of the old hardware/config is an **open question** for the operator (§11): keep it
@@ -473,7 +473,7 @@ decision, listed in §11.
 - **BC writes are idempotent.** `InsertDeviceScan` keys on the UNIQUE
   `(Device Code, Fingerprint)` pair; a replay finds the existing row and exits `false`, so
   the same event pushed twice lands exactly once
-  (`Gateclerk/Codeunits/AttendanceScanMgtEfsPOM.Codeunit.al:75-83`).
+  (the repo's Codeunits directory, scan-management codeunit, lines 75-83).
 - **The agents are not idempotent as pollers.** Each keeps its own checkpoint, circuit and
   ring arithmetic, and two pollers double the request load against the device's
   ~190-request nonce use-cap and the shared event ring
@@ -481,8 +481,8 @@ decision, listed in §11.
   `src/gateclerk/isapi_transport.py:327-358`). That is why overlap is forbidden even though
   BC dedupes.
 - **The Mac's already-pushed scans stay.** They are normal BC rows; the fingerprint dedupe
-  makes a later re-push harmless (`Gateclerk/Codeunits/AttendanceScanMgtEfsPOM.Codeunit.al:22-28`,
-  `Gateclerk/Codeunits/AttendanceScanMgtEfsPOM.Codeunit.al:81-83`).
+  makes a later re-push harmless (the repo's Codeunits directory, scan-management codeunit,
+  lines 22-28 and 81-83).
 
 ## 10. Rollback
 
