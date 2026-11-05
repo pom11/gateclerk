@@ -84,7 +84,10 @@ RUN apk add --no-cache tzdata \
     && adduser -S -D -H -u 10001 -G gateclerk -h /var/lib/gateclerk gateclerk \
     && for site in ${GATECLERK_SITES}; do \
          install -d -o gateclerk -g gateclerk -m 0750 "/var/lib/gateclerk/${site}"; \
-       done
+       done \
+    && install -d -o gateclerk -g gateclerk -m 0750 \
+         /var/lib/mnotify/audit \
+         /var/lib/mnotify/state
 
 COPY --from=build /opt/gateclerk /opt/gateclerk
 COPY --chmod=0755 deploy/container_healthcheck.sh /usr/local/bin/gateclerk-healthcheck
@@ -122,9 +125,6 @@ CMD ["agent", "run", "--site", "site-a", "--config", "/etc/gateclerk/sites.toml"
 FROM runtime AS alerts
 
 COPY --from=mnotify-build /opt/mnotify /opt/mnotify
-RUN install -d -o gateclerk -g gateclerk -m 0750 \
-        /var/lib/mnotify/audit \
-        /var/lib/mnotify/state
 
 ENV PATH="/opt/mnotify/bin:${PATH}" \
     MICRO_NOTIFY_CONFIG=/etc/mnotify/config.toml \
