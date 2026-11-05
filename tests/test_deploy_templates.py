@@ -57,6 +57,7 @@ OWNED_FILES = (
     DEPLOY / "compose.yaml",
     DEPLOY / "container_healthcheck.sh",
     DEPLOY / "gateclerk.env.example",
+    DEPLOY / "mnotify.toml.example",
     DEPLOY / "CONTAINER.md",
 )
 
@@ -228,6 +229,7 @@ def test_deploy_dir_holds_only_the_documented_artifacts() -> None:
         "gateclerk-agent.plist",
         "gateclerk-agent@.service",
         "gateclerk.env.example",
+        "mnotify.toml.example",
     ], f"deploy/ holds an undocumented artifact: {found}"
 
 
@@ -597,6 +599,36 @@ def test_readme_points_at_the_command_the_unit_runs(readme: str) -> None:
     assert "P2-07b" in step2, (
         "the render/install section must flag that `agent run` arrives in P2-07b"
     )
+
+
+# --- 5. container story: one default site, opt-in second, pinned notify build --------
+
+
+def test_compose_starts_only_site_a_by_default_and_gates_site_b() -> None:
+    """Production has one site: a bare `compose up -d` must not start site-b."""
+    text = deploy_text(DEPLOY / "compose.yaml")
+    site_a = text[text.index("  site-a:") : text.index("  # A second site")]
+    site_b = text[text.index("  site-b:") : text.index("\nvolumes:")]
+    assert "profiles:" not in site_a, "site-a must be in the default profile"
+    assert 'profiles: ["second-site"]' in site_b, (
+        "site-b must be opt-in; otherwise compose up starts a site nobody configured"
+    )
+
+
+def test_dockerfile_defaults_to_alerts_and_keeps_an_alertless_target() -> None:
+    text = deploy_text(DEPLOY / "Dockerfile")
+    pin = re.search(r"^ARG MICRO_NOTIFY_SHA=([0-9a-f]{40})$", text, re.MULTILINE)
+    assert pin, "micro-notify must be pinned by a full commit SHA build arg"
+    assert 'ARG GATECLERK_SITES="site-a site-b"' in text, (
+        "the documented site state dirs must exist in the image so named volumes inherit "
+        "uid 10001 instead of Docker's root-owned mount point"
+    )
+    assert "FROM runtime AS alerts" in text, "the default (last) stage must include alerts"
+    alerts = text[text.index("FROM runtime AS alerts") :]
+    assert "COPY --from=mnotify-build /opt/mnotify /opt/mnotify" in alerts
+    assert "MICRO_NOTIFY_SECRETS=file" in alerts
+    assert "MICRO_NOTIFY_SECRETS_DIR=/run/secrets/mnotify" in alerts
+    assert "MICRO_NOTIFY_CONFIG=/etc/mnotify/config.toml" in alerts
 
 
 # --- 5. hygiene scan over the whole deploy surface (card rule: no real hosts/IPs) -------

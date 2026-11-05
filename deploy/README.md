@@ -9,9 +9,11 @@ not an install you can copy blind:
 | `gateclerk-agent.plist` | **EXAMPLE ONLY**: the same seams for launchd, for a developer's macOS laptop |
 
 A container alternative ships beside the unit: `deploy/Dockerfile` (Alpine/musl,
-non-root), `deploy/compose.yaml` (one service and one state volume per site) and
-`deploy/CONTAINER.md` (build, credentials env-file, volume and healthcheck). It runs the
-same `gateclerk agent run` surface and keeps the same references-never-values rule; use
+non-root, gateclerk plus `mnotify` in separate venvs; `--target runtime` for alert-less),
+`deploy/compose.yaml` (site-a only by default, a second site behind the `second-site`
+profile, one state volume per site) and `deploy/CONTAINER.md` (build, credentials
+env-file, mnotify config/secrets, volumes and healthcheck). It runs the same
+`gateclerk agent run` surface and keeps the same references-never-values rule; use
 that document when the production host is Alpine in Docker instead of systemd.
 
 Windows agent hosts have no unit file here (the supported route is a Task Scheduler task

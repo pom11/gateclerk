@@ -1091,6 +1091,7 @@ def test_deploy_artifacts_are_untouched_by_this_card() -> None:
         "gateclerk-agent.plist",
         "gateclerk-agent@.service",
         "gateclerk.env.example",
+        "mnotify.toml.example",
     ]
 
 
