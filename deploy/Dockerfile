@@ -49,9 +49,9 @@ COPY src ./src
 
 # A virtualenv is the image's install root. It is built as root in this disposable
 # stage; the runtime stage copies it and never runs pip.
-# Follow-up: once PR #95 adds the `excel` extra, install `.[excel]` so `gateclerk users import` works.
+# The `excel` extra is what makes `gateclerk users import` work in this image.
 RUN python -m venv /opt/gateclerk \
-    && /opt/gateclerk/bin/pip install --no-cache-dir .
+    && /opt/gateclerk/bin/pip install --no-cache-dir '.[excel]'
 
 FROM python:3.12-alpine AS mnotify-build
 
