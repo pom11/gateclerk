@@ -11,8 +11,14 @@ BINDING SPEC: docs/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
 * nonce recoveries -> NOT an alert: an info counter line only (spec §2a: retirement
   is routine at any minutes-scale cadence; OBSERVED.md "Digest nonce use-cap");
 * clock skew over threshold -> warning;
-* checkpoint stall (older than k*cadence) / oldest-serial rising -> CRITICAL
-  (DESIGN.md OQ4: the ring has started rolling and punches are being lost).
+* checkpoint stall -> CRITICAL only on evidence of loss, never on silence. A
+  checkpoint older than k*cadence while polls succeed and return nothing newer is
+  a quiet door (night/lunch), not an outage: the checkpoint only moves on major=5
+  punches. The page fires only when that stale checkpoint coincides with
+  ``STALL_STRIKES`` consecutive non-auth failed polls. A separate arm pages when
+  our store's oldest serialNo rises — that means stored history disappeared, not
+  that the device ring is rolling. Real ring-rollover detection does not exist
+  yet (card t_ed9c7e92); docs/internal/DESIGN.md:411 records the intended probe.
 
 The invariant that outranks everything else here — the lockout-safety one the card
 pins hardest — is that an UNACKED parked device is touched NEVER again: not at the
@@ -44,7 +50,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from gateclerk.agent_store import WatermarkCheck, read_checkpoint
+from gateclerk.agent_store import WatermarkCheck, read_checkpoint, read_oldest_serial
 from gateclerk.exceptions import GateClerkError, IsapiAuthError
 from gateclerk.tz import Skew
 
@@ -69,7 +75,8 @@ KIND_AUTH_TERMINAL = "auth_terminal"
 KIND_DEVICE_LOCKED = "device_locked"
 #: device clock past ``tz.SKEW_WARN_SECONDS`` (DESIGN.md "Time handling": log, never fix).
 KIND_CLOCK_SKEW = "clock_skew"
-#: checkpoint unmoved for k cadences — the ring is rolling (DESIGN.md OQ4).
+#: checkpoint stale AND a failed-poll streak, or stored history disappeared.
+#: Never mere silence; the serial-floor arm is not ring-rollover detection.
 KIND_CHECKPOINT_STALL = "checkpoint_stall"
 #: db past the §2b keep-everything watermark.
 KIND_DB_WATERMARK = "db_watermark"
@@ -215,10 +222,19 @@ class AlertPolicy:
             "auth_terminal": 0,
             "device_locked": 0,
             "clock_skew": 0,
+            #: Evidence-of-loss only: a failing poll or a rising serial floor. A quiet
+            #: door whose polls succeed is not a stall (card STALL-ALERT-FALSE).
             "checkpoint_stall": 0,
             "db_watermark": 0,
         }
         self._mem_parks: dict[str, dict[str, Any]] = {}
+        # Consecutive non-auth failed polls per device. "ok" resets to 0; auth
+        # failures and circuit-open skips neither count nor reset (they have their
+        # own channels and prove nothing about the event walk).
+        self._failed_streak: dict[str, int] = {}
+        # Our store's floor per device across checks: MIN(serial_no), NOT the
+        # device's oldest retained event. See agent_store.read_oldest_serial.
+        self._oldest_serial_seen: dict[str, int | None] = {}
         # Episode guards: each of these alert kinds pages ONCE per incident, never
         # once per tick — an alert that fires every 5 minutes is an alert nobody reads.
         self._locked_open = False
@@ -424,6 +440,8 @@ class AlertPolicy:
         if getattr(result, "ok", False):
             self.counters["ticks_ok"] += 1
             self._locked_open = False
+            if serial is not None:
+                self._failed_streak[serial] = 0
             # A good tick IS the proof the credentials work again — the park (any
             # shape) lifts. §2c's rationale for the slow re-probe over park-forever:
             # "a transient creds rotation self-heals without a site visit".
@@ -436,6 +454,8 @@ class AlertPolicy:
 
         self.counters["tick_failures"] += 1
         exc = getattr(result, "exception", None)
+        if serial is not None and not isinstance(exc, IsapiAuthError):
+            self._failed_streak[serial] = self._failed_streak.get(serial, 0) + 1
         if isinstance(exc, IsapiAuthError):
             if exc.locked:
                 if not self._locked_open:
@@ -511,18 +531,31 @@ class AlertPolicy:
     # --- the critical channel: checkpoint stall (DESIGN.md OQ4) ----------------------------
 
     def check_stall(self, device_serial: str) -> Alert | None:
-        """Checkpoint age vs ``k * cadence``: over -> CRITICAL once per incident.
+        """Checkpoint age becomes a stall ONLY with evidence of loss, never silence.
 
-        A checkpoint that stops moving while the device is reachable means the ring
-        is rolling under us — the events between the checkpoint and the ring floor
-        are LOST (OBSERVED.md: noise dominates the ring; DESIGN.md OQ4 "poll
-        interval must be minutes, not days"). k is ``STALL_STRIKES`` (module
-        constant, docstring: no config key exists).
+        The health/alert field stays, but its meaning changed with STALL-ALERT-FALSE:
+        a stall is EVIDENCE OF LOSS, not "the checkpoint has not moved". A checkpoint
+        that stops moving while polls SUCCEED and the device returns nothing newer is
+        a quiet door (night/lunch) — the checkpoint only moves on major=5 punches, so
+        age alone is silence and must not page. Two shapes are evidence:
 
-        Silence for a device with NO checkpoint row: a fresh install is not a
-        stalled one (P2-03's cold-start floor governs), and inventing an alert for
-        the state every first boot passes through would train operators to ignore
-        the one that matters.
+        * a stale checkpoint AND ``STALL_STRIKES`` consecutive non-auth failed polls
+          (an ok poll resets the streak; auth failures and circuit-open skips neither
+          count nor reset);
+        * our store's oldest serialNo rose since the previous check — stored history
+          disappeared. This reads MIN(serial_no) from the keep-everything store, not
+          the device's retained floor: it is NOT ring-rollover detection, which does
+          not exist yet (card t_ed9c7e92). docs/internal/DESIGN.md:411 records the
+          intended device-side probe: "the agent must record oldest-serialNo per
+          poll (a monotonic increase of the minimum = rolling started = punches are
+          being lost)".
+
+        One page per incident: the frozen ``updated_at`` plus the evidence shape is
+        the episode key; a further rise of the floor is a new incident. Silence for
+        a device with NO checkpoint row: a fresh install is not a stalled one
+        (P2-03's cold-start floor governs), and inventing an alert for the state
+        every first boot passes through would train operators to ignore the one that
+        matters.
         """
         if self.conn is None:
             return None
@@ -531,22 +564,45 @@ class AlertPolicy:
             return None
         updated = _parse_iso(checkpoint.updated_at)
         threshold = timedelta(seconds=self.stall_strikes * self.cadence_s)
-        if self.now() - updated <= threshold:
-            # Quiet (or healed): close the episode so a LATER stall pages fresh.
-            self._stall_open_at.pop(device_serial, None)
-            return None
-        if self._stall_open_at.get(device_serial) == checkpoint.updated_at:
-            return None  # already paged for exactly this frozen checkpoint
-        self._stall_open_at[device_serial] = checkpoint.updated_at
         age = (self.now() - updated).total_seconds()
-        return self._fire(
-            LEVEL_CRITICAL,
-            KIND_CHECKPOINT_STALL,
-            device_serial,
-            f"checkpoint unmoved for {age:.0f}s (k={self.stall_strikes} x cadence "
-            f"{self.cadence_s}s) — the ring may be rolling and punches lost "
-            f"(last serial {checkpoint.checkpoint_serial})",
+        stale = self.now() - updated > threshold
+
+        oldest = read_oldest_serial(self.conn, device_serial)
+        previous_oldest = self._oldest_serial_seen.get(device_serial)
+        self._oldest_serial_seen[device_serial] = oldest
+        floor_moved = (
+            oldest is not None and previous_oldest is not None and oldest > previous_oldest
         )
+
+        streak = self._failed_streak.get(device_serial, 0)
+        failing = streak >= self.stall_strikes
+        if not (stale and failing) and not floor_moved:
+            if not stale:
+                # The checkpoint moved (or healed): close the episode so a LATER
+                # stall is a new incident and pages fresh.
+                self._stall_open_at.pop(device_serial, None)
+            return None
+
+        evidence = f"floor:{previous_oldest}->{oldest}" if floor_moved else "failing-poll"
+        episode = f"{checkpoint.updated_at}|{evidence}"
+        if self._stall_open_at.get(device_serial) == episode:
+            return None  # already paged for exactly this incident
+        self._stall_open_at[device_serial] = episode
+        if floor_moved:
+            note = (
+                f"oldest stored serialNo rose {previous_oldest} -> {oldest} — stored "
+                "history disappeared. This arm reads our keep-everything store, not "
+                "the device ring, so it is not ring-rollover detection; real "
+                "ring-rollover detection is card t_ed9c7e92 (DESIGN.md:411)"
+            )
+        else:
+            note = (
+                f"checkpoint unmoved for {age:.0f}s (k={self.stall_strikes} x cadence "
+                f"{self.cadence_s}s) and {streak} consecutive polls FAILED — no "
+                f"successful poll is proving the device has nothing newer, so punches "
+                f"may be unreported (last serial {checkpoint.checkpoint_serial})"
+            )
+        return self._fire(LEVEL_CRITICAL, KIND_CHECKPOINT_STALL, device_serial, note)
 
     # --- the warning channel: db watermark (§2b) --------------------------------------------
 

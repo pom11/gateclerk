@@ -78,9 +78,13 @@ window, and counting both label and stream would double-count. `observe_warn` co
 nothing (pinned by feeding it both markers). The §5 rollout gate needs this counter as
 EVIDENCE that fallback ≈ 0, so its source must be the loop's verdict.
 
-**oldest_serial: MIN(events.serial_no)** — P1 has no oldest-retained probe (DESIGN OQ4
-records it as the rolling detector's input: monotonic increase of the minimum = ring
-rolling). No fabrication; the docstring says so and the test recomputes the SQL.
+**oldest_serial: MIN(events.serial_no)** — this is our keep-everything store's floor,
+NOT the device's oldest retained event: no oldest-retained probe exists, so real
+ring-rollover detection does not exist yet (card t_ed9c7e92). DESIGN.md:411 records
+the intended device-side probe: record oldest-serialNo per poll; a monotonic increase
+of the minimum means rolling started. P2-05's serial-floor arm reads this store value
+and names what it actually detects: stored history disappeared. No fabrication; the
+docstring says so and the test recomputes the SQL.
 
 **push_ok/push_failed are the drain log's own cumulative counters** — wired as
 `drain(..., log=collector.observe_push_log)`, parsed from the drain line itself so
