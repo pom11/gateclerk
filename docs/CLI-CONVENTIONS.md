@@ -75,7 +75,7 @@ and the proposed classes are recorded here merged where they coincide.
 | 3 | terminal auth | 401, circuit opened to avoid an account lockout. A human must verify the credential (`gateclerk creds test`) |
 | 4 | device / protocol | the box answered and was not usable, or the host name never resolved |
 | 5 | runaway paging | the device kept saying MORE past the paging cap |
-| 6 | push failure | **reserved** for the push lane. No command returns it yet — see below |
+| 6 | push failure | **reserved for the push lane**: `gateclerk doctor` returns it when its push probe fails (push-lane failure — a failed sink/TLS check or dead-letter rows; see `src/gateclerk/doctor_cli.py`). No other command may return it without updating this file first |
 
 Two decisions worth stating plainly:
 
@@ -83,9 +83,11 @@ Two decisions worth stating plainly:
   exits 2 on a config error, so no script can distinguish them today either way.
   Splitting them means changing one of the two numbers, which is a behavior change
   rather than a refactor. See "Left" in the card handoff.
-- **6 is reserved, not wired.** `agent run` maps a parked device or an open circuit to
-  3 today and a test pins that. Giving the push lane its own code means moving that pin
-  deliberately, as its own change, not as a side effect of a naming card.
+- **6 is reserved for the push lane and `doctor` wires it.** `gateclerk doctor` returns
+  6 when its push probe fails (a failed sink/TLS check or dead-letter rows; see
+  `src/gateclerk/doctor_cli.py`). `agent run` maps a parked device or an open circuit to
+  3 today and a test pins that. Only the push lane owns 6: no other command may return it
+  without updating this file first.
 
 Mapping is one function — `cli_conventions.exit_code_for` — and `cli._fail` delegates
 to it, so a command body cannot pick a different number for the same failure. The
