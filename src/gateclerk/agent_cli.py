@@ -1051,10 +1051,22 @@ def resolve_db_path(site: SiteConfig, state_root: Path | str | None) -> str:
     Shared by `ack` and `deadletter` so a command that READS the store cannot disagree with
     the command that WROTE it. P2-01 owns the derivation of the site-derived name
     (`db_path_resolved`); this only applies the state root to a relative path.
+
+    `--state-root` may name either the site's own directory (what `service install` renders
+    into the unit) or the PARENT that holds one directory per site (what an operator passes
+    to a multi-site `doctor`/`status`). Prefer `<root>/<site>` only when it exists AND the
+    flat `<root>/<db_path>` does not: this same function is the writer's path too, so a
+    flat-layout site that happens to have a stale `<root>/<site>/` directory must keep
+    writing its flat store rather than silently opening an empty one. A root already named
+    for the site never descends a second level.
     """
     db_path = Path(site.db_path_resolved)
     if state_root is not None and not db_path.is_absolute():
-        return str(Path(state_root) / db_path)
+        root = Path(state_root)
+        per_site = root / site.name
+        if root.name != site.name and per_site.is_dir() and not (root / db_path).exists():
+            root = per_site
+        return str(root / db_path)
     return str(db_path)
 
 

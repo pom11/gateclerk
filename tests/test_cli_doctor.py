@@ -26,8 +26,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from gateclerk import agent_db, agent_store, doctor_cli
+from gateclerk import agent_cli, agent_db, agent_store, doctor_cli, service_cli, status_cli
 from gateclerk.cli import app
+from gateclerk.config import ConfigSurface, site_from_args
 from gateclerk.exceptions import IsapiAuthError, IsapiError
 from gateclerk.model import Direction, DirectionSource, EventRecord, Outcome, TzSource
 
@@ -67,11 +68,11 @@ path = "{csv_sink_path}"
     return cfg_file
 
 
-def _seed_store(db_path: Path, *, dead_letter: bool = False) -> None:
+def _seed_store(db_path: Path, *, dead_letter: bool = False, site: str = "demo-a") -> None:
     conn = agent_db.connect(db_path, now_iso=FIXED_NOW.isoformat())
     try:
         rec = EventRecord(
-            site="demo-a",
+            site=site,
             device_serial="DEMO-SN-01",
             serial_no=1,
             employee_no="DEMO-E01",
@@ -255,3 +256,214 @@ def test_doctor_exit_code_matrix_and_credential_file_permissions(
     assert res_2.exit_code == 2
     assert "chmod 600" in res_2.stdout
     assert PLANTED_DEVICE_PW not in res_2.stdout
+
+
+# --- --state-root: option (c), the unit's per-site dir vs the operator's parent ---------------
+
+
+def _write_state_root_config(tmp_path: Path, *, name: str) -> Path:
+    """A site block with the DERIVED relative db_path (`./gateclerk-<site>.sqlite3`).
+
+    This is what `service install`'s unit sees: `--state-root <base>/<site>` plus a relative
+    store name. No sinks keeps the fixture to the one section under test.
+    """
+    cfg_file = tmp_path / f"{name}.toml"
+    cfg_file.write_text(
+        f"""\
+[[site]]
+name = "{name}"
+host = "192.0.2.10"
+iana_tz = "Europe/Bucharest"
+""",
+        encoding="utf-8",
+    )
+    return cfg_file
+
+
+def _add_dead_letter(db_path: Path) -> None:
+    """Add one dead-letter row to an already-seeded store (doctor's db row FAILS on any)."""
+    conn = agent_db.connect(db_path, now_iso=FIXED_NOW.isoformat())
+    try:
+        event_id = int(conn.execute("SELECT id FROM events LIMIT 1").fetchone()[0])
+        conn.execute(
+            "INSERT INTO dead_letter (event_id, payload, endpoint, sink_name, error_class, "
+            "attempts, first_attempt_at, last_attempt_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                "{}",
+                "https://ingest.example.invalid/v1/push",
+                "cloud",
+                "HttpStatus502",
+                3,
+                "2026-11-04T11:00:00+00:00",
+                "2026-11-04T11:55:00+00:00",
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def _doctor_db_row(cfg_file: Path, *, site: str, state_root: Path) -> dict:
+    res = runner.invoke(
+        app,
+        [
+            "doctor",
+            "--config",
+            str(cfg_file),
+            "--site",
+            site,
+            "--state-root",
+            str(state_root),
+            "-o",
+            "json",
+        ],
+    )
+    rows = [json.loads(line) for line in res.stdout.splitlines() if line.strip()]
+    by_sec = {row["section"]: row for row in rows}
+    return res, by_sec["db"]
+
+
+def test_doctor_resolves_per_site_store_under_service_install_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The layout `service install` writes: parent/<site>/gateclerk-<site>.sqlite3.
+
+    `doctor` must find it whether the operator passes the PARENT (multi-site root) or the
+    per-site directory the unit itself passes. `status`, `ack` and `deadletter list` must
+    resolve the exact same store, because they all delegate to `resolve_db_path`.
+    """
+    site_name = "site-a"
+    per_site = Path(service_cli.default_state_dir("launchd", site_name, home=tmp_path))
+    parent = per_site.parent
+    per_site.mkdir(parents=True)
+    db_path = per_site / f"gateclerk-{site_name}.sqlite3"
+    _seed_store(db_path, site=site_name)
+    cfg_file = _write_state_root_config(tmp_path, name=site_name)
+
+    monkeypatch.setattr(
+        doctor_cli,
+        "default_device_prober",
+        lambda _site, **_kw: ("model=DS-K1T341 serial=DEMO-SN-01", 1.0),
+    )
+    monkeypatch.setattr(
+        doctor_cli, "default_tls_prober", lambda _host, _port, **_kw: "TLSv1.3 cert verified"
+    )
+
+    site = site_from_args(site=site_name, config_path=cfg_file, surface=ConfigSurface.AGENT)
+    expected = str(db_path)
+    assert agent_cli.resolve_db_path(site, parent) == expected
+    assert agent_cli.resolve_db_path(site, per_site) == expected
+
+    for root in (parent, per_site):
+        res, db_row = _doctor_db_row(cfg_file, site=site_name, state_root=root)
+        assert db_row["status"] == "pass", res.output
+        assert "integrity=ok" in db_row["detail"]
+        assert "no store yet" not in db_row["detail"]
+
+    # `status`: same store, same state dir (no "no store yet").
+    row = status_cli.collect_site_status(site, state_root=parent, now=FIXED_NOW)
+    assert row["state"] == str(per_site)
+    assert row["db"] != "no store yet"
+
+    # `ack`: it found the store (an empty park set exits 2 with "no parked device", while a
+    # wrong path would have said "no store at <path>: nothing to ack").
+    ack = runner.invoke(
+        app,
+        [
+            "agent",
+            "ack",
+            "--site",
+            site_name,
+            "--config",
+            str(cfg_file),
+            "--state-root",
+            str(parent),
+        ],
+    )
+    assert "no store at" not in ack.output
+    assert "no parked device" in ack.output
+
+    # `deadletter list`: the row planted in the per-site store is the one it reads.
+    _add_dead_letter(db_path)
+    dead = runner.invoke(
+        app,
+        [
+            "agent",
+            "deadletter",
+            "list",
+            "--site",
+            site_name,
+            "--config",
+            str(cfg_file),
+            "--state-root",
+            str(parent),
+            "-o",
+            "json",
+        ],
+    )
+    assert dead.exit_code == 0, dead.output
+    assert "HttpStatus502" in dead.stdout
+
+
+def test_flat_store_wins_over_existing_per_site_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flat-layout site keeps its flat store even when `<root>/<site>/` already exists.
+
+    `resolve_db_path` also serves `agent run`, the writer: descending into a stale/empty
+    per-site directory here would silently open an empty store and re-pull every event.
+    """
+    site_name = "site-a"
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / site_name).mkdir()  # an existing per-site dir with NO store in it
+    flat_db = root / f"gateclerk-{site_name}.sqlite3"
+    _seed_store(flat_db, site=site_name)
+    cfg_file = _write_state_root_config(tmp_path, name=site_name)
+
+    monkeypatch.setattr(
+        doctor_cli,
+        "default_device_prober",
+        lambda _site, **_kw: ("model=DS-K1T341 serial=DEMO-SN-01", 1.0),
+    )
+    monkeypatch.setattr(
+        doctor_cli, "default_tls_prober", lambda _host, _port, **_kw: "TLSv1.3 cert verified"
+    )
+
+    site = site_from_args(site=site_name, config_path=cfg_file, surface=ConfigSurface.AGENT)
+    assert agent_cli.resolve_db_path(site, root) == str(flat_db)
+    assert agent_cli.resolve_state_root(site, root) == root
+
+    res, db_row = _doctor_db_row(cfg_file, site=site_name, state_root=root)
+    assert db_row["status"] == "pass", res.output
+    assert "integrity=ok" in db_row["detail"]
+
+
+def test_state_root_named_for_the_site_does_not_double_descend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--state-root <base>/<site>` is the unit's form: never append `<site>` a second time."""
+    site_name = "site-a"
+    root = tmp_path / "state" / site_name
+    root.mkdir(parents=True)
+    (root / site_name).mkdir()  # decoy: a directory that a naive join would pick
+    db_path = root / f"gateclerk-{site_name}.sqlite3"
+    _seed_store(db_path, site=site_name)
+    cfg_file = _write_state_root_config(tmp_path, name=site_name)
+
+    monkeypatch.setattr(
+        doctor_cli,
+        "default_device_prober",
+        lambda _site, **_kw: ("model=DS-K1T341 serial=DEMO-SN-01", 1.0),
+    )
+    monkeypatch.setattr(
+        doctor_cli, "default_tls_prober", lambda _host, _port, **_kw: "TLSv1.3 cert verified"
+    )
+
+    site = site_from_args(site=site_name, config_path=cfg_file, surface=ConfigSurface.AGENT)
+    assert agent_cli.resolve_db_path(site, root) == str(db_path)
+
+    res, db_row = _doctor_db_row(cfg_file, site=site_name, state_root=root)
+    assert db_row["status"] == "pass", res.output
+    assert "integrity=ok" in db_row["detail"]
