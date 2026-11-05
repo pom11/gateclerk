@@ -69,13 +69,13 @@ because the two agents poll different devices.
 ### 1b. Alpine / musl container — sibling card, not this doc
 
 Production is most likely Alpine in a Docker container (§11). The image is owned by the
-**CONTAINER-ALPINE** sibling card; this repository has no Dockerfile or image target today.
-Eventually that card's `deploy/Dockerfile`, `deploy/compose.yaml` and `deploy/CONTAINER.md`
-are the container install (read from its worktree `oc_t_28346631` while this doc was
-written). Inside a container there is no systemd unit and no `LoadCredential=`; use the
-environment rungs in §2 and §3. Keep the same one-site/one-store/one-push-target rule. The
-container equivalents in §9 and §10 follow that card's compose shape; re-check their
-command names against those files when the sibling card merges.
+**CONTAINER-ALPINE** sibling card, now merged (PR #93): `deploy/Dockerfile`,
+`deploy/compose.yaml`, `deploy/CONTAINER.md` and `deploy/container_healthcheck.sh` are the
+container install (the compose project is named `gateclerk`, so the running container is
+`gateclerk-site-a-1`). Inside a container there is no systemd unit and no
+`LoadCredential=`; use the environment rungs in §2 and §3. Keep the same
+one-site/one-store/one-push-target rule. The container equivalents in §9 and §10 were
+re-checked against the merged `deploy/compose.yaml` and `deploy/CONTAINER.md`.
 
 ### 1c. Homebrew — operator-gated by the public flip
 
@@ -89,7 +89,7 @@ What depends on the flip: only `brew install`. What does **not** depend on it:
 - git clone + `uv venv` + `uv pip install` from the checkout (`deploy/README.md:55-56`);
 - `pipx install .` / `pip install .` from a checkout or wheel (`README.md:31-34`);
 - the systemd unit in `deploy/` (§1a);
-- the future container image (CONTAINER-ALPINE).
+- the container image in `deploy/` (PR #93, §1b).
 
 The operator can therefore go live without flipping anything.
 
@@ -280,7 +280,7 @@ journalctl -u gateclerk-agent@site-a -f
 journalctl -u gateclerk-agent@site-a -n 50
 ```
 
-Container install (sibling card CONTAINER-ALPINE shape; re-check when it merges): the same
+Container install (container install, deploy/compose.yaml; verified against the merged file): the same
 stderr line is in the compose service log:
 
 ```bash
@@ -405,7 +405,7 @@ journalctl -u gateclerk-agent@site-a -f
   --config /etc/gateclerk/sites.toml --state-root /var/lib/gateclerk/site-a --site site-a
 ```
 
-Container (sibling card CONTAINER-ALPINE shape; re-check when it merges):
+Container (container install, deploy/compose.yaml; verified against the merged file):
 
 ```bash
 docker compose -f deploy/compose.yaml up -d site-a
@@ -497,7 +497,7 @@ Systemd:
 sudo systemctl disable --now gateclerk-agent@site-a
 ```
 
-Container (sibling card CONTAINER-ALPINE shape; re-check when it merges):
+Container (container install, deploy/compose.yaml; verified against the merged file):
 
 ```bash
 # `stop` preserves the container and its named volume. Do not use `down -v`.
