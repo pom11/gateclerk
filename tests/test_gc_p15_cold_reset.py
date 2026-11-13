@@ -26,22 +26,28 @@ clauses those four do not reach on their own:
 (8) the probe's own window bounds are asserted on the wire — it never reads back below
     the checkpoint, and a floor it cannot place costs no request at all (fail closed).
 
-WHY A TRANSPORT SHIM (`_MajorFilteringTransport`) — read this before "fixing" it.
-The shared `FakeDevice` answers the event store with WINDOW arithmetic only and
-deliberately does NOT simulate the server-side `major`/`minor` filters
-(fakedevice.py, `_event_store_response`: "major/minor are NOT simulated server-side ...
-we never trust a server filter we have not probed"). That is the right default for a
-box whose filter behaviour is unknown, but it makes the card's own scenario
-unreachable: the narrow poll asks `major=5` (punches) and the probe asks `major=0`
-(everything), so on a filter-blind fake both reads see the same rows and a quiet tick
-can never hide the evidence the probe finds. The card's premise is precisely a device
-that DOES honour the filter it advertised — the arm OBSERVED.md's "Server-side filter
-truth" section contrasts with the silently-ignored one. So the shim re-filters the
-store's answer by the `major` the request asked for, which is what a honouring box
-returns, and leaves every other request byte-identical. Everything above it —
-`IsapiClient`, digest auth, the paging engine, `store_events`, the checkpoint CAS — is
-production code under test, unchanged. The probe request is additionally identifiable
-by `timeReverseOrder: true` + `maxResults: 1`, which is what cases (3) and (4) count.
+WHY THE FAKE HONOURS ITS `major` FILTER (`honour_event_major_filter`) — read this before
+"fixing" it. The shared `FakeDevice` answers the event store with WINDOW arithmetic and
+leaves the server-side `major` filter un-simulated UNLESS a test asks for the honouring
+arm (fakedevice.py, "The event store can ALSO honour `major` — opt-in, DEFAULT OFF").
+The default is right for a box whose filter behaviour is unknown, and it made this
+card's own scenario unreachable: the narrow poll asks `major=5` (punches) and the probe
+asks `major=0` (everything), so on a filter-blind fake both reads see the same rows and
+a quiet tick can never hide the evidence the probe finds. The card's premise is
+precisely a device that DOES honour the filter it advertised — the arm OBSERVED.md's
+"Server-side filter truth" contrasts with the silently-ignored one, and its event-log
+census is the measurement (per-`major` counts over one ring). So the scenario turns the
+shared knob on: `device.honour_event_major_filter = True`, and the narrow poll answers
+NO MATCH over the heartbeats while the `major=0` read still sees them. Everything above
+the fake — `IsapiClient`, digest auth, the paging engine, `store_events`, the
+checkpoint CAS — is production code under test, unchanged.
+`hidden_rows(device)` is the false-green guard: it asserts the arm is installed and
+returns what the filter swallowed, and case (1) requires a non-zero count, so a device
+that quietly stopped filtering leaves the probe nothing to find and the tick would
+otherwise be answered by the pre-existing in-window branch. The probe request is
+additionally identifiable by `timeReverseOrder: true` + `maxResults: 1`, which is what
+cases (3) and (4) count; case (4) kills only that request, by wrapping the loop's own
+page reader (the same inject-one-call idiom case (8) uses for `_parse_stamp`).
 
 Offline by construction: FakeDevice behind the real IsapiClient, tmp sqlite, injected
 wall + monotonic clocks, no socket. The harness and the device seeds are P2-03's own,
@@ -69,7 +75,6 @@ from test_p2_03_scheduler import (
     DEVICE_FW,
     DEVICE_FW_UPGRADED,
     DEVICE_INFO_PATH,
-    EVENT_PATH,
     RECORDED,
     LoopHarness,
     _set_firmware,
@@ -82,80 +87,67 @@ from test_p2_03_scheduler import (
 #: hourly budget has expired and the wider read is due.
 QUIET_S = RESET_PROBE_INTERVAL_S + 120
 
-#: The event POST as httpx routes it: `url.path` never carries the query string.
-_EVENT_ROUTE = EVENT_PATH.split("?")[0]
-
 SERIAL = "MASKED-SER-1"
 
 
 # --- the filter-honest device arm (see the module docstring) -----------------------------
 
 
-class _MajorFilteringTransport(httpx.BaseTransport):
-    """Wrap a FakeDevice transport so the event store honours the requested `major`.
+def honouring_device() -> FakeDevice:
+    """The box this card is about: it honours the `major` filter it advertises.
 
-    `major: 0` is the ISAPI "every major" ask (the loop's own `include_noise` walk uses
-    it), so only a non-zero `major` narrows the answer. `fail_reverse_reads` models the
-    probe request itself failing — the one arm of the card that must bend, never break.
+    That is the shared fake's opt-in arm — `tests/fakedevice.py`, "The event store can
+    ALSO honour `major`" — and it is what makes the quiet tick expressible at all: the
+    narrow `major=5` poll answers NO MATCH over the replacement's `major=3` heartbeats
+    while the probe's `major=0` read still sees them. `major: 0` narrows nothing, which
+    is why the noise-inclusive walk and the probe both keep working with the arm on.
     """
-
-    def __init__(self, inner: httpx.BaseTransport, *, fail_reverse_reads: bool = False) -> None:
-        self._inner = inner
-        self._fail_reverse = fail_reverse_reads
-        #: Rows the `major` filter swallowed on a narrow read. Test 1 asserts this is
-        #: non-zero: a shim that silently stopped filtering would leave the probe with
-        #: nothing to find and the tick would still pass, answered by the IN-WINDOW
-        #: branch instead — the exact false green this file's premise has to defend.
-        self.hidden_rows = 0
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        response = self._inner.handle_request(request)
-        # `url.path` carries NO query string on httpx, so the route is compared bare
-        # (and `AcsEventTotalNum` is not this route — endswith would catch it too).
-        if request.url.path != _EVENT_ROUTE:
-            return response
-        try:
-            payload = json.loads(request.content)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return response
-        cond = payload.get("AcsEventCond") if isinstance(payload, dict) else None
-        if not isinstance(cond, dict):
-            return response
-        if self._fail_reverse and cond.get("timeReverseOrder") is True:
-            # A dead probe read: the same shape `add_raw` raises for a transport error.
-            raise httpx.ConnectError("probe read refused (test-injected transport failure)")
-        major = cond.get("major") or 0
-        if not major:
-            return response
-        body = json.loads(response.content)
-        envelope = body.get("AcsEvent")
-        if not isinstance(envelope, dict) or "InfoList" not in envelope:
-            return response
-        rows = [r for r in envelope["InfoList"] if r.get("major") == major]
-        self.hidden_rows += len(envelope["InfoList"]) - len(rows)
-        if not rows:
-            # The recorded empty-window shape: "NO MATCH" with the space, no InfoList.
-            envelope = {
-                "searchID": envelope.get("searchID", ""),
-                "responseStatusStrg": "NO MATCH",
-                "numOfMatches": 0,
-                "totalMatches": 0,
-            }
-        else:
-            envelope.update(
-                {"numOfMatches": len(rows), "totalMatches": len(rows), "InfoList": rows}
-            )
-        return httpx.Response(200, json={"AcsEvent": envelope})
-
-
-def filter_honest(device: FakeDevice, *, fail_reverse_reads: bool = False) -> FakeDevice:
-    """Install the honour-the-filter arm on `device` (module docstring: why)."""
-    # The client takes any httpx transport; FakeDevice's attribute is typed to the
-    # MockTransport it builds itself, so the seam needs the ignore, not a cast.
-    device.transport = _MajorFilteringTransport(  # type: ignore[assignment]
-        device.transport, fail_reverse_reads=fail_reverse_reads
-    )
+    device = seeded_device()
+    device.honour_event_major_filter = True
     return device
+
+
+def hidden_rows(device: FakeDevice) -> int:
+    """Rows the `major` arm swallowed — plus the guard that the arm is really installed.
+
+    Case (1) asserts this is non-zero: an arm that silently stopped filtering would leave
+    the probe with nothing to find and the tick would still pass, answered by the
+    IN-WINDOW branch — the exact false green this file's premise has to defend. The
+    assertion is what makes "the arm went missing" a loud failure rather than a green
+    that proves nothing.
+    """
+    assert device.honour_event_major_filter, (
+        "the honour-the-filter arm is not installed, so the narrow poll sees what the "
+        "probe sees and the quiet-tick assertions would pass off the in-window branch"
+    )
+    return device.event_major_hidden
+
+
+def kill_probe_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ONLY the newest-first probe read die (case (4): bend, never break).
+
+    The probe and the narrow poll are indistinguishable to the fake's raw queue — same
+    route, same auth, same client — so a fault that names one has to be selected by what
+    the request ASKS for. Wrapping the loop's own page reader does that in one condition
+    and leaves every other request on the real path: the narrow poll still completes, the
+    tick still reports `ok`, and the probe's failure is the only thing the loop hears.
+    The same inject-one-call idiom as case (8)'s `_parse_stamp`.
+    """
+    real = agent_loop._search_reader
+
+    def reader_for(client: Any, endpoint: str = "acs_event_search") -> Any:
+        inner = real(client, endpoint)
+
+        def read(body: dict[str, Any]) -> dict[str, Any]:
+            cond = body.get("AcsEventCond") if isinstance(body, dict) else None
+            if isinstance(cond, dict) and cond.get("timeReverseOrder") is True:
+                # The same shape `add_raw` raises for a transport error.
+                raise httpx.ConnectError("probe read refused (test-injected transport failure)")
+            return inner(body)
+
+        return read
+
+    monkeypatch.setattr(agent_loop, "_search_reader", reader_for)
 
 
 def wipe_log(device: FakeDevice) -> None:
@@ -183,7 +175,6 @@ def quiet_replacement(
     *,
     new_serials: list[tuple[int, str]],
     upgraded: bool = True,
-    fail_reverse_reads: bool = False,
 ) -> LoopHarness:
     """Run to the state the card is about: epoch 0 at serial 100, then a swap.
 
@@ -192,9 +183,7 @@ def quiet_replacement(
     moves past the probe interval. The harness is returned JUST before the quiet tick,
     which the caller takes and asserts on.
     """
-    device = filter_honest(
-        seeded_device(), fail_reverse_reads=fail_reverse_reads
-    )  # the honest-filter arm, module docstring
+    device = honouring_device()  # the honest-filter arm, module docstring
     seed_events(
         device,
         [
@@ -217,16 +206,6 @@ def quiet_replacement(
     h.clock.advance(QUIET_S)
     h.monotonic.advance(QUIET_S)
     return h
-
-
-def _shim(device: FakeDevice) -> _MajorFilteringTransport:
-    """The installed arm, or a loud failure: a quietly-missing shim is a false green."""
-    transport = device.transport
-    assert isinstance(transport, _MajorFilteringTransport), (
-        "the honour-the-filter arm is not installed, so the narrow poll sees what the "
-        "probe sees and the quiet-tick assertions would pass off the in-window branch"
-    )
-    return transport
 
 
 def probe_reads(device: FakeDevice) -> list[dict[str, Any]]:
@@ -280,7 +259,7 @@ def test_quiet_replacement_is_detected_one_hour_after_the_last_tick(tmp_path: Pa
     # The evidence lived ONLY behind the narrow poll's filter: the poll was blind to it
     # (rows hidden) and the newest-first read is what found it. Without this pin the
     # test could be answered by the pre-existing in-window branch and prove nothing here.
-    assert _shim(h.device).hidden_rows > 0
+    assert hidden_rows(h.device) > 0
     assert len(probe_reads(h.device)) == 1
     assert quiet.serial_reset is not None
     assert (quiet.serial_reset.old_serial, quiet.serial_reset.new_serial) == (100, 3)
@@ -403,7 +382,9 @@ def test_quiet_probe_runs_at_most_once_per_hour(tmp_path: Path) -> None:
 # --- DoD (4): a probe that raises must not fail the tick or move the checkpoint ----------
 
 
-def test_failed_quiet_probe_does_not_fail_the_tick(tmp_path: Path) -> None:
+def test_failed_quiet_probe_does_not_fail_the_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The alert path bends, never breaks: a dead probe read is "no evidence".
 
     Same scenario as DoD (1) — a real reset is waiting to be found — except the
@@ -414,8 +395,8 @@ def test_failed_quiet_probe_does_not_fail_the_tick(tmp_path: Path) -> None:
     h = quiet_replacement(
         tmp_path,
         new_serials=[(1, "2026-10-19T09:57:00"), (3, "2026-10-19T10:08:00")],
-        fail_reverse_reads=True,
     )
+    kill_probe_reads(monkeypatch)  # only the newest-first read dies; the poll completes
     quiet = h.tick()
 
     assert quiet.ok, quiet.error
