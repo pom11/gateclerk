@@ -79,6 +79,7 @@ from test_p2_03_scheduler import (
     SYSTEM_TIME_PATH,
     T0,
     device_event,
+    system_time_body_at,
 )
 
 RECORDED = Path(__file__).parent / "fixtures" / "recorded" / "site-a-ds-k1t341amf-s"
@@ -155,12 +156,21 @@ class FakeMonotonic:
 
 
 def seeded_device(**over: Any) -> FakeDevice:
-    """A FakeDevice answering the loop's bootstrap GETs with the RECORDED site-a bodies."""
+    """A FakeDevice answering the loop's bootstrap GETs with the RECORDED site-a bodies.
+
+    The `System/time` answer is the recorded body with its wall digits derived from the
+    harness clock (P2-03's `system_time_body_at`), NOT the 2026-10-15 probe snapshot verbatim:
+    a box whose RTC sits days off is a different scenario from the one these CLI cases pin, and
+    since GC-P04 wired the tick's `Skew` into P2-05's warning channel such a box also prints a
+    `clock_skew` line on stderr — which `CliRunner` folds into `result.output`, right where a
+    `--output json` test tries to parse JSON. The claimed `+02:00` stamp is kept verbatim, so
+    window labels and event-window bounds are untouched.
+    """
     device = FakeDevice(password=PASSWORD)
     device.claimed_offset_min = over.pop("claimed", CLAIM_MIN)
     assert not over, f"unknown seed knobs: {sorted(over)}"
     device.xml_ok("GET", DEVICE_INFO_PATH, (RECORDED / "device_info.xml").read_text())
-    device.xml_ok("GET", SYSTEM_TIME_PATH, (RECORDED / "system_time.xml").read_text())
+    device.xml_ok("GET", SYSTEM_TIME_PATH, system_time_body_at(T0))
     device.add(
         "GET",
         ACS_CAPS_PATH,

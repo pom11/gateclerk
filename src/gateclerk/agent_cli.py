@@ -645,6 +645,16 @@ class SiteAgent:
             report.absorb(result)
             key = loop.device_serial or PENDING_SERIAL
             self._last_tick[key] = result
+            # GC-P04: the clock channel, fed by the reading GC-P03 already refreshes. Both
+            # surfaces get the SAME Skew object — the policy's one-warning-per-episode rule
+            # (§2c) and the collector's §2e gauge — and this sits ahead of the ok/fail split
+            # on purpose: a terminal can be reachable enough to answer System/time and still
+            # fail the event walk, and an RTC an hour off corrupts R1's payroll scan either
+            # way. Neither observer raises; neither writes to the device.
+            if result.clock_skew is not None:
+                report.alerts.extend(self.policy.observe_skew(result.clock_skew))
+                if self.collector is not None:
+                    self.collector.observe_skew(key, result.clock_skew)
             if self.collector is not None:
                 self.collector.observe_tick(result, device_serial=key, client=loop.client)
             # The nonce-recovery total is the transport's OWN counter (an info line, never an

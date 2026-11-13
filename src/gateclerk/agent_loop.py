@@ -179,6 +179,10 @@ class TickResult:
     #: (paging.py:351) — the §2e `search_termination` observable: P2-06 reports it,
     #: so the loop hands it over instead of the health module re-walking anything.
     termination: str | None = None
+    #: The device wall-clock reading from this tick's System/time refresh, if any.
+    #: P2-05 turns a warning Skew into one clock_skew alert; P2-06 stores the gauge.
+    #: GC-P03 only ever stored it on the loop; this field is what gets it out.
+    clock_skew: Skew | None = None
     #: Set ONLY on the tick that confirmed a serialNo reset and opened the new epoch.
     #: P2-05 turns this into one critical alert naming both serials; later ticks leave
     #: it None, so the incident never pages again.
@@ -374,6 +378,10 @@ class DeviceLoop:
             )
         since, until = None, None
         before: Checkpoint | None = None
+        # Bound BEFORE the try: a failure in `_ensure_device_state()` (a 401 at bootstrap,
+        # say) reaches the `except` below, and the failed result must then report "no clock
+        # reading" rather than raise NameError on its way out.
+        skew: Skew | None = None
         try:
             self._ensure_device_state()
             if self.device_serial is None:  # pragma: no cover - _ensure raises otherwise
@@ -389,6 +397,12 @@ class DeviceLoop:
                 or self._monotonic() - self._claim_read_at >= DEVICE_CLAIM_REFRESH_S
             ):
                 self._refresh_device_claim()
+            # GC-P04: hand the reading up. `_last_skew` is written ONLY by a SUCCESSFUL
+            # System/time read and is never cleared by a failed one, so what the tick reports
+            # is a SAMPLED measurement (up to DEVICE_CLAIM_REFRESH_S old), not a per-tick one —
+            # recomputing it here would put a clock GET in every tick, which §2a's nonce-budget
+            # math is exactly what GC-P03's cadence exists to protect.
+            skew = self._last_skew
             # Capture the checkpoint BEFORE the per-chunk advances below. The ring-floor
             # probe (card t_ed9c7e92) compares the device's oldest retained event with
             # this value: after the walk there is nothing retained above the advanced
@@ -492,10 +506,11 @@ class DeviceLoop:
                 checkpoint_time_before=(before.checkpoint_time if before else None),
                 advanced=advanced,
                 termination=counts.termination,
+                clock_skew=skew,
                 serial_reset=reset,
             )
         except Exception as exc:
-            return self._failure(exc, since=since, until=until)
+            return self._failure(exc, since=since, until=until, skew=skew)
 
     def probe_ring_floor(self, since_stamp: str) -> int | None:
         """One read-only AcsEvent page: the oldest event of ANY major still retained.
@@ -835,7 +850,15 @@ class DeviceLoop:
 
     # --- internals ----------------------------------------------------------------------
 
-    def _failure(self, exc: Exception, *, since: Any, until: Any) -> TickResult:
+    def _failure(
+        self, exc: Exception, *, since: Any, until: Any, skew: Skew | None = None
+    ) -> TickResult:
+        """A failed tick, as data (never an exception into the scheduler).
+
+        `skew` is the clock reading the tick had already collected when the failure
+        happened — the walk and the clock read are separate facts, and P2-05/P2-06 still
+        have to see the one it got (GC-P04). It is None when nothing was read yet.
+        """
         checkpoint = read_checkpoint(self.conn, self.device_serial) if self.device_serial else None
         circuit_open = self.client.circuit_open()
         # The transport already opened the circuit on a terminal 401 (lockout
@@ -849,6 +872,7 @@ class DeviceLoop:
             exception=exc,
             window_label=self._label(),
             checkpoint_serial=checkpoint.checkpoint_serial if checkpoint else None,
+            clock_skew=skew,
         )
 
     def _ensure_device_state(self) -> None:

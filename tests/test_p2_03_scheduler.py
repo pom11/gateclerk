@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -124,13 +125,51 @@ def device_event(serial: int, wall: str) -> dict[str, Any]:
     }
 
 
+def system_time_body_at(moment: datetime) -> str:
+    """The recorded `System/time` body with its wall digits at `moment`, claimed stamp kept.
+
+    THE DEVICE CLOCK, DERIVED — not frozen. The recorded body carries a 2026-10-15 probe
+    snapshot (`localTime 2026-10-15T16:39:32+02:00`). Served verbatim to a run whose injected
+    clock is `T0` — or `T0` plus days, which the ring-floor cases do — the fake is a terminal
+    whose RTC sits days off the agent's. Nothing read that reading until GC-P04 wired the tick's
+    `Skew` into P2-05's warning channel, at which point every such test woke up holding a
+    `clock_skew` warning it never claimed to be about. A real RTC keeps counting, so the honest
+    fixture DERIVES the reading from the scenario clock; `e2e_harness._fresh_wall` already does
+    exactly this for the goldens, for the same stated reason ("no golden ages; skew measures the
+    clock, not fixture rot from a 2026-10-15 probe snapshot").
+
+    Only the digits move. The `<localTime>` *suffix* — the +02:00 stamp OBSERVED.md proves is
+    wrong inside +03:00 summer — survives verbatim, because that stamp, not the reading, is what
+    defines this scenario and what every window-label assertion here depends on.
+    """
+    text = (RECORDED / "system_time.xml").read_text()
+    wall = moment.astimezone(ZoneInfo(SITE_TZ)).strftime("%Y-%m-%dT%H:%M:%S")
+    stamped, hits = re.subn(
+        r"<localTime>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}([^<]*)</localTime>",
+        lambda m: f"<localTime>{wall}{m.group(1)}</localTime>",
+        text,
+        count=1,
+    )
+    assert hits == 1, (
+        "the recorded System/time body lost its <localTime> element: the seam below would "
+        "stamp nothing and every clock-sensitive test here would silently stop testing"
+    )
+    return stamped
+
+
 def seeded_device(**over: Any) -> FakeDevice:
-    """A FakeDevice answering the loop's bootstrap GETs with the RECORDED site-a bodies."""
+    """A FakeDevice answering the loop's bootstrap GETs with the RECORDED site-a bodies.
+
+    Its RTC is derived from the scenario clock (`T0`) by `system_time_body_at`, so a default
+    seeded box is a device whose clock is RIGHT — which is what every scheduler/agent test
+    here assumes unless it is specifically about a skewed clock (then: `reset` the
+    `System/time` route to your own body, the way GC-P04's skew tests do).
+    """
     device = FakeDevice(password=PASSWORD)
     device.claimed_offset_min = over.pop("claimed", DEVICE_CLAIM_MIN)
     assert not over, f"unknown seed knobs: {sorted(over)}"
     device.xml_ok("GET", DEVICE_INFO_PATH, (RECORDED / "device_info.xml").read_text())
-    device.xml_ok("GET", SYSTEM_TIME_PATH, (RECORDED / "system_time.xml").read_text())
+    device.xml_ok("GET", SYSTEM_TIME_PATH, system_time_body_at(T0))
     device.add(
         "GET",
         ACS_CAPS_PATH,
