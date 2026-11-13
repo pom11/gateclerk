@@ -104,6 +104,7 @@ Every read command accepts `-o table` (default human view) or `-o json` / `-o js
 | `gateclerk service install\|uninstall\|logs` | Render `launchd` plist (macOS) or `systemd` unit (Linux) and print load/unload/log commands (never auto-loads) |
 | `gateclerk agent run \| ack \| deadletter list\|remove` | Run the poll+drain loop, clear a 401 device park after fixing credentials, or inspect/remove dead-letter rows |
 | `gateclerk migrate probe\|export\|diff\|apply\|undo` | Terminal-to-terminal user/card/face enrollment migration pipeline |
+| `gateclerk migrate clean` | Report enrollment bundles and run journals older than `--older-than` (default `7d`) — a dry run by default; `--apply` deletes them. `probes/` is never touched (GC-14 retention) |
 
 ### Delivery sinks decision table (`[[site.sink]]` vs `push_target`)
 

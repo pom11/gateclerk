@@ -60,6 +60,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import stat
 import string
 from collections.abc import Iterable, Mapping, Sequence
@@ -83,6 +84,7 @@ __all__ = [
     "VOLATILE_URL_FIELDS",
     "BundleData",
     "BundleManifest",
+    "CleanReport",
     "FaceTemplate",
     "FacesIndex",
     "FingerprintIndex",
@@ -1089,3 +1091,106 @@ def _verify_one_b64(
             "bundle was edited or truncated after export; refusing to diff, verify "
             "or restore from it"
         )
+
+
+# --- TTL purge (GC-14 / GC-P16c) -------------------------------------------------------------
+
+#: The two buckets a TTL purge may touch, spelled as the private root lays them out
+#: (``<root>/bundles`` and ``<root>/runs``, §2/§5a). ``migrate_apply`` owns these names
+#: (``BUNDLES_DIR_NAME`` / ``RUNS_DIR_NAME``) and imports this module, so importing them
+#: back here would be a cycle; ``tests/test_gc_p16c_migrate_clean.py`` pins the two
+#: spellings equal, which is what stops them drifting apart silently.
+#:
+#: ``PROBES_DIR_NAME`` is deliberately NOT here. The probe cache is the gate that lets a
+#: later command read at all (§3), not a copy of someone's biometrics, and a purge that
+#: aged it out would silently turn a working site into one that refuses to diff.
+_BUNDLES_BUCKET = "bundles"
+_RUNS_BUCKET = "runs"
+
+
+@dataclass(frozen=True, slots=True)
+class CleanReport:
+    """What one ``migrate clean`` pass found, and — with ``apply`` — what it removed.
+
+    The buckets stay separate rather than one flat tuple because an operator reviews them
+    differently: a bundle is the rollback source a restore reads, a run journal is §5a's
+    evidence of a write. ``apply`` travels with the report so a dry run can never be
+    re-read later as a delete log it was not.
+    """
+
+    root: Path
+    older_than: datetime
+    apply: bool
+    bundles: tuple[Path, ...] = ()
+    runs: tuple[Path, ...] = ()
+
+    @property
+    def count(self) -> int:
+        return len(self.bundles) + len(self.runs)
+
+
+def clean_artifacts(
+    root: Path,
+    *,
+    older_than: datetime,
+    apply: bool = False,
+    now: datetime | None = None,
+) -> CleanReport:
+    """List (and with ``apply``, delete) bundle/run dirs older than the cutoff.
+
+    ``probes/`` is never touched: the 7-day probe cache is a read gate, not a PII
+    artifact. A path is old when its directory mtime is before ``older_than``.
+
+    The scope is the whole safety story, so it is spelled out:
+
+    * exactly two directories are walked — ``<root>/bundles`` and ``<root>/runs``. Nothing
+      else under ``root`` is even opened, and nothing outside ``root`` can be reached:
+      every deleted path is a child of one of those two by construction;
+    * only DIRECTORIES are candidates, so a stray file (a writer's leftover ``*.partial``
+      sibling) is reported by neither and deleted by neither;
+    * the comparison is strict: a path stamped exactly AT the cutoff is kept, because
+      "older than 7 days" does not include "exactly 7 days";
+    * a ``stat()`` that fails skips the entry instead of aborting the pass — a directory
+      another process is mid-way removing is not a reason to lose the whole report.
+
+    ``now`` is the caller's INJECTED clock (the repo's clock rule: no timestamp in this
+    feature is read from the wall here). It has one job: a cutoff ahead of it would make
+    every artifact on disk "older" than the cutoff, so a purge whose cutoff is in the
+    future is refused rather than run. It is optional because the report is also useful
+    to a caller that has already reasoned about the cutoff.
+    """
+    root = Path(root)
+    if now is not None and older_than > now:
+        raise ValueError(
+            f"older_than {older_than.isoformat()} is ahead of now "
+            f"({now.isoformat()}): every artifact would count as older than it — a "
+            "purge whose cutoff is in the future is refused, not run"
+        )
+
+    chosen_bundles: list[Path] = []
+    chosen_runs: list[Path] = []
+    for base, bucket in (
+        (root / _BUNDLES_BUCKET, chosen_bundles),
+        (root / _RUNS_BUCKET, chosen_runs),
+    ):
+        if not base.is_dir():
+            continue
+        for child in sorted(base.iterdir()):
+            if not child.is_dir():
+                continue
+            try:
+                mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=UTC)
+            except OSError:
+                continue
+            if mtime < older_than:
+                bucket.append(child)
+    if apply:
+        for path in (*chosen_bundles, *chosen_runs):
+            shutil.rmtree(path)
+    return CleanReport(
+        root=root,
+        older_than=older_than,
+        apply=apply,
+        bundles=tuple(chosen_bundles),
+        runs=tuple(chosen_runs),
+    )

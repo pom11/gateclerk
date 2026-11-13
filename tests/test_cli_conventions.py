@@ -128,6 +128,7 @@ EXPECTED_LEAVES: set[str] = {
     "export scans",
     "init",
     "migrate apply",
+    "migrate clean",
     "migrate diff",
     "migrate export",
     "migrate probe",
@@ -173,9 +174,10 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 37 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
-    # `users import` / `users template`; +1 for GC-P15 follow-up 2's `agent probe list`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 37
+    # 38 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
+    # `users import` / `users template`; +1 for GC-P15 follow-up 2's `agent probe list`;
+    # +1 for GC-P16c's `migrate clean`.
+    assert len(leaves) == len(EXPECTED_LEAVES) == 38
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
