@@ -274,11 +274,13 @@ def test_bearer_resolves_from_the_site_keychain_item_not_a_global_fallback() -> 
 
 
 def test_bearer_resolves_from_env_when_no_token_is_passed() -> None:
-    """The env rung mirrors the function's own `GATECLERK_INGEST_TOKEN_<SITE>` naming.
+    """The env rung is the AGENT's own contract: `GATECLERK_INGEST_TOKEN_<SITE>`.
 
-    Same variable name on both ends on purpose: the operator sets one name per site and
-    it works in the agent's environment and in the Cloud Run function's. Lowercase site
-    names are uppercased for the lookup because the function uppercases its site codes.
+    That spelling belongs to the agent alone. The Cloud Run receiver reads its own
+    legacy-prefixed constant and site-list env var from its own secret store
+    (deliberately not spelled here; see the private plan), so the two ends are
+    configured independently and neither name has to match. Lowercase site names are
+    uppercased for the lookup because the receiver uppercases site codes before comparing.
     """
     client, capture = client_for(200)
     transport = agent_push.https_transport(
