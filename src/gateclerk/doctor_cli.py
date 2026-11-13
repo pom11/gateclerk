@@ -423,20 +423,22 @@ def _check_sinks_section(
             keychain_probe=probe_kc,
             other_paths=others,
         )
-        # If token-refs check failed on keychain/env, also check the Linux credential file
-        # for the ingest ref (`gateclerk-ingest-<site>` or `spec.token_keychain`) before failing.
+        # If the token-ref check failed on keychain/env, also check the Linux credential file
+        # for the ingest ref (`gateclerk-ingest-<site>` or `spec.token_keychain`) before
+        # failing. The name is `sink_cli._check_token_refs`'s (singular) — a plural spelling
+        # here made this fallback unreachable and filed a missing bearer under exit 6.
         sink_failed = False
         for chk in checks:
-            if not chk.ok and chk.check == "token-refs":
+            if not chk.ok and chk.check == "token-ref":
                 ing_ref = spec.token_keychain or credentials.ingest_ref(site.name)
                 file_ok, file_detail = _check_cred_file_ref(ing_ref, env=environ)
                 if file_ok is True and file_detail:
-                    summaries.append(f"{spec.name}:token-refs={file_detail}")
+                    summaries.append(f"{spec.name}:token-ref={file_detail}")
                     continue
             if not chk.ok:
                 sink_failed = True
                 failures.append(f"{spec.name}:{chk.check}: {chk.detail}")
-                if chk.check in ("config", "token-refs", "directory", "path-collision"):
+                if chk.check in ("config", "token-ref", "directory", "path-collision"):
                     exit_code = exit_code or CONFIG_ERROR_EXIT
                 else:
                     exit_code = exit_code or PUSH_FAILURE_EXIT
