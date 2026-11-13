@@ -10,10 +10,13 @@ module that owns it and is reused untouched (seam 6, "reuse, do not fork"):
   which is what makes the checkpoint rule below enforceable.
 * `pipeline.event_record_from_device` — the p1-07 assembly contract (27-key record,
   classification verdict, tz provenance verbatim from p1-06).
-* `pipeline.read_device_identity` / `read_capabilities` / `device_window_labels` — the
+* `pipeline.read_device_identity` / `read_capabilities` / `device_time_reading` — the
   once-per-client bootstrap: the serial is half the store key, the caps clamp paging,
   and the device's claimed offset labels every window (seam 7: device-claimed labels
-  or the WARNED site fallback, never silent, never naive).
+  or the WARNED site fallback, never silent, never naive). The claimed offset is the
+  one bootstrap value that is NOT frozen for the life of the client: it is re-read on
+  the bounded `DEVICE_CLAIM_REFRESH_S` cadence (GC-P03, DST), by the single reader
+  `DeviceLoop._refresh_device_claim`.
 * `isapi_transport.IsapiClient` — digest session, busy backoff, the 401 circuit. ONE
   client per device, kept alive across ticks (spec §2a: rebuilding per poll pays an
   extra handshake per cycle and hits the ~190-request nonce use-cap far sooner; OBSERVED.md).
@@ -66,7 +69,7 @@ from gateclerk.agent_store import (
     store_events,
 )
 from gateclerk.config import DeviceTarget, resolve_credentials
-from gateclerk.exceptions import IsapiError
+from gateclerk.exceptions import IsapiAuthError, IsapiError
 from gateclerk.isapi_transport import IsapiClient
 from gateclerk.paging import (
     DEFAULT_CHUNK,
@@ -78,13 +81,13 @@ from gateclerk.paging import (
 )
 from gateclerk.pipeline import (
     NOISE_MAJOR,
-    device_window_labels,
+    device_time_reading,
     event_record_from_device,
     paging_limits_from_caps,
     read_capabilities,
 )
 from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
-from gateclerk.tz import TimeResolver, offset_hhmm
+from gateclerk.tz import Skew, TimeResolver, compute_skew, offset_hhmm
 
 __all__ = [
     "DEFAULT_DEVICE_USERS_INTERVAL_S",
@@ -112,6 +115,17 @@ _COLD_START_BACK = "cadence + overlap"
 #: once the newest serial is strictly below the checkpoint. 100 serials is ~100 min
 #: of site-a's 1/min noise stream, well above any overlap or paging jitter.
 RESET_MIN_SERIAL_DROP = 100
+
+#: GC-P03: how often a RUNNING loop re-reads `GET /ISAPI/System/time`. The card's
+#: tension in one number: the claimed UTC offset is the label every event window goes
+#: out with, and it moves at a DST transition — cached for the life of the process it
+#: shifts the poll window by an hour until someone restarts the unit (the payroll bug
+#: OBSERVED.md's A/B proved). But `/ISAPI/System/time` is still a request, and every
+#: request spends the ~190-use nonce budget (OBSERVED.md "Digest nonce use-cap"), so
+#: the read cannot simply become per-tick either. Fifteen minutes is short enough to
+#: bound a DST error to one poll and long enough that the 5-minute cadence reads the
+#: clock on at most every third tick.
+DEVICE_CLAIM_REFRESH_S = 15 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,12 +334,22 @@ class DeviceLoop:
         #: roster's sense (the roster row goes to a companion table, not the punch stream), so
         #: it is a separate seam rather than a value crammed into `_sink_transports`.
         self._sink_writers: dict[str, Any] = dict(sink_writers or {})
-        # Bootstrap state: read once per client, never per tick (spec §2a math).
+        # Bootstrap state: read once per client, never per tick (spec §2a math) — EXCEPT
+        # the claimed offset, which GC-P03 bounds instead of freezing (see
+        # DEVICE_CLAIM_REFRESH_S and _refresh_device_claim).
         self.device_serial: str | None = None
         self._caps: Any = None
         self._claim: int | None = None
         self._claim_note: str | None = None
         self._bootstrapped = False
+        #: Monotonic stamp of the last SUCCESSFUL System/time read (None until one
+        #: lands). It is deliberately not moved by a failed read: the next tick then
+        #: retries rather than stranding the last claim for a whole interval.
+        self._claim_read_at: float | None = None
+        #: The last reading/skew the loop actually got off the wire. GC-P03 only stores
+        #: them; GC-P04 wires the skew into the alert policy and the health gauge.
+        self._last_device_time: Any = None
+        self._last_skew: Skew | None = None
 
     # --- the tick -----------------------------------------------------------------------
 
@@ -354,6 +378,17 @@ class DeviceLoop:
             self._ensure_device_state()
             if self.device_serial is None:  # pragma: no cover - _ensure raises otherwise
                 raise IsapiError("bootstrap completed without a device serial")
+            # GC-P03: the claimed UTC offset is a CLOCK reading, not a constant. One
+            # System/time GET at bootstrap plus one per DEVICE_CLAIM_REFRESH_S — never
+            # one per tick (§2a's nonce-budget math still holds: at the 5-minute cadence
+            # this is at most one extra cheap GET per three ticks). A DST transition
+            # therefore shifts the window label within one interval instead of for the
+            # life of the unit.
+            if (
+                self._claim_read_at is None
+                or self._monotonic() - self._claim_read_at >= DEVICE_CLAIM_REFRESH_S
+            ):
+                self._refresh_device_claim()
             # Capture the checkpoint BEFORE the per-chunk advances below. The ring-floor
             # probe (card t_ed9c7e92) compares the device's oldest retained event with
             # this value: after the walk there is nothing retained above the advanced
@@ -819,13 +854,16 @@ class DeviceLoop:
     def _ensure_device_state(self) -> None:
         """The once-per-client bootstrap: identity, caps, claimed window label.
 
-        `read_capabilities` (pipeline → p1-04 discover) does its OWN deviceInfo read
+        `read_capabilities` (pipeline → p1-04 discover) does ITS OWN deviceInfo read
         for the cache key and carries the serial on the result — so the serial comes
         from there rather than a second `read_device_identity` GET: every request
         counts against the ~190-use nonce cap (spec §2a math). A blank serial is
-        refused (the store key cannot be honoured; pipeline's own rule). The claimed
-        offset is read exactly once per client (device_window_labels' rule: re-reads
-        spend requests against the cap for an answer that does not change).
+        refused (the store key cannot be honoured; pipeline's own rule).
+
+        The claimed offset goes through `_refresh_device_claim`, which is the ONLY
+        reader of the clock in this class — the bootstrap is no longer special, it is
+        simply the first read on the bounded cadence (GC-P03: an offset cached for the
+        life of the process is an hour of wrong windows after a DST transition).
         """
         if self._bootstrapped:
             return
@@ -835,12 +873,45 @@ class DeviceLoop:
                 "deviceInfo carried no serialNumber — the store key (device_serial, "
                 "serial_no) cannot be honoured; refusing to store records with a blank serial"
             )
-        labels = device_window_labels(self.client)
         self.device_serial = caps.serial
         self._caps = caps
-        self._claim = labels.claimed_offset_min
-        self._claim_note = labels.note
+        self._refresh_device_claim()
         self._bootstrapped = True
+
+    def _refresh_device_claim(self) -> None:
+        """Read the claimed offset (and the wall clock for skew) on a bounded cadence.
+
+        The loop's ONE System/time reader (GC-P03). Three outcomes, deliberately
+        different (OBSERVED.md's three failure classes):
+
+        * a good read moves `_claim` (the label every window goes out with), records the
+          reading and its skew, and stamps the cadence clock;
+        * a device fault that is NOT auth keeps the LAST GOOD claim and records why the
+          read failed — losing the poll because a clock read failed is strictly worse
+          than polling on a claim that may be an hour stale, and the p1-05c fallback
+          (site-labeled, warned) only ever applies when there is no claim at all;
+        * an `IsapiAuthError` RE-RAISES (pipeline `device_window_labels`' own rule): an
+          unauthenticated run must not spend its one cheap read deciding to degrade
+          payroll windows quietly — a wrong credential is a human's call, exit 3.
+
+        A failed read does not move `_claim_read_at`, so the NEXT tick retries instead
+        of waiting out another interval with a stale label.
+        """
+        try:
+            reading, _raw = device_time_reading(self.client)
+        except IsapiAuthError:
+            raise
+        except IsapiError as exc:
+            # A transient read failure keeps the last good claim; the walk still runs.
+            self._claim_note = f"System/time unreadable: {exc}"
+            return
+        self._last_device_time = reading
+        self._last_skew = compute_skew(reading, our_now=self._now(), site_tz=self.site_tz)
+        self._claim = reading.claimed_offset_minutes
+        self._claim_note = (
+            None if self._claim is not None else (reading.note or "no claimed UTC offset")
+        )
+        self._claim_read_at = self._monotonic()
 
     def _reset_evidence(self, checkpoint: Checkpoint, newest: int) -> SerialReset | None:
         """Confirm a serialNo reset from fresh deviceInfo — or return None.
