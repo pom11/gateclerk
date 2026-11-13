@@ -129,14 +129,20 @@ Still broken while the projected sink has `"type": ""` and `dropped` names `sink
    ```python
    to, d_to = _safe_recipient(raw_sink.get("to"))
    dropped.extend(d_to)
+
    timeout_raw = raw_sink.get("timeout_s")
-   timeout_s = timeout_raw if isinstance(timeout_raw, (int, float)) and timeout_raw > 0 else None
-   if timeout_raw is not None and timeout_s is None:
+   timeout_ok = (
+       isinstance(timeout_raw, (int, float)) and not isinstance(timeout_raw, bool) and timeout_raw > 0
+   )
+   timeout_s = timeout_raw if timeout_ok else None
+   if timeout_raw is not None and not timeout_ok:
        dropped.append("sink.timeout_s")
+
    accepts_raw = raw_sink.get("accepts_roster", True)
    accepts_roster = accepts_raw if isinstance(accepts_raw, bool) else True
    if not isinstance(accepts_raw, bool):
        dropped.append("sink.accepts_roster")
+
    headers, d_headers = _safe_headers(raw_sink.get("headers"))
    dropped.extend(d_headers)
    ```
