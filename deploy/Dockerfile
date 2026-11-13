@@ -29,8 +29,9 @@
 #     add the compiler to the `build` stage only — never to `runtime`.
 #   * site state directories are created in the image, one per documented site. Docker
 #     gives an empty named volume the ownership of its image mount point; without the
-#     directory here Docker creates it as root and uid 10001 cannot write. Add a site
-#     with --build-arg GATECLERK_SITES="site-a site-b site-c" (spaces).
+#     directory here Docker creates it as root and uid 10001 cannot write. The default
+#     list is the documented site set (`site-a site-b site-c`); an operator adds a site
+#     with --build-arg GATECLERK_SITES="site-a site-b site-c site-d" (spaces).
 
 # micro-notify is pinned to a commit SHA, not a moving branch. It is fetched as the
 # GitHub archive tarball in the build stage below. Bump this one ARG deliberately.
@@ -74,7 +75,12 @@ RUN mkdir -p /build/micro-notify \
 
 FROM python:3.12-alpine AS runtime
 
-ARG GATECLERK_SITES="site-a site-b"
+# The documented site set, one state directory per site. Creating them here is what lets
+# a named volume mounted at /var/lib/gateclerk/<site> inherit uid 10001 instead of the
+# root-owned empty directory Docker would otherwise make. An operator who serves a site
+# outside this list adds it at build time, space-separated:
+#   --build-arg GATECLERK_SITES="site-a site-b site-c site-d"
+ARG GATECLERK_SITES="site-a site-b site-c"
 
 # tzdata is what makes ZoneInfo("Europe/Bucharest") work on musl; Alpine ships no
 # tz database by default. The agent computes device-local windows from the site zone.

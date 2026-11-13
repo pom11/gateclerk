@@ -619,9 +619,9 @@ def test_dockerfile_defaults_to_alerts_and_keeps_an_alertless_target() -> None:
     text = deploy_text(DEPLOY / "Dockerfile")
     pin = re.search(r"^ARG MICRO_NOTIFY_SHA=([0-9a-f]{40})$", text, re.MULTILINE)
     assert pin, "micro-notify must be pinned by a full commit SHA build arg"
-    assert 'ARG GATECLERK_SITES="site-a site-b"' in text, (
-        "the documented site state dirs must exist in the image so named volumes inherit "
-        "uid 10001 instead of Docker's root-owned mount point"
+    assert 'ARG GATECLERK_SITES="site-a site-b site-c"' in text, (
+        "every documented site's state dir must exist in the image so named volumes "
+        "inherit uid 10001 instead of Docker's root-owned mount point"
     )
     assert "FROM runtime AS alerts" in text, "the default (last) stage must include alerts"
     alerts = text[text.index("FROM runtime AS alerts") :]
