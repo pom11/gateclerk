@@ -44,6 +44,11 @@ caller passes `PushLedger.sent_event_ids()`) and that has aged past the local wi
 Everything else stays the owner's call, and everything the queue or the dead-letter
 still points at survives. See the function's own docstring for the four guards.
 
+Because that delete raises `MIN(serial_no)`, it also accounts for itself to the
+`AlertPolicy` whose connection it deleted from (`note_pruned`) — P2-05's
+"stored history disappeared" arm reads that same minimum, and a rise nobody accounted
+for must keep paging. A delete made without a policy in hand therefore pages, by design.
+
 Two refusals this module owns, both anti-loss:
 
 * `UnusableRecordError` — a record with `serial_no=None` cannot honour the pinned key:
@@ -877,6 +882,7 @@ def prune_pushed_events(
     *,
     event_ids: set[int],
     before_utc: str,
+    policy: Any | None = None,
 ) -> int:
     """Delete pushed events older than the cutoff; queued/dead-lettered rows survive.
 
@@ -918,9 +924,24 @@ def prune_pushed_events(
 
     Returns the number of rows deleted, and nothing else: no id, name or payload crosses
     this boundary (P2-06's rule for state surfaces, applied to a return value).
+
+    `policy` — an `agent_alert.AlertPolicy`, duck-typed so this module never imports it —
+    is told, for each device the delete touched, what floor remains. That notification is
+    the only thing that lets ``check_stall`` distinguish this sanctioned housekeeping from
+    history that disappeared on its own (GC-P16a follow-up), and it is deliberately strict:
+    it goes to a policy only when that policy reads THIS connection (it excuses a rise in
+    the store it reads), it carries a serial and an integer and nothing else, and it is sent
+    only after the delete committed. A caller that passes no policy gets the same delete
+    with no attribution — which is exactly the owner's purge shape, and must keep paging.
     """
     if not event_ids:
         return 0
+    # Attribution is only honest about a store the policy actually reads: `check_stall`
+    # answers from `policy.conn`, so a policy wired to another connection must be told
+    # nothing — it would excuse a rise in a store this delete never touched. Duck-typed on
+    # purpose: `agent_alert` reads this module, so this one must not import it.
+    attributed = getattr(policy, "conn", None) is conn
+    floors: dict[str, int | None] = {}
     ids = sorted(event_ids)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -931,6 +952,19 @@ def prune_pushed_events(
         conn.executemany(
             "INSERT OR IGNORE INTO temp.prune_ids VALUES (?)",
             ((event_id,) for event_id in ids),
+        )
+        # Whose floor is about to move? Asked BEFORE the delete, because afterwards the
+        # rows that answer it are gone.
+        touched = (
+            [
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT device_serial FROM events"
+                    " WHERE id IN (SELECT event_id FROM temp.prune_ids)"
+                )
+            ]
+            if attributed
+            else []
         )
         cur = conn.execute(
             """
@@ -944,8 +978,18 @@ def prune_pushed_events(
             (before_utc,),
         )
         deleted = cur.rowcount
+        # Still inside the transaction: this is the floor THIS delete produced, not one
+        # another writer may have moved before we got to report it.
+        floors = {serial: read_oldest_serial(conn, serial) for serial in touched}
     except BaseException:
         conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT")
+    # And reported only now: an attribution must describe a delete that actually committed.
+    # `note_pruned` takes a serial and an integer floor (never an id, name or payload) and
+    # never raises, so housekeeping cannot break the alert path. An empty `floors` means
+    # either nothing was touched or no policy was credited, and the loop is a no-op.
+    if deleted and policy is not None:
+        for serial, floor in floors.items():
+            policy.note_pruned(serial, floor)
     return deleted

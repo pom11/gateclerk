@@ -132,7 +132,10 @@ Two different failure channels — keep them separate:
   - clock skew over threshold → warning (DESIGN.md "Time handling": log, not
     auto-fix; `tz.compute_skew` + `SKEW_WARN_SECONDS` carry over).
   - checkpoint stall / oldest-seen serialNo rising → **critical**: the ring has
-    started rolling and punches are being lost (DESIGN.md open question 4).
+    started rolling and punches are being lost (DESIGN.md open question 4). One
+    exception, decided with GC-P16a's retention prune: a rise the agent accounted for
+    at the moment it deleted is its own housekeeping, not a loss — and only up to the
+    floor that delete left behind. Any other rise pages as it always did.
 
 #### Alert routing: journald or mnotify (one route)
 

@@ -22,6 +22,13 @@ The prune cadence (at most once per day) and the checkpoint's untouchedness are 
 where they live: the real `SiteAgent.tick()` for the cadence, the real `checkpoint`
 row for the untouchedness.
 
+So is what the delete does to the ALERTS, because this is the product's only sanctioned
+`DELETE FROM events` and P2-05's "stored history disappeared" arm reads that same
+`MIN(serial_no)` on every ok tick. The delete accounts for itself to the policy whose
+connection it deleted from; the cases below pin both halves — the sanctioned rise
+stays quiet, and every rise that nobody accounted for (or that goes past the floor the
+prune left) still pages with the evidence it always carried.
+
 Offline by construction: tmp sqlite files and FakeDevice only. Fixture shapes are
 imported, not copied (P2-02's `make_record`/`db`, P2-07b's `AgentHarness`,
 test_ring_floor_probe's `_advance_clock`, which moves the fake's RTC with the agent's
@@ -40,6 +47,7 @@ import pytest
 import gateclerk.agent_cli as agent_cli
 import gateclerk.agent_db as agent_db
 import gateclerk.agent_store as agent_store
+from gateclerk.agent_alert import AlertPolicy
 from gateclerk.agent_store import prune_pushed_events
 from gateclerk.sinks import IMPLICIT_SINK_NAME
 from test_p2_02_store import SERIAL, SITE, make_record
@@ -276,28 +284,23 @@ def test_prune_of_an_empty_ledger_deletes_nothing(db: sqlite3.Connection) -> Non
     assert prune_pushed_events(db, event_ids={rowid}, before_utc=CUTOFF) == 1
 
 
-@pytest.mark.xfail(
-    reason="GC-P16a follow-up t_8953101a: check_stall's floor_moved arm reads a "
-    "sanctioned prune as lost history — delete this marker when the fix lands",
-    strict=True,
-)
 def test_a_prune_that_moves_the_store_floor_does_not_page_lost_history(
     db: sqlite3.Connection, tmp_path: Path
 ) -> None:
-    """KNOWN GAP (strict xfail, carded): the prune trips P2-05's "stored history disappeared".
+    """A sanctioned prune is not lost history: the anti-loss arm must not page for it.
 
     `AlertPolicy.check_stall` treats a rise in `MIN(serial_no)` as evidence of loss — the
     arm exists precisely because spec §2b says a purge is the owner's and must not happen
-    by accident. GC-P16a adds the first SANCTIONED deletion, and the policy has no way to
-    tell the two apart, so in a long-running unit the tick after the prune pages.
+    by accident. GC-P16a added the first deletion the AGENT is allowed to make, and the
+    arm could not tell the two apart, so in a long-running unit the tick after the daily
+    prune paged a critical alert for a delete that was correct.
 
-    The assertion below is what the fix must make true (a sanctioned prune is not lost
-    history); the fix lives in `agent_alert.py`, which GC-P16a's FILES list does not
-    cover, so it is a follow-up card rather than a quiet special case here. `xfail_strict`
-    is on in pyproject, so whoever lands the fix must delete this marker.
+    The attribution travels with the delete: `prune_pushed_events` tells the policy it is
+    named in the `policy=` argument which devices it touched and what floor remains (see
+    that function's docstring, and the tick hook, which passes its own policy). The
+    two tests below are the counter-cases this one cannot cover: a rise nobody accounted
+    for still pages, and a rise PAST the pruned floor still pages.
     """
-    from gateclerk.agent_alert import AlertPolicy
-
     old = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
     fresh = store_aged(db, serial_no=200, event_time_utc=FRESH_ISO)
     agent_store.advance_checkpoint(
@@ -308,8 +311,221 @@ def test_a_prune_that_moves_the_store_floor_does_not_page_lost_history(
     )
     assert policy.check_stall(SERIAL) is None, "no evidence on the first look"
 
-    assert prune_pushed_events(db, event_ids={old, fresh}, before_utc=CUTOFF) == 1
+    assert prune_pushed_events(db, event_ids={old, fresh}, before_utc=CUTOFF, policy=policy) == 1
     assert policy.check_stall(SERIAL) is None, "a sanctioned prune is not lost history"
+
+
+def test_an_unsanctioned_purge_of_the_oldest_row_still_pages_lost_history(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The arm keeps its teeth: the SAME delete, made without the prune, still pages.
+
+    This is the shape the xfail marker could not express. The store, the checkpoint and
+    the policy are those of the test above, and the row that goes is the row the prune
+    would have gone — but it leaves by a raw `DELETE FROM events`, which is the owner's
+    purge (spec §2b: theirs alone) and nothing tells the policy about it. The evidence is
+    the same `100 -> 200` text it carried before the attribution existed.
+    """
+    old = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
+    store_aged(db, serial_no=200, event_time_utc=FRESH_ISO)
+    agent_store.advance_checkpoint(
+        db, SERIAL, 200, completed=True, checkpoint_time=FRESH_ISO, now=NOW
+    )
+    policy = AlertPolicy(
+        site=SITE, cadence_s=300, conn=db, park_dir=tmp_path / "park", now=lambda: NOW
+    )
+    assert policy.check_stall(SERIAL) is None, "no evidence on the first look"
+
+    db.execute("DELETE FROM events WHERE id = ?", (old,))
+
+    fired = policy.check_stall(SERIAL)
+    assert fired is not None, "an unaccounted rise in MIN(serial_no) is lost history"
+    assert fired.kind == "checkpoint_stall"
+    assert fired.level == "critical"
+    assert "oldest stored serialNo rose 100 -> 200" in fired.note
+    assert "stored history disappeared" in fired.note
+
+
+def test_a_rise_past_the_pruned_floor_is_still_evidence(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Attribution is a floor, not a free pass: excused is "up to here", nothing above.
+
+    One-time suppression ("the next rise is a prune") would leave the arm blind for
+    whatever followed the prune, and with a 14-day window on a 5-minute cadence an
+    unaccounted loss can land minutes after a legitimate one. So the policy records the
+    floor the prune left behind and excuses a rise only while the observed floor stays at
+    or below it. Here the prune moves 100 -> 200 (quiet) and a raw delete then moves
+    200 -> 300 (pages).
+    """
+    old = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
+    middle = store_aged(db, serial_no=200, event_time_utc=FRESH_ISO)
+    store_aged(db, serial_no=300, event_time_utc=FRESH_ISO)
+    agent_store.advance_checkpoint(
+        db, SERIAL, 300, completed=True, checkpoint_time=FRESH_ISO, now=NOW
+    )
+    policy = AlertPolicy(
+        site=SITE, cadence_s=300, conn=db, park_dir=tmp_path / "park", now=lambda: NOW
+    )
+    assert policy.check_stall(SERIAL) is None, "no evidence on the first look"
+
+    assert prune_pushed_events(db, event_ids={old, middle}, before_utc=CUTOFF, policy=policy) == 1
+    assert policy.check_stall(SERIAL) is None, "the sanctioned rise is accounted for"
+
+    db.execute("DELETE FROM events WHERE id = ?", (middle,))
+    fired = policy.check_stall(SERIAL)
+    assert fired is not None, "a rise past the pruned floor is not excused by the prune"
+    assert "oldest stored serialNo rose 200 -> 300" in fired.note
+
+
+def test_a_second_prune_replaces_the_excuse_rather_than_widening_it(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The excuse describes the store as the LAST delete left it — never a wider one.
+
+    A monotone "highest floor ever seen" rule survives a device whose serial space
+    restarts (GC-P15's reset: the store's floor legitimately drops) and then hushes a real
+    loss up to that old, high number. So the notification is replaced, not raised. Here the
+    first prune leaves 200, the serials then restart below it, a second prune leaves 2 — and
+    the next unsanctioned rise to 3 pages, where a carried-over 200 would have excused it.
+    """
+    old = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
+    store_aged(db, serial_no=200, event_time_utc=FRESH_ISO)
+    agent_store.advance_checkpoint(
+        db, SERIAL, 200, completed=True, checkpoint_time=FRESH_ISO, now=NOW
+    )
+    policy = AlertPolicy(
+        site=SITE, cadence_s=300, conn=db, park_dir=tmp_path / "park", now=lambda: NOW
+    )
+    assert policy.check_stall(SERIAL) is None
+    assert prune_pushed_events(db, event_ids={old}, before_utc=CUTOFF, policy=policy) == 1
+    assert policy.check_stall(SERIAL) is None, "the sanctioned rise stays quiet"
+
+    # The device's serial space restarts below the pruned floor: the store drops back to 1,
+    # which is a LOWER floor and therefore not evidence of anything (P2-05's rule).
+    db.execute("DELETE FROM events")
+    low = store_aged(db, serial_no=1, event_time_utc=OLD_ISO)
+    second = store_aged(db, serial_no=2, event_time_utc=FRESH_ISO)
+    store_aged(db, serial_no=3, event_time_utc=FRESH_ISO)
+    assert policy.check_stall(SERIAL) is None, "a lower floor is not evidence"
+
+    assert prune_pushed_events(db, event_ids={low}, before_utc=CUTOFF, policy=policy) == 1
+    assert policy._pruned_floor == {SERIAL: 2}, "the excuse is the floor THIS delete left"
+    assert policy.check_stall(SERIAL) is None, "1 -> 2 was the prune's own doing"
+
+    db.execute("DELETE FROM events WHERE id = ?", (second,))
+    fired = policy.check_stall(SERIAL)
+    assert fired is not None, "a rise past the NEWEST floor is not excused by an old one"
+    assert "oldest stored serialNo rose 2 -> 3" in fired.note
+
+
+def test_a_policy_reading_a_different_store_is_not_credited(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """`policy.conn is conn` is the difference between an excuse and a lie.
+
+    The attribution excuses a rise in the store the policy actually reads, so a policy
+    wired to another database must learn nothing from this delete: crediting it would hush
+    the anti-loss arm of a site whose rows this statement never touched.
+    """
+    other = agent_db.connect(tmp_path / "other-site.sqlite3")
+    try:
+        old = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
+        store_aged(db, serial_no=200, event_time_utc=FRESH_ISO)
+        policy = AlertPolicy(
+            site=SITE, cadence_s=300, conn=other, park_dir=tmp_path / "park", now=lambda: NOW
+        )
+
+        assert prune_pushed_events(db, event_ids={old}, before_utc=CUTOFF, policy=policy) == 1
+        assert policy._pruned_floor == {}, "a policy over another store learns nothing"
+    finally:
+        other.close()
+
+
+def test_a_prune_that_empties_a_device_leaves_no_excuse_behind(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The prune that removes a device's LAST row notes no floor — and excuses nothing.
+
+    `read_oldest_serial` answers None for an empty device, while `_pruned_floor` is typed
+    int: a None entry there would be an excuse no reader can interpret, so `note_pruned`
+    declines it and the anti-loss arm stays exactly as it was. The second half is the
+    teeth — the rows stored after the empty store are protected by whatever delete removes
+    THEM, never by this one.
+    """
+    only = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
+    agent_store.advance_checkpoint(
+        db, SERIAL, 100, completed=True, checkpoint_time=OLD_ISO, now=NOW
+    )
+    policy = AlertPolicy(
+        site=SITE, cadence_s=300, conn=db, park_dir=tmp_path / "park", now=lambda: NOW
+    )
+    assert policy.check_stall(SERIAL) is None
+
+    assert prune_pushed_events(db, event_ids={only}, before_utc=CUTOFF, policy=policy) == 1
+    assert policy._pruned_floor == {}, "an empty device has no floor to be trusted to"
+    assert policy.check_stall(SERIAL) is None, "no floor is not a rise"
+
+    low = store_aged(db, serial_no=5, event_time_utc=FRESH_ISO)
+    store_aged(db, serial_no=6, event_time_utc=FRESH_ISO)
+    assert policy.check_stall(SERIAL) is None, "the first look at the new rows seeds"
+    db.execute("DELETE FROM events WHERE id = ?", (low,))
+    fired = policy.check_stall(SERIAL)
+    assert fired is not None, "an emptied store must not excuse a later loss"
+    assert "oldest stored serialNo rose 5 -> 6" in fired.note
+
+
+def test_a_prune_that_never_committed_attributes_nothing(
+    db: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete that did not land must not buy an excuse.
+
+    The statement's own transaction is what makes this true: the floor is read after the
+    delete and reported only after the commit, so anything that breaks in between leaves
+    both the rows and the policy exactly as they were. The seam fails the floor read (the
+    statement right after the delete) so the transaction has a reason to roll back.
+    """
+    old = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
+    store_aged(db, serial_no=200, event_time_utc=FRESH_ISO)
+    policy = AlertPolicy(
+        site=SITE, cadence_s=300, conn=db, park_dir=tmp_path / "park", now=lambda: NOW
+    )
+    real = agent_store.read_oldest_serial
+
+    def exploding(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("disk I/O error (test seam)")
+
+    monkeypatch.setattr(agent_store, "read_oldest_serial", exploding)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="test seam"):
+            prune_pushed_events(db, event_ids={old}, before_utc=CUTOFF, policy=policy)
+    finally:
+        monkeypatch.setattr(agent_store, "read_oldest_serial", real)
+
+    assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2, "the delete rolled back"
+    assert policy._pruned_floor == {}, "a delete that never landed excuses nothing"
+
+
+def test_the_attribution_carries_no_payload(db: sqlite3.Connection, tmp_path: Path) -> None:
+    """What crosses the store/policy boundary: the device's serial and one integer.
+
+    White-box on purpose — `policy._pruned_floor` IS the whole surface the delete is
+    allowed to touch, so the equality is the shape pin and the `repr` scan is the PII pin.
+    `store_aged` writes a real-shaped row (flattened `name`, `employee_no`, `raw`), so a
+    leak here would be a leak of exactly what GC-P16a's "only a count" rule keeps out of
+    the prune's return value.
+    """
+    old = store_aged(db, serial_no=100, event_time_utc=OLD_ISO)
+    store_aged(db, serial_no=200, event_time_utc=FRESH_ISO)
+    policy = AlertPolicy(
+        site=SITE, cadence_s=300, conn=db, park_dir=tmp_path / "park", now=lambda: NOW
+    )
+
+    assert prune_pushed_events(db, event_ids={old}, before_utc=CUTOFF, policy=policy) == 1
+
+    attributed = policy._pruned_floor
+    assert attributed == {SERIAL: 200}, "one integer per touched device, nothing else"
+    assert "User E100" not in repr(attributed), "the notification must not carry payload"
 
 
 # --- the tick hook -------------------------------------------------------------------------
@@ -323,10 +539,11 @@ def test_prune_runs_at_most_once_per_day(tmp_path: Path, monkeypatch: pytest.Mon
     boundary a frozen clock can pin exactly: the jump is exactly one day.
 
     The monkeypatched prune also records what the tick handed it, which is where the
-    retention window and the ledger wiring are pinned: the cutoff is the moment minus
-    `DEFAULT_LOCAL_RETENTION_DAYS` expressed in UTC (the column it filters is UTC —
-    `tz.py:334`), and the ids are the ones the real push just recorded as `sent`
-    (tests 1-4 above pin what the real delete does with them).
+    retention window, the ledger wiring and the attribution target are pinned: the cutoff
+    is the moment minus `DEFAULT_LOCAL_RETENTION_DAYS` expressed in UTC (the column it
+    filters is UTC — `tz.py:334`), the ids are the ones the real push just recorded as
+    `sent` (tests 1-4 above pin what the real delete does with them), and the policy is the
+    object whose `check_stall` reads this same store (below it, the alerts).
 
     The harness clock is deliberately Bucharest-local (P2-03's `T0`), which is what makes
     the UTC half of the cutoff assertion non-vacuous: an un-normalised cutoff would be a
@@ -335,8 +552,14 @@ def test_prune_runs_at_most_once_per_day(tmp_path: Path, monkeypatch: pytest.Mon
     """
     calls: list[dict[str, Any]] = []
 
-    def counting_prune(_conn: sqlite3.Connection, *, event_ids: set[int], before_utc: str) -> int:
-        calls.append({"event_ids": set(event_ids), "before_utc": before_utc})
+    def counting_prune(
+        _conn: sqlite3.Connection,
+        *,
+        event_ids: set[int],
+        before_utc: str,
+        policy: Any = None,
+    ) -> int:
+        calls.append({"event_ids": set(event_ids), "before_utc": before_utc, "policy": policy})
         return 0
 
     monkeypatch.setattr(agent_cli, "prune_pushed_events", counting_prune)
@@ -360,6 +583,10 @@ def test_prune_runs_at_most_once_per_day(tmp_path: Path, monkeypatch: pytest.Mon
         rowids = {row[0] for row in agent.conn.execute("SELECT id FROM events")}
         assert rowids and calls[0]["event_ids"] == rowids, (
             "the prune must receive the ids the push recorded as sent, and nothing else"
+        )
+        assert calls[0]["policy"] is agent.policy, (
+            "the prune must be handed the very policy that reads this store: that object "
+            "is the only thing that can be told about the delete (GC-P16a follow-up)"
         )
 
         _advance_clock(harness, device, timedelta(days=1))

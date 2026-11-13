@@ -272,6 +272,13 @@ class AlertPolicy:
         # Our store's floor per device across checks: MIN(serial_no), NOT the
         # device's oldest retained event. See agent_store.read_oldest_serial.
         self._oldest_serial_seen: dict[str, int | None] = {}
+        # The floor a SANCTIONED prune left behind, per device: the `MIN(serial_no)` this
+        # process accounted for as "we deleted that row on purpose" (GC-P16a's daily
+        # retention pass). Set only by `note_pruned`, which `prune_pushed_events` calls on
+        # the policy whose connection it deleted from. Same lifetime as
+        # `_oldest_serial_seen` — in-process, reset by a restart, re-seeded by the first
+        # look after one — and replaced by each delete, so a rise above it stays evidence.
+        self._pruned_floor: dict[str, int] = {}
         # Episode guards: each of these alert kinds pages ONCE per incident, never
         # once per tick — an alert that fires every 5 minutes is an alert nobody reads.
         self._locked_open = False
@@ -592,6 +599,33 @@ class AlertPolicy:
 
     # --- the critical channel: checkpoint stall (DESIGN.md OQ4) ----------------------------
 
+    def note_pruned(self, device_serial: str, new_floor: int | None) -> None:
+        """Account for a delete this agent is ALLOWED to make before the next check reads it.
+
+        GC-P16a's retention prune removes rows the poller has already delivered, which
+        raises ``MIN(serial_no)`` — the very reading ``check_stall`` below calls "stored
+        history disappeared". This is the one channel that tells the two apart, and it is
+        called by the delete itself (`agent_store.prune_pushed_events`), on the policy
+        whose connection it deleted from, with a device serial and the floor that remains.
+        Nothing else crosses it: no event id, no name, no payload; and it never raises,
+        because housekeeping must not be able to break the alert path.
+
+        Like `_oldest_serial_seen`, this is process state: a restart re-seeds both from the
+        first look, so an attribution can never be resurrected from disk or outlive the
+        observations it explains. The entry is REPLACED, never widened: it describes the
+        store as this delete left it, so an excuse can never reach past what this process
+        last saw and removed. That matters for a device whose serial space restarts
+        (GC-P15's reset) — its floor legitimately drops, and a "highest ever seen" rule
+        would leave an old, wide excuse behind to mask a real loss. The excuse reaches only
+        up to here either way, so a loss that follows a legitimate delete (or hides inside
+        the same episode) is still pageable.
+        """
+        if not device_serial or new_floor is None:
+            # No serial, nothing to attribute; `None` floor means the device has no rows
+            # left at all, which `check_stall` reads as "no floor" rather than a rise.
+            return
+        self._pruned_floor[device_serial] = new_floor
+
     def check_stall(
         self,
         device_serial: str,
@@ -613,7 +647,10 @@ class AlertPolicy:
           count nor reset);
         * our store's oldest serialNo rose since the previous check — stored history
           disappeared. This reads MIN(serial_no) from the keep-everything store, so
-          it is NOT device ring-rollover detection;
+          it is NOT device ring-rollover detection. One exception, deliberately: a rise
+          the retention prune accounted for at the moment it deleted (``note_pruned``,
+          at most up to the floor that prune left) is our own sanctioned housekeeping,
+          not a loss. A rise above it is, and pages as it always has;
         * the DEVICE's oldest retained event of ANY major is past the checkpoint that
           stood BEFORE this tick walked (card t_ed9c7e92). The caller injects
           ``ring_probe`` — a zero-arg, read-only call returning that floor
@@ -651,6 +688,14 @@ class AlertPolicy:
         floor_moved = (
             oldest is not None and previous_oldest is not None and oldest > previous_oldest
         )
+        # A rise this agent caused itself is not lost history: the retention prune accounts
+        # for its own delete at the moment it makes it (`note_pruned`, called by
+        # `prune_pushed_events` on this very policy). The excuse reaches only UP TO the
+        # floor the prune left behind — a row that went any higher was not sanctioned by
+        # this process, and the arm keeps its teeth (spec §2b: a purge is the owner's).
+        pruned_floor = self._pruned_floor.get(device_serial)
+        sanctioned = oldest is not None and pruned_floor is not None and oldest <= pruned_floor
+        floor_lost = floor_moved and not sanctioned
 
         streak = self._failed_streak.get(device_serial, 0)
         failing = streak >= self.stall_strikes
@@ -672,7 +717,7 @@ class AlertPolicy:
             and device_floor > checkpoint_serial_before + 1
         )
 
-        if not (stale and failing) and not floor_moved and not floor_evicted:
+        if not (stale and failing) and not floor_lost and not floor_evicted:
             if not stale:
                 # The checkpoint moved (or healed): close the episode so a LATER
                 # stall is a new incident and pages fresh.
@@ -681,7 +726,7 @@ class AlertPolicy:
 
         if floor_evicted:
             evidence = f"device-floor:{checkpoint_serial_before}->{device_floor}"
-        elif floor_moved:
+        elif floor_lost:
             evidence = f"floor:{previous_oldest}->{oldest}"
         else:
             evidence = "failing-poll"
@@ -705,7 +750,7 @@ class AlertPolicy:
                 "cannot prove a punch existed there). One AcsEvent oldest-first read, "
                 "all majors, compared before the checkpoint advanced"
             )
-        elif floor_moved:
+        elif floor_lost:
             note = (
                 f"oldest stored serialNo rose {previous_oldest} -> {oldest} — stored "
                 "history disappeared. This arm reads our keep-everything store, so it "

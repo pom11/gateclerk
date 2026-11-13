@@ -825,6 +825,12 @@ class SiteAgent:
         # them as TEXT: an un-normalised `+02:00` cutoff would be a lexical comparison
         # two or three hours off, silently aging every row by the site's offset.
         #
+        # The policy travels with the call. This is the product's only sanctioned delete
+        # from `events`, and `check_stall` reads `MIN(serial_no)` on every ok tick of this
+        # long-lived unit, so the object that has to be able to tell this rise apart from
+        # lost history is this one: the store function notes the floor it left behind on
+        # the policy whose connection it deleted from (GC-P16a follow-up, t_8953101a).
+        #
         # `_last_prune_at` is set BEFORE the call, so a failing statement (a write lock
         # held by a CLI `deadletter delete`, say: `connect()` sets no busy_timeout)
         # cannot retry-loop for the rest of the day. It DOES still propagate out of the
@@ -839,6 +845,7 @@ class SiteAgent:
                 self.conn,
                 event_ids=self.ledger.sent_event_ids(),
                 before_utc=cutoff.isoformat(),
+                policy=self.policy,
             )
         report.parked = self.parked_keys()
         self._write_health()
