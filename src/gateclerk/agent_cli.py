@@ -56,6 +56,7 @@ the transport's `Secret` and never in this module, a report, or a log line.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import random
@@ -97,15 +98,19 @@ __all__ = [
     "HEALTH_DIR_NAME",
     "HEALTH_FILE_NAME",
     "PARK_DIR_NAME",
+    "POLLER_LOCK_SUFFIX",
     "PUSH_LEDGER_FILE_NAME",
+    "PollerAlreadyRunning",
     "PushLedger",
     "SiteAgent",
     "SiteRunReport",
     "SiteTickReport",
+    "acquire_poller_lock",
     "build_site_agent",
     "discard_dead_letter",
     "flag_rung_password",
     "queue_new_events",
+    "release_poller_lock",
     "resolve_db_path",
     "resolve_state_root",
 ]
@@ -116,6 +121,9 @@ PARK_DIR_NAME = "park"
 #: The §2e health snapshot dir under the state dir (the socat reader's file).
 HEALTH_DIR_NAME = "health"
 HEALTH_FILE_NAME = "agent.json"
+#: GC-P10's lock-file suffix under the state dir: `gateclerk-<site>.lock`, one lock per
+#: site — the on-disk statement of the deployment law "one site, one process, one store".
+POLLER_LOCK_SUFFIX = ".lock"
 #: systemd exposes `LoadCredential=<name>:<path>` as this env var pointing at a dir of files.
 CREDENTIALS_DIRECTORY_ENV = "CREDENTIALS_DIRECTORY"
 
@@ -664,6 +672,10 @@ class SiteAgent:
         #: that is what distinguishes an outage from a quiet door.
         self._last_ok_at: dict[str, datetime] = self._last_ok_from_health()
         self._cycle_started = time.monotonic()
+        #: GC-P10's flock handle (see `acquire_poller_lock`): None until `run()` takes it.
+        #: `run()` releases in its `finally`; `close()` covers a caller that built the
+        #: agent and never ran it.
+        self._poller_lock: Any = None
 
     # --- one pass -------------------------------------------------------------------------
 
@@ -770,26 +782,38 @@ class SiteAgent:
         this only reuses it — and the injected sleep keeps the whole loop testable in
         milliseconds.
         """
+        # GC-P10: the site lock is taken BEFORE the first tick — a second poller must be
+        # refused before it presents credentials to the device (one digest nonce budget,
+        # one 401 lockout). Sitting above the inner try is deliberate: a refusal is not a
+        # crash and must not print the abort line for a run that never ticked.
+        if self._poller_lock is None:
+            self._poller_lock = acquire_poller_lock(Path(self._db_path).parent, self.site.name)
         reports: list[SiteTickReport] = []
         sleep = self._sleep if self._sleep is not None else time.sleep
         ticks = 0
         try:
-            while max_ticks is None or ticks < max_ticks:
-                self._cycle_started = time.monotonic()
-                reports.append(self.tick())
-                ticks += 1
-                if once or (max_ticks is not None and ticks >= max_ticks):
-                    break
-                sleep(self._cycle_delay())
-        except BaseException:
-            # A raise here is a BUG, not a device failure (`tick()` absorbs those). The
-            # counters go out before the traceback so journald keeps them, and
-            # `Restart=always` brings the process back.
-            _abort_line(
-                f"agent run aborted site={self.site.name} after {ticks} tick(s); "
-                f"counters={self.policy.counters}"
-            )
-            raise
+            try:
+                while max_ticks is None or ticks < max_ticks:
+                    self._cycle_started = time.monotonic()
+                    reports.append(self.tick())
+                    ticks += 1
+                    if once or (max_ticks is not None and ticks >= max_ticks):
+                        break
+                    sleep(self._cycle_delay())
+            except BaseException:
+                # A raise here is a BUG, not a device failure (`tick()` absorbs those). The
+                # counters go out before the traceback so journald keeps them, and
+                # `Restart=always` brings the process back.
+                _abort_line(
+                    f"agent run aborted site={self.site.name} after {ticks} tick(s); "
+                    f"counters={self.policy.counters}"
+                )
+                raise
+        finally:
+            # Runs after that `except` re-raises: the lock goes back even on a bug trace,
+            # so the process `Restart=always` starts next can take it (R7's restart path).
+            release_poller_lock(self._poller_lock)
+            self._poller_lock = None
         return SiteRunReport(
             site=self.site.name,
             db_path=self._db_path,
@@ -839,7 +863,13 @@ class SiteAgent:
         The mnotify sink is drained for its own bounded time so `--once` and a SIGTERM
         both give an accepted page a chance to finish; a still-running page only warns
         (the local evidence line was already written before it was queued).
+
+        The GC-P10 poller lock is released first if it is still held — the normal case
+        is a no-op (`run()`'s `finally` already dropped it and stored None); what this
+        covers is a caller that built the agent and closed it without ever running it.
         """
+        release_poller_lock(self._poller_lock)
+        self._poller_lock = None
         close_sink = getattr(getattr(self.policy, "sink", None), "close", None)
         if callable(close_sink):
             close_sink()
@@ -1229,6 +1259,60 @@ def resolve_state_root(site: SiteConfig, state_root: Path | str | None) -> Path:
     also the unit's `ReadWritePaths=<STATE_ROOT>/<SITE>` (deploy/README.md step 1).
     """
     return Path(resolve_db_path(site, state_root)).parent
+
+
+class PollerAlreadyRunning(ConfigError):  # noqa: N818 — name fixed by the GC-P10 card
+    """Another process already owns this site's poll loop (one site, one poller)."""
+
+
+def acquire_poller_lock(state_root: Path | str, site: str) -> Any:
+    """Hold an exclusive non-blocking flock for the life of the agent process.
+
+    GC-P10's enforcement of the deployment law: two `agent run` processes on one site
+    burn the terminal's ~190-use digest nonce budget together and can trip the 401
+    lockout, so the second starter must be refused BEFORE it presents credentials — a
+    lockout is worse than a refused start (R7). The lock lives in the state root because
+    that is the site's one writable directory (unit `ReadWritePaths`), and `flock` is
+    the right primitive: the kernel drops it when the holder's fd closes, so a killed,
+    crashed or rebooted poller never leaves a stale file to clean up. The PID written
+    after the lock is won names the owner for the operator (`cat` the file, then `ps`).
+
+    Returns the open handle — the lock is only held while the fd stays open, so the
+    CALLER must keep the return value alive (that is why `SiteAgent` stores it). Raises
+    `PollerAlreadyRunning` (a `ConfigError`, exit 2 via `cli_shared._fail`) naming the
+    lock path when the flock is already held.
+    """
+    path = Path(state_root) / f"gateclerk-{site}{POLLER_LOCK_SUFFIX}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise PollerAlreadyRunning(
+            f"another agent already polls site {site!r} (lock {path}); "
+            "stop it before starting a second poller"
+        ) from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def release_poller_lock(handle: Any) -> None:
+    """Release the lock and close the file; safe to call twice.
+
+    "Twice-safe" is the `None` check, which is also why every caller sets its stored
+    handle back to `None` after releasing: `run()`'s `finally` and `close()` both
+    release, and the second of the two must be a no-op, not a write to a closed fd.
+    """
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 # --- the composition (no socket opens, no credential values kept) ----------------------------
