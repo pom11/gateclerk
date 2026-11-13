@@ -828,7 +828,8 @@ def plan_import(
         )
 
     notes = [
-        "card numbers are masked in the plan; the audit CSV holds the full values",
+        "card numbers are masked in the plan and in the audit CSV; only the workbook "
+        "and the device hold the full value",
     ]
     if cap is None:
         notes.append(
@@ -862,7 +863,15 @@ def render_plan_rows(plan: ImportPlan) -> list[dict[str, Any]]:
 
 
 def write_results_csv(path: str | os.PathLike[str], plan: ImportPlan) -> Path:
-    """Write the operator's audit file — the ONLY place a full card number appears."""
+    """Write the operator's masked audit file (`0600`, one row per sheet row).
+
+    GC-14: this is a report, not a second card register. BC Tables 70605/70606 own the
+    card assignment, so the row carries `mask_card_no` — the same form the dry run and
+    `--json` print — and the full card number never leaves the terminal write path or
+    the operator's Excel source. The columns and their order are a contract: operator
+    scripts read `cardNo` by name, so only the value is masked, never the layout. The
+    file still holds `employeeNo` and `name`, which is why it stays `0600`.
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8", newline="") as handle:
@@ -885,7 +894,7 @@ def write_results_csv(path: str | os.PathLike[str], plan: ImportPlan) -> Path:
                     "line": item.row.line,
                     "employeeNo": item.row.employee_no,
                     "name": item.row.name,
-                    "cardNo": item.row.card_no,
+                    "cardNo": mask_card_no(item.row.card_no),
                     "cardType": item.row.card_type,
                     "action": str(item.action),
                     "reason": item.reason or "",

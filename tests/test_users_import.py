@@ -433,7 +433,9 @@ def test_apply_writes_via_journal_and_rerun_skips_present(tmp_path: Path) -> Non
     assert report.cards_result is not None and len(report.cards_result.confirmed) == 1
     text = journal.read_text()
     assert '"planned"' in text and '"applied"' in text and '"confirmed"' in text
-    assert "90000090" in results.read_text()
+    # GC-P16b: the journal keeps the write record, the audit CSV does not keep the card.
+    assert "90000090" not in results.read_text()
+    assert "****0090" in results.read_text()
     assert results.stat().st_mode & 0o777 == 0o600
 
     client = factory()

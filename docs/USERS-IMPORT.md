@@ -84,8 +84,10 @@ Every plan prints the target's model and serial (read from `System/deviceInfo`).
 different terminal is refused before any write with a non-zero exit. This is the guard
 against enrolling cards on the wrong door when both the old and new units are reachable.
 
-Card numbers are masked to the last four characters in plans and logs. The per-row audit
-CSV (`--results`, default next to the workbook) is the only output with full card numbers.
+Card numbers are masked to the last four characters everywhere they are printed, logs
+included. The per-row audit CSV (`--results`, default next to the workbook) is masked
+too — `employeeNo` and `name` stay in it, which is why it is written `0600`, and the
+full card number stays in the workbook and in the device.
 
 `employeeNo` and `cardNo` cells must be **Text** in Excel. A numeric cell is refused with
 a "format the column as Text" reason rather than silently rounding a 19-digit card
