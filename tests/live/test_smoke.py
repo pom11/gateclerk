@@ -25,5 +25,5 @@ def test_placeholder_device_reachable(live_opt_in: None) -> None:
     """
     pytest.skip(
         "live smoke assertions arrive with p1-03 (transport) + p1-02 (creds); "
-        "see docs/DESIGN.md P1 exit criteria"
+        "see docs/internal/DESIGN.md P1 exit criteria"
     )

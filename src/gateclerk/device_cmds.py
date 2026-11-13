@@ -257,7 +257,7 @@ def device_capabilities(
         bool,
         typer.Option(
             "--json",
-            help="Raw capability dump (the evidence trail for docs/OBSERVED.md). "
+            help="Raw capability dump (the evidence trail for the device probe record). "
             "Shorthand for --output json.",
         ),
     ] = False,
@@ -273,7 +273,7 @@ def device_capabilities(
 
     Card size we may ask for, searchID length, the queryable major set and the minor
     code sets all come from here — never from a guessed table. `--json` prints the raw
-    bodies too, which is what gets pasted into docs/OBSERVED.md after a live run.
+    bodies too, which is what gets pasted into docs/internal/OBSERVED.md after a live run.
 
     `fmt` is resolved BEFORE any failure can happen and is what every error path is
     given: `--json` means "machine-readable, including the errors", and a config failure

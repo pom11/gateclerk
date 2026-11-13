@@ -5,7 +5,7 @@
 # Keep this example's host in the TEST-NET range: a committed config must never name a
 # real device, and this repo's test suite refuses non-TEST-NET addresses under tests/.
 #
-# Credential refs only, never values (docs/P2-SITE-AGENT.md §2d): the reference name
+# Credential refs only, never values (docs/internal/P2-SITE-AGENT.md §2d): the reference name
 # for one device is `gateclerk-<site>-<host>` (e.g. `gateclerk-site-a-192.0.2.10`) — the
 # systemd `LoadCredential=` name an agent unit carries. macOS keeps the keychain scheme
 # unchanged (service `gateclerk-hikvision`, account = the host); the resolver picks the
@@ -39,7 +39,7 @@ keychain_service = "gateclerk-hikvision"  # keychain ACCOUNT is always the host
 timeout_s = 30.0                     # read timeout; the device drops idle keep-alives
 page_delay_ms = 100                  # between pages of one paged search
 
-# --- P2 agent keys (docs/P2-SITE-AGENT.md §2a–§2d; the default is shown for each) -----
+# --- P2 agent keys (docs/internal/P2-SITE-AGENT.md §2a–§2d; the default is shown for each) -----
 # All six are OPTIONAL for the P1 CLI (which ignores them); the P2 agent reads them per
 # site. Uncomment to override a default.
 

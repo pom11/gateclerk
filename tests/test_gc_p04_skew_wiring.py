@@ -1,6 +1,6 @@
 """Card GC-P04: the skew GC-P03 reads reaches the alert policy AND the health gauge.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2c (clock skew = warning channel) and §2e
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2c (clock skew = warning channel) and §2e
 (`device_clock_skew_seconds`). `AlertPolicy.observe_skew` and
 `AgentHealthCollector.observe_skew` shipped in P2-05/P2-06 unit-tested and with NO caller:
 GC-P03 made the running `DeviceLoop` re-read `GET /ISAPI/System/time` on a bounded cadence,

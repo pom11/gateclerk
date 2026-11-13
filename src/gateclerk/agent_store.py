@@ -1,8 +1,8 @@
 """The P2 site agent's event store: (device_serial, serial_epoch, serial_no) UPSERT +
 completed-only checkpoint.
 
-Card P2-02 (docs/P2-SITE-AGENT.md §1 seams 1-3 + §2b, SIGNED OFF 2026-10-19; device
-truth docs/OBSERVED.md). Semantics are pinned by the spec and the box — this module
+Card P2-02 (docs/internal/P2-SITE-AGENT.md §1 seams 1-3 + §2b, SIGNED OFF 2026-10-19; device
+truth docs/internal/OBSERVED.md). Semantics are pinned by the spec and the box — this module
 implements them, it does not invent them:
 
 UPSERT (seam 1). `events` is UNIQUE(device_serial, serial_epoch, serial_no) and every

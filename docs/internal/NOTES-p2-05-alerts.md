@@ -1,6 +1,6 @@
 # P2-05 notes — alerts + park-on-bad-creds
 
-Card: t_4c2ab984. BINDING SPEC: docs/P2-SITE-AGENT.md §2c (DECIDED verbatim).
+Card: t_4c2ab984. BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2c (DECIDED verbatim).
 Branch wt/p2-05-alerts. Parents P2-03 (agent_loop, #30) + P2-04 (agent_push, #31)
 merged into main (c0b8ba0 / 9b7af27) mid-flight; this branch carries origin/main and
 the diff vs main is exactly three files: `src/gateclerk/agent_alert.py` (new),

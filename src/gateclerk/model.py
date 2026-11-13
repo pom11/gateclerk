@@ -4,7 +4,7 @@ Card p1-07. Everything upstream (transport, paging, capabilities, classifier, tz
 resolver) produces facts; everything downstream (the P2 sqlite store, the P3/BC
 mapping, the JSONL push payload) consumes *this* shape. Field names here are therefore
 a contract, not an implementation detail: renaming one is a spec discussion, never a
-silent edit. `tests/test_model.py` pins the exact key set and `docs/DESIGN.md` "Event
+silent edit. `tests/test_model.py` pins the exact key set and `docs/internal/DESIGN.md` "Event
 model" is its prose twin; p1-08 renders its table columns from `RECORD_JSON_KEYS`.
 
 Three rules this module exists to enforce:
@@ -270,7 +270,7 @@ def _as_str(value: object, *, field: str) -> str | None:
 def _as_int(value: object, *, field: str) -> int | None:
     """Numeric field → int, tolerant of the stringified numbers some fw emits.
 
-    `"75"` for `minor` is real (docs/references/acs-event-codes.md §5 notes fw-dependent
+    `"75"` for `minor` is real (docs/internal/references/acs-event-codes.md §5 notes fw-dependent
     field types); reading it as 0 would silently rename a pass into an unknown code.
     """
     if value is None:

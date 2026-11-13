@@ -1,6 +1,6 @@
 """Card P2-04: the outbound pusher + dead-letter — backoff 1→30 s, 24 h bound, replay.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2b (dead-letter = a table in the SAME sqlite db,
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2b (dead-letter = a table in the SAME sqlite db,
 one row per failed push holding the COMPLETE JSONL payload line + endpoint tag + error
 class + attempt count + first/last-attempt timestamps; replay = re-push, UPSERT makes it
 safe; rows deleted ONLY by an owner-run command) + §2c (pusher backoff base 1 s cap 30 s
@@ -176,7 +176,7 @@ def test_the_queue_and_dead_letter_tables_ship_in_the_same_db(db) -> None:
     # list: a later card appends v5/v6 (SINKS-CORE did), and a total-count assertion
     # would make every such card edit this unrelated test. Precedent: the P2-02
     # downgrade-wall test was changed from a literal 3 to `len(MIGRATIONS) + 1` for
-    # exactly this reason (docs/PROGRESS.md, P2-04 entry) — strengthen the seam, do not
+    # exactly this reason (docs/internal/PROGRESS.md, P2-04 entry) — strengthen the seam, do not
     # freeze the length.
     assert [(m.version, m.name) for m in agent_db.MIGRATIONS[:4]] == [
         (1, "schema_migrations_bookkeeping"),

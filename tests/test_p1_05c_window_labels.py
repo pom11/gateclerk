@@ -1,6 +1,6 @@
 """P1-05c: event-window labels must carry the DEVICE's claimed offset (payroll-critical).
 
-The A/B this file replays is recorded in docs/OBSERVED.md ("Window offsets are
+The A/B this file replays is recorded in docs/internal/OBSERVED.md ("Window offsets are
 ARITHMETIC for the device", owner run 2026-10-17, dense day 2026-05-21):
 
     startTime 13:00:00+03:00, endTime 14:30:00+03:00  -> "NO MATCH", totalMatches 0

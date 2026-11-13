@@ -2,12 +2,12 @@
 
 Every path this package can call is declared in ONE table with its HTTP method, and
 `tests/test_endpoints_registry.py` pins that table to EXACTLY the endpoints
-docs/DESIGN.md's call table documents. That is a closed allowlist, not a heuristic:
+docs/internal/DESIGN.md's call table documents. That is a closed allowlist, not a heuristic:
 heuristics on method or path name cannot prove a call is read-only (a write path registered
 as GET looks exactly like a read), enumeration can. Adding an endpoint is therefore a named,
 reviewed change to that test — never a silent addition.
 
-Method policy (docs/DESIGN.md, "Constraints / invariants"):
+Method policy (docs/internal/DESIGN.md, "Constraints / invariants"):
   * GET is allowed.
   * POST is allowed ONLY for the stateless search endpoints listed in `SEARCH_ENDPOINTS`,
     which do not mutate device state (the device dedupes a search by searchID/cursor, and the
@@ -152,7 +152,7 @@ REGISTRY: dict[str, Endpoint] = {
             "`AcsEvent/Total` is 400 notSupport on this firmware and is registered nowhere",
         ),
         # --- E1 enrollment-probe surfaces (card E1-03, design §1/§3) ------------------
-        # Read-only additions, each justified by a live bench-A read (docs/OBSERVED.md
+        # Read-only additions, each justified by a live bench-A read (docs/internal/OBSERVED.md
         # "E1 enrollment-read probes"). The availability of EACH is probed per device
         # and recorded; several of these answers are 404 on bench A, and the registry
         # still carries the path because the probe must be able to ASK (silence is

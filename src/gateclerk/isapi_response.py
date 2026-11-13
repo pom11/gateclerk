@@ -3,7 +3,7 @@ the envelope -> typed-exception mapping. Pure functions; nothing here touches a 
 
 Why this module exists separately from the transport (p1-03 card)
 -----------------------------------------------------------------
-docs/OBSERVED.md and docs/references/isapi-client-gotchas.md §3 establish that a
+docs/internal/OBSERVED.md and docs/internal/references/isapi-client-gotchas.md §3 establish that a
 Hikvision `webs` server does **not** honour the format you asked for on the error
 path: a `?format=json` request can answer XML, with a quoted `charset="UTF-8"`, under
 at least four different XML namespaces, using `statusCode` **or** `statusValue`. So

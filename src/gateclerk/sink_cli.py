@@ -579,8 +579,7 @@ def _check_sink_url(url: str, *, sink: str) -> None:
     if not url.startswith(SINK_URL_SCHEMES):
         allowed = " or ".join(SINK_URL_SCHEMES)
         raise SinkCliError(
-            f"sink {sink!r}: url {url!r} must start with {allowed} — no endpoint is ever "
-            "invented (docs/P2-SITE-AGENT.md §3)"
+            f"sink {sink!r}: url {url!r} must start with {allowed} — no endpoint is ever invented"
         )
     parts = urlsplit(url)
     if not parts.netloc:
@@ -1064,7 +1063,8 @@ def check_site_sinks(
 
 
 #: How `sink test` explains the statuses a benign probe can come back with. The ingest's
-#: own contract (functions/main.py `gateclerk_ingest`, mirrored in docs/P2-SITE-AGENT.md §3):
+#: own contract (functions/main.py `gateclerk_ingest`, mirrored in
+#: `docs/internal/P2-SITE-AGENT.md` §3):
 #: 200 accepted, 401/403 credential-or-site problem, 422 payload problem, 5xx the ingest's
 #: own trouble (retryable), anything else unexpected. A probe sends an EMPTY batch, so a
 #: 200 proves reachability + auth + the header contract without writing a punch anywhere.

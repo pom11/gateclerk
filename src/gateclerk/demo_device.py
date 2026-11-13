@@ -6,8 +6,8 @@ same ISAPI the production client reads, so this is not a helper the tests cooper
 with — it is an HTTP server the **unmodified** `gateclerk.isapi_transport.IsapiClient`
 talks to (tests/test_demo_device.py points the real client at it over a real socket).
 
-Envelope SHAPES are faithful to the recorded captures (docs/OBSERVED.md and
-docs/OBSERVED-site-B.md): the XML-despite-?format=json answer on System/*, the
+Envelope SHAPES are faithful to the recorded captures (docs/internal/OBSERVED.md and
+docs/internal/OBSERVED-site-B.md): the XML-despite-?format=json answer on System/*, the
 silent `maxResults` clamp to the advertised cap (30 on both recorded sites),
 `MORE` until the last page, advance-by-`numOfMatches`, the `NO MATCH` (with the
 space) empty window that carries NO `InfoList` key at all, the recorded rejections

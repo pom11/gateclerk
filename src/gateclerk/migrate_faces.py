@@ -1,6 +1,6 @@
 """E1-06 faces phase: ``modelData`` template port + FDSearch-hash verify + face undo.
 
-Design contract: docs/ENROLLMENT-MIGRATION.md — §5 step 6 (faces ARE the product, v4),
+Design contract: docs/internal/ENROLLMENT-MIGRATION.md — §5 step 6 (faces ARE the product, v4),
 §5a (journal lifecycle + undo proof-of-add), §5b/§5b.1 (rule D-WIPE, user-delete ban),
 §6 (read-back verify), §9 (capture-before-fake). Everything here rests on committed
 bench-A captures under
@@ -245,7 +245,7 @@ ABSENT_SHA = hashlib.sha256(b"").hexdigest()
 OP_FACE_SETUP = "face_setup"
 OP_FACE_DELETE = "face_delete"
 
-#: E1-11 (site-B capture, 2026-10-23, docs/OBSERVED-site-B.md "Face WRITE capture"):
+#: E1-11 (site-B capture, 2026-10-23, docs/internal/OBSERVED-site-B.md "Face WRITE capture"):
 #: the EXACT rejection pair V4.13.0 answers when the request shape is right and the
 #: TEMPLATE BYTES are from another firmware generation. Captured verbatim as
 #: ``tests/fixtures/recorded/site-b-v4130/enrollment/facesetup_crossgen_reject_400.json``
@@ -267,8 +267,8 @@ TEMPLATE_PORTABILITY_HINT = (
     "target firmware rejected the source face templates (generation mismatch: the "
     "captured pair subStatusCode=badJsonContent + errorMsg=faceURL — the device could "
     "not parse modelData and asked for a picture instead, and the picture route is "
-    "dead on both firmwares). Faces require re-enrollment on the target — "
-    "docs/OBSERVED-site-B.md 'Face WRITE capture'."
+    "dead on both firmwares). Faces require re-enrollment on the target; the device "
+    "probe record's 'Face WRITE capture' section carries the captured rejection."
 )
 
 

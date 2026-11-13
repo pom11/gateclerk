@@ -5,7 +5,7 @@
     "(`GET /ISAPI/Security/encryption/capabilities` -> 404 notSupport, OBSERVED.md), so",
     "the encrypted-blob shape cannot be captured here; this file carries it for the",
     "detector + flag tests in tests/test_model.py.",
-    "Shapes follow docs/references/acs-event-codes.md section 5 and the recorded",
+    "Shapes follow docs/internal/references/acs-event-codes.md section 5 and the recorded",
     "events_major5_page1.json record layout. `expect_encrypted` is the asserted",
     "encrypted_person_data value; `name` is always stored verbatim, never rewritten.",
     "Masking policy as everywhere: no real names, serials, nonces or credentials."

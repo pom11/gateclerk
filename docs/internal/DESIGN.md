@@ -75,7 +75,7 @@ heal gaps.
 | `/ISAPI/System/time` | GET | XML here too. device clock + tz; drift/offset is our problem, not the device's (see Time handling) |
 | `/ISAPI/AccessControl/UserInfo/Count` | GET | GET only — POST → `methodNotAllowed` on this fw |
 | `/ISAPI/AccessControl/UserInfo/Search` | POST (JSON body) | employee roster, paged. Records carry a `password` hash key — strip before storing |
-| `/ISAPI/AccessControl/CardInfo/Search` | POST (JSON body) | card enrollments (employeeNo, cardNo, cardType), paged; wrapped `CardInfoSearchCond` body. Added by E1-01 (enrollment export) with `gateclerk.endpoints.SEARCH_ENDPOINTS` + the registry test — bench A answers the shape (0 cards recorded), design docs/ENROLLMENT-MIGRATION.md §1 |
+| `/ISAPI/AccessControl/CardInfo/Search` | POST (JSON body) | card enrollments (employeeNo, cardNo, cardType), paged; wrapped `CardInfoSearchCond` body. Added by E1-01 (enrollment export) with `gateclerk.endpoints.SEARCH_ENDPOINTS` + the registry test — bench A answers the shape (0 cards recorded), design docs/internal/ENROLLMENT-MIGRATION.md §1 |
 | `/ISAPI/Intelligent/FDLib/FDSearch` | POST (JSON body) | face library records, paged; **FLAT body** (`faceLibType`,`FDID`[+`FPID`] — the per-endpoint dialect split, ENROLLMENT-MIGRATION.md §1/§9: the wrapped style `UserInfo/Search` demands 400s here). Rows carry `FPID` (=employeeNo), `faceURL` (photo bytes DEAD on this fw — 404 every way) and `modelData` (base64 face TEMPLATE — the portable artifact). Added by E1-01b; read-only, the write verbs (`FDLib/FDSetUp`, `FaceDataRecord`) are unprobed and registered nowhere (§9 capture-before-fake) |
 | `/ISAPI/AccessControl/FingerPrintUpload` | POST (JSON body) | fingerprint template READ (misleading vendor name: data flows device→client), wrapped `FingerPrintCond` body `{searchID,employeeNo,fpIndex,dataType:"template"}` — plain-cond form 400s `MessageParametersLack:FingerPrintCond` as probed. Added by E1-01b; the client→device write verb `FingerPrintDownload` is unprobed and registered nowhere |
 | `/ISAPI/AccessControl/AcsEvent` | POST (JSON body) | events, paged |
@@ -104,7 +104,7 @@ that model actually accepts. So P1 does this on first contact:
    doesn't enumerate.
 
 We will not guess which minor is "face pass" and "card pass" on the DS-K1T341AMF-S. We'll
-read it from the device and record the observed mapping in `docs/OBSERVED.md` after the
+read it from the device and record the observed mapping in `docs/internal/OBSERVED.md` after the
 first live smoke run, with the raw capability JSON attached.
 
 `maxResults` in particular: some models advertise 10, others 30/100+. We clamp to the
@@ -455,7 +455,7 @@ bounded retries, capability discovery), `gateclerk device info`, `gateclerk devi
 `gateclerk users list`, `gateclerk events --since/--until` (paged + checkpointed), `json`/
 `table` output, offline unit tests on fixtures, one opt-in live smoke suite.
 Exit: reads a full day of punches off the site-a device, correct UTC, idempotent re-run
-adds zero rows, `docs/OBSERVED.md` records the real event-code table.
+adds zero rows, `docs/internal/OBSERVED.md` records the real event-code table.
 
 **P2 — site agent + local store (SIGNED OFF 2026-10-19 — scheduled, carded).** Per-seam decisions (a)–(f) all decided as recommended: [P2-SITE-AGENT.md](P2-SITE-AGENT.md) §6 is binding for P2 cards. sqlite store keyed `(device_serial, serial_no)`, checkpoint + overlap,
 systemd/launchd unit, outbound pusher with retry + dead-letter, config for N devices

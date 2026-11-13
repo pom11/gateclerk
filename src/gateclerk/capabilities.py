@@ -1,6 +1,6 @@
 """Capability discovery: what THIS device advertises, so we never guess (card p1-04).
 
-docs/DESIGN.md ("Why we read /capabilities instead of hardcoding event codes") is the
+docs/internal/DESIGN.md ("Why we read /capabilities instead of hardcoding event codes") is the
 contract: Hikvision minor/major codes are model- and firmware-dependent, the community
 tables disagree with each other, and the device itself tells us the truth via
 
@@ -12,7 +12,7 @@ limit, supported major set, per-major minor sets, eventAttribute support), and c
 the result in-process per `(serial, firmwareVersion)` — a firmware upgrade can change
 the whole table, so firmware is part of the cache key (DESIGN.md capability-cache seam).
 
-Device truth (docs/OBSERVED.md, site-a DS-K1T341AMF-S fw V3.2.30): `maxResults @max=30`,
+Device truth (docs/internal/OBSERVED.md, site-a DS-K1T341AMF-S fw V3.2.30): `maxResults @max=30`,
 `searchID @max=64`, `major @opt=0,1,2,3,5`, full minorEvent/minorAlarm/minorException/
 minorOperation sets, and **no `eventAttribute` capability** — which is why filters stay
 client-side (OBSERVED.md "Server-side filter truth").
@@ -65,7 +65,7 @@ __all__ = [
 
 #: Floor used when a device gives no `maxResults @max` (DESIGN.md: "we clamp to the
 #: advertised max and never assume" — with nothing advertised, the smallest cap ever
-#: reported for this family (10, docs/references/acs-event-codes.md §1.5) is the only
+#: reported for this family (10, docs/internal/references/acs-event-codes.md §1.5) is the only
 #: request size that cannot fail).
 DEFAULT_MAX_RESULTS = 10
 
@@ -624,7 +624,8 @@ def discover(
     except IsapiError as exc:
         raise CapabilityDiscoveryError(
             f"cannot read AcsEvent capabilities from the device ({exc}); refusing to "
-            "guess event codes — see docs/DESIGN.md 'Why we read /capabilities'"
+            "guess event codes — the design doc's 'Why we read /capabilities' section "
+            "records why the device's own advertisement is the only source we accept"
         ) from exc
     caps = parse_acs_event_capabilities(body)
 

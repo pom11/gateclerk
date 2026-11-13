@@ -9,7 +9,7 @@ brief calls the highest-yield Hikvision gotcha (gotchas §1.4) — and the hands
 would prove nothing. Here, a wrong `uri=`, a wrong realm, or a stale nonce produces the
 same 401 the device produces, and the tests see it.
 
-The challenge mirrors the real transcript (docs/OBSERVED.md + the masked fixture
+The challenge mirrors the real transcript (docs/internal/OBSERVED.md + the masked fixture
 `digest_challenge_401.txt`): qop="auth", realm `DS-39DED0D1`, `Server: webs`, and the
 lowercase `stale="false"` spelling this firmware sends (Hikvision's own guide shows
 uppercase elsewhere — the client must not care; neither httpx nor requests reads
@@ -33,7 +33,7 @@ Scenarios are installed per test:
   the three shapes `RETIRE_STALE_TRUE` / `RETIRE_STALE_FALSE` / `RETIRE_ENVELOPE_ONLY`,
   issuing a fresh nonce each time. Unlike `expire_after` it fires again every N uses,
   because the live symptom is a deterministic 401 at the ~190th request of a walk
-  (docs/OBSERVED.md "Digest nonce use-cap") — a one-shot rotation cannot reproduce a
+  (docs/internal/OBSERVED.md "Digest nonce use-cap") — a one-shot rotation cannot reproduce a
   walk that dies at request N. Recorded 401 bodies: `tests/fixtures/README.md`.
 * `busy_503()` / `invalid_content()` (module-level) — the two wire shapes the retry
   tests need: the `deviceBusy` family (vendor statusCode 2, HTTP 503) and the
@@ -43,7 +43,7 @@ The event handlers are body-strict, not just auth-strict
 ----------------------------------------------------------------
 A fake more lenient than the device is a false-green machine (the lesson of the
 worktree-editable-import bug, applied to request shapes). The live run of 2026-10-17
-(docs/OBSERVED.md "Event-window startTime form: offset REQUIRED") proved this
+(docs/internal/OBSERVED.md "Event-window startTime form: offset REQUIRED") proved this
 firmware 400s an AcsEvent/AcsEventTotalNum body whose `startTime`/`endTime` is
 naive: `statusCode=6`, `subStatusCode=badJsonContent`, `errorMsg=startTime` (the
 recorded shape: `error_naive_start_time.json`). The P2-10 canary's first real tick
@@ -59,7 +59,7 @@ The event store FILTERS by ARITHMETIC (p1-05c — the anti-false-green core)
 `add_events(...)` installs stored events and puts the fake in *filtering mode* for
 the two event POSTs: instead of replaying a canned page queue, it computes which
 stored events fall in the requested window the way the DEVICE does —
-docs/OBSERVED.md "Window offsets are ARITHMETIC for the device" (A/B 2026-10-17:
+docs/internal/OBSERVED.md "Window offsets are ARITHMETIC for the device" (A/B 2026-10-17:
 the SAME window digits answered `NO MATCH`/0 labeled `+03:00` and OK/20 labeled
 `+02:00`, dense day 2026-05-21). The fake parses the bound's label, converts the
 bound to an instant, re-anchors it on ITS OWN claimed clock (`claimed_offset_min`,
@@ -174,7 +174,7 @@ _EVENT_COND_KEYS = {
 
 # --- nonce-retirement shapes (card t_a3521d8a) --------------------------------------
 #
-# The live symptom (docs/OBSERVED.md "Digest nonce use-cap", owner run 2026-10-17):
+# The live symptom (docs/internal/OBSERVED.md "Digest nonce use-cap", owner run 2026-10-17):
 # a long backfill walks ~190 requests with the CORRECT password and then dies on a
 # 401 — deterministic count, device stays unlocked. That reads as the device retiring
 # the digest nonce after N uses. We never captured the 401 itself, so the mechanism is
@@ -443,7 +443,7 @@ class Served:
     digest: dict[str, str] = field(default_factory=dict)
 
 
-# --- E1 enrollment-read surfaces (card E1-03; truth = docs/OBSERVED.md "E1 enrollment-
+# --- E1 enrollment-read surfaces (card E1-03; truth = docs/internal/OBSERVED.md "E1 enrollment-
 #     read probes", bench A rounds 11-18, 2026-10-21) ------------------------------------
 #
 # These routes enforce the request dialects the DEVICE enforces — a fake more lenient
@@ -807,7 +807,7 @@ def _enrollment_user_records() -> list[dict]:
 
 
 def _a_user(no: str, *, local_ui: bool, num_of_fp: int = 0, **extra: object) -> dict:
-    """One bench-A-shaped UserInfo record (docs/OBSERVED.md + user_search_page1.json).
+    """One bench-A-shaped UserInfo record (docs/internal/OBSERVED.md + user_search_page1.json).
 
     The fixture file is the shape truth; the two additions below are what masking
     removed and the probes confirmed the DEVICE still sends:
@@ -864,7 +864,7 @@ A_CORPUS_USERS: list[dict] = [
     ),
     _a_user("4", local_ui=False),
 ]
-#: A had ZERO cards (docs/PROGRESS.md E1 note): the empty-card corpus is device
+#: A had ZERO cards (docs/internal/PROGRESS.md E1 note): the empty-card corpus is device
 #: truth, and the fake must answer NO MATCH + missing `CardInfo` key for it.
 A_CORPUS_CARDS: list[dict] = []
 
@@ -1006,7 +1006,7 @@ class FakeDevice:
         # --- the repeatable nonce use-cap (card t_a3521d8a) -------------------------
         #: when set to N, every nonce is accepted for exactly N authorized responses
         #: and then retired — again and again, for as long as the session runs. This
-        #: is the shape the live 401 at request ~190 needs (docs/OBSERVED.md "Digest
+        #: is the shape the live 401 at request ~190 needs (docs/internal/OBSERVED.md "Digest
         #: nonce use-cap"): `expire_after` cannot reproduce a walk that dies at N.
         self.retire_after: int | None = None
         #: which of RETIRE_SHAPES the rejection answers with (see the block above
@@ -1053,7 +1053,7 @@ class FakeDevice:
         self.event_major_hidden = 0
         self.served: list[Served] = []
         self.challenges = 0
-        #: --- E1-03 request budget counters (docs/ENROLLMENT-MIGRATION.md §0.5) ------
+        #: --- E1-03 request budget counters (docs/internal/ENROLLMENT-MIGRATION.md §0.5) ------
         #: EVERY request the fake received (before auth, including raw-queue hits), and
         #: the same per path+method; plus the count of requests whose credentials the
         #: box ACCEPTED. The probe's "exactly one request per probed surface, never
@@ -1140,7 +1140,7 @@ class FakeDevice:
 
         Nothing to pay — a client that only knows how to answer a challenge has no
         move here except to drop its auth state and re-bootstrap. Recorded (invented,
-        labelled) as `digest_envelope_only_401.txt`; docs/OBSERVED.md leaves this shape
+        labelled) as `digest_envelope_only_401.txt`; docs/internal/OBSERVED.md leaves this shape
         OPEN, which is why the fake can emit it and a test can pin what we do about it.
         """
         return httpx.Response(
@@ -1384,7 +1384,7 @@ class FakeDevice:
     ) -> None:
         """Install the E1-01 enrollment corpus (windowed store for both searches).
 
-        The default corpus is bench A's recorded shape (docs/ENROLLMENT-MIGRATION.md
+        The default corpus is bench A's recorded shape (docs/internal/ENROLLMENT-MIGRATION.md
         §1: 4 users — one with `numOfFP=1` (the fingerprint A cannot migrate), 0 cards
         — plus a `password` field the export must strip). Names are masked the way the
         recorded fixtures are (`User E<n>`), so this file stays hygiene-clean.
@@ -1630,7 +1630,7 @@ class FakeDevice:
                     "(E1-01 rule: unknown or un-armed enrollment POSTs are hard "
                     "failures, not empty answers); a capture-backed fixture route "
                     "(reset_json/add) or seed_enrollment() is the only way this path "
-                    "may be answered — see docs/ENROLLMENT-MIGRATION.md §9 "
+                    "may be answered — see docs/internal/ENROLLMENT-MIGRATION.md §9 "
                     "capture-before-fake"
                 )
         return None

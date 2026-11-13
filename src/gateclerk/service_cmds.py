@@ -16,7 +16,7 @@ The three laws the handlers exist to enforce
 --------------------------------------------
 1. **install never loads.** The plan writes the unit and prints
    `launchctl bootstrap gui/$UID …` / `systemctl --user daemon-reload && systemctl --user
-   enable --now …`. It does not run them (docs/P2-SITE-AGENT.md cutover law: the operator
+   enable --now …`. It does not run them (docs/internal/P2-SITE-AGENT.md cutover law: the operator
    decides when a poller starts against a live door controller).
 2. **uninstall needs proof.** A unit without the `gateclerk-managed-by:` marker is refused;
    the handler prints the unload command and leaves the file alone.
@@ -530,7 +530,7 @@ def _remove_unit(plan: svc.ServicePlan) -> None:
 
     The credential source files, the state dir, the sqlite store and any `*.service.d` drop-in
     are never touched: they are the operator's data and the park is on disk on purpose
-    (docs/P2-SITE-AGENT.md — an unacked park must survive an uninstall, not vanish with the
+    (docs/internal/P2-SITE-AGENT.md — an unacked park must survive an uninstall, not vanish with the
     unit that started the process that made it).
     """
     plan.paths.unit_path.unlink(missing_ok=True)

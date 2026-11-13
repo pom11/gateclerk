@@ -1,6 +1,6 @@
 """Card GC-P03: the RUNNING loop re-reads the device's claimed UTC offset (DST).
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2a request math + OBSERVED.md "time/offset bug"
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2a request math + OBSERVED.md "time/offset bug"
 and "Digest nonce use-cap". `DeviceLoop` used to read `GET /ISAPI/System/time` exactly
 once per process (inside the `if self._bootstrapped: return` block), so a terminal whose
 offset moves at a DST transition kept being stamped with the offset from process start:

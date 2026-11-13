@@ -1,8 +1,8 @@
 """Card P2-03: the scheduler loop — 5 min cadence / 5 min overlap, ONE long-lived client.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2a (DECIDED 2026-10-19: 5 min / 5 min, one
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2a (DECIDED 2026-10-19: 5 min / 5 min, one
 long-lived `IsapiClient` per device across cycles so digest state amortizes against the
-~190-request nonce use-cap) + §1 seams 2/3/7/9. Device truth: docs/OBSERVED.md. The
+~190-request nonce use-cap) + §1 seams 2/3/7/9. Device truth: docs/internal/OBSERVED.md. The
 loop reuses P1 (paging's `iter_event_windows` cursor rules, pipeline's assembly +
 capability discovery + claimed-offset read, transport's digest/circuit machinery) and
 P2-02's store (`store_events` / `advance_checkpoint` / `read_checkpoint`); it owns only

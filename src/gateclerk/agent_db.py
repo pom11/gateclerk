@@ -1,6 +1,6 @@
 """sqlite connection seam for the P2 site agent: pragmas + forward-only migrations.
 
-Card P2-02 (docs/P2-SITE-AGENT.md §1 seams 1-3, §2b, SIGNED OFF 2026-10-19). This is
+Card P2-02 (docs/internal/P2-SITE-AGENT.md §1 seams 1-3, §2b, SIGNED OFF 2026-10-19). This is
 the *connection* half of the store; the semantics (events UPSERT, completed-only
 checkpoint, watermark) live in `gateclerk.agent_store`. stdlib `sqlite3` only — the
 agent box gets one dependency fewer to rot, and the store is a handful of tables.

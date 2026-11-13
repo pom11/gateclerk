@@ -7,6 +7,10 @@ shared option definitions, failure-to-exit conversion, and test seams (`IsapiCli
 `_now`, `_warn_tz_mismatch`, `_migrate_client`, `_migrate_seams`) into
 `gateclerk.cli_shared`. This file is now only the root Typer app, the registrations in
 their historical `--help` order, and `main()`.
+
+`gateclerk migrate`'s writes happen only under its explicitly gated `apply --apply`; the
+gated-write law is `docs/internal/ENROLLMENT-MIGRATION.md` §7 and the group itself is
+defined in `gateclerk.migrate_cmds`.
 """
 
 from __future__ import annotations
@@ -76,7 +80,7 @@ app = typer.Typer(
     help=(
         "Hikvision attendance connector: read-only P1 surface (never writes), plus the "
         "E1 enrollment-migration group `gateclerk migrate`, whose writes happen ONLY "
-        "under its explicitly gated `apply --apply` (docs/ENROLLMENT-MIGRATION.md §7)."
+        "under its explicitly gated `apply --apply`."
     ),
     no_args_is_help=True,
     add_completion=False,

@@ -1,13 +1,13 @@
 """E1-06b fingerprints phase: one-shot template port, ack-is-not-confirm, re-read verify.
 
-Design contract: docs/ENROLLMENT-MIGRATION.md — §5 step 2 (FP sits between cards and
+Design contract: docs/internal/ENROLLMENT-MIGRATION.md — §5 step 2 (FP sits between cards and
 faces), §5a (journal), §5b.1 (undo with no verb = REPORT-ONLY), §6 (read-back verify),
 §1 "fingerprints" row (READ proven; portability claimable ONLY inside one sensor
 family). Parent E1-04 owns the machinery this phase reuses — ``WriteJournal``,
 ``BudgetedWriteTransport``, ``classify_rejection``, ``person_hash``, the budget maths.
 Nothing here forks them.
 
-What bench A proved (docs/OBSERVED.md "E1 §5.0 WRITE-PATH CAPTURE"; the fixtures under
+What bench A proved (docs/internal/OBSERVED.md "E1 §5.0 WRITE-PATH CAPTURE"; the fixtures under
 ``tests/fixtures/recorded/site-a-ds-k1t341amf-s/enrollment/`` are the truth, this
 paragraph is a caption):
 

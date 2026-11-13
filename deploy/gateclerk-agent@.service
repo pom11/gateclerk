@@ -1,6 +1,6 @@
 # gateclerk-agent@.service — the P2 site agent, ONE systemd unit per site.
 #
-# What this is: the deploy template owned by card P2-07a (docs/P2-SITE-AGENT.md §2d +
+# What this is: the deploy template owned by card P2-07a (docs/internal/P2-SITE-AGENT.md §2d +
 # §6(d), DECIDED 2026-10-19: "systemd LoadCredential= unit-per-site
 # gateclerk-agent@<site>.service, naming gateclerk-<site>-<host>"). The instance name IS the
 # site name and is the only argument the agent needs: one site = one unit = one sqlite

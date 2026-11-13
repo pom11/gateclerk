@@ -1,6 +1,6 @@
 """Time / timezone resolution for punch events — this output is payroll data.
 
-docs/OBSERVED.md ("The time/offset bug", device-verified 2026-10-15) **overrides** the
+docs/internal/OBSERVED.md ("The time/offset bug", device-verified 2026-10-15) **overrides** the
 offset-trusting wording in DESIGN.md "Time handling": on our site-a DS-K1T341AMF-S
 (fw V3.2.30) the wall clock is right (skew ~4 s) but the UTC *offset label* is wrong —
 it stamps `+02:00` in Bucharest summer. Trusting the string offset would shift every
@@ -104,7 +104,7 @@ class TimestampInputError(GateClerkError):
 class TzSource(StrEnum):
     """How a resolved timestamp got its UTC instant. Kept on every record."""
 
-    #: The policy path: naive wall clock + site IANA zone (docs/OBSERVED.md).
+    #: The policy path: naive wall clock + site IANA zone (docs/internal/OBSERVED.md).
     SITE_TZ = "site-tz"
     #: A CLI value the operator gave *with* an offset — honoured exactly as written.
     STRING_OFFSET = "string-offset"

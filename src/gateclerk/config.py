@@ -2,7 +2,7 @@
 
 Two jobs, one seam:
 
-  Config    `sites.toml` -> `SiteConfig` (docs/DESIGN.md "Credential plumbing"): the site
+  Config    `sites.toml` -> `SiteConfig` (docs/internal/DESIGN.md "Credential plumbing"): the site
             block is the committed, non-secret half of the connection. Hosts are not
             secrets; passwords never appear in this file.
   Creds     `resolve_credentials()` turns (flags, env, macOS Keychain) into a
@@ -101,7 +101,7 @@ DEFAULT_ISAPI_USER = "admin"
 DEFAULT_IANA_TZ = "Europe/Bucharest"
 DEFAULT_SITES_FILE = "sites.toml"
 
-# P2 agent defaults are docs/P2-SITE-AGENT.md decisions, signed off 2026-10-19 — the
+# P2 agent defaults are docs/internal/P2-SITE-AGENT.md decisions, signed off 2026-10-19 — the
 # card text cites the seam for each number. They live HERE (and every P2 key of the
 # schema is defined NOW) so later P2 cards only read them:
 #   cadence/overlap 5 min/5 min (§2a: minutes, not days — the ~190-request nonce use-cap
@@ -118,9 +118,14 @@ DEFAULT_DB_WARN_BYTES = 2 * 1024**3
 DEFAULT_PUSH_DEAD_LETTER_AFTER_S = 86400
 DEFAULT_DB_PATH_TEMPLATE = "./gateclerk-{site}.sqlite3"
 
-#: The only `push_target` schemes the validator accepts (§3: the push leg is ordinary
-#: HTTPS to our own endpoint; `stub://` is the owner-authorized local stub ingest).
-#: Everything else — `ftp://`, plaintext `http://`, scheme-less — is refused.
+#: The only `push_target` schemes the validator accepts — the whole "never invent an
+#: endpoint" law, `docs/internal/P2-SITE-AGENT.md` §3 (the push leg is ordinary HTTPS to
+#: our own endpoint; `stub://` is the owner-authorized local stub ingest). Everything
+#: else — `ftp://`, plaintext `http://`, scheme-less — is refused. The refusals raised
+#: across `config.py` / `agent_push.py` / `agent_cli.py` / `init_cli.py` / `sinks.py`
+#: state that rule in their own words and no longer restate this pointer: they are
+#: printed surfaces, and the shipped artefact has no `docs/` tree to resolve one against
+#: (`tests/test_doc_citations.py` pins it).
 PUSH_TARGET_SCHEMES = ("stub://", "https://")
 
 #: SINKS-CORE: the schemes a SINK ref may carry — §3's two, plus `file://` for a local
@@ -153,7 +158,7 @@ class ConfigSurface(StrEnum):
 
     CLI   — the P1 operator surface: today's behaviour, `iana_tz` optional (the CLI
             falls back to `DEFAULT_IANA_TZ` via `--tz` precedence in cli.py).
-    AGENT — the P2 site agent (docs/P2-SITE-AGENT.md §2d): a block without an explicit
+    AGENT — the P2 site agent (docs/internal/P2-SITE-AGENT.md §2d): a block without an explicit
             `iana_tz` is REFUSED, because site tz is payroll truth and the compiled-in
             default is a *site-a* value that must never decide another site's payroll.
     """
@@ -207,7 +212,7 @@ class SiteConfig:
     whole phase), so later P2 cards only read fields: the agent keys below are validated
     at parse time AND construct time exactly like P1's, and `surface` says which process
     is asking — the agent refuses a block whose `iana_tz` is missing, the CLI does not
-    (docs/P2-SITE-AGENT.md §2d; see `ConfigSurface`).
+    (docs/internal/P2-SITE-AGENT.md §2d; see `ConfigSurface`).
     """
 
     name: str
@@ -226,7 +231,7 @@ class SiteConfig:
     device_tz: str | None = None
     isapi_user: str = DEFAULT_ISAPI_USER
     keychain_service: str = DEFAULT_KEYCHAIN_SERVICE
-    # --- P2 agent keys (docs/P2-SITE-AGENT.md §2a-§2d) ---------------------------------
+    # --- P2 agent keys (docs/internal/P2-SITE-AGENT.md §2a-§2d) ---------------------------------
     #: Seconds between polls (§2a: 5 min against the ~190-request nonce use-cap).
     cadence_s: int = DEFAULT_CADENCE_S
     #: Seconds of already-seen window re-read on every poll (§2a: the gap-healer).
@@ -597,7 +602,7 @@ def _push_target_problem(target: str, *, key: str = "push_target") -> str | None
     allowed = " or ".join(PUSH_TARGET_SCHEMES)
     return (
         f"{key} {target!r} has an unacceptable scheme: a push target must start with "
-        f"{allowed} (never a default endpoint — docs/P2-SITE-AGENT.md §3)"
+        f"{allowed} — never a default endpoint"
     )
 
 
@@ -1003,15 +1008,15 @@ def load_sites(
     """Parse `sites.toml` into `{name: SiteConfig}`. Raises on a bad file or bad block.
 
     `surface` says which process is reading (see `ConfigSurface`): the agent surface
-    refuses a block without an explicit `iana_tz` (docs/P2-SITE-AGENT.md §2d).
+    refuses a block without an explicit `iana_tz` (docs/internal/P2-SITE-AGENT.md §2d).
     """
     file = Path(path)
     try:
         raw = file.read_bytes()
     except FileNotFoundError:
         raise ConfigError(
-            f"sites file {file} not found. Create it with one [[site]] block (see "
-            "docs/DESIGN.md 'Credential plumbing') or pass --config / --host."
+            f"sites file {file} not found. Create it with one [[site]] block (the design "
+            "doc's 'Credential plumbing' section shows one) or pass --config / --host."
         ) from None
     except OSError as exc:
         raise ConfigError(f"cannot read sites file {file}: {exc.strerror or exc}") from exc
@@ -1091,7 +1096,7 @@ def site_from_args(
             message = (
                 f"warning: site {found.name!r} has no iana_tz in sites.toml; UTC math "
                 "falls back to the compiled-in default (a site-a value). Site timezone "
-                "is payroll truth — declare iana_tz explicitly (docs/P2-SITE-AGENT.md §2d)."
+                "is payroll truth — declare iana_tz explicitly."
             )
             (warn or _warn_stderr)(message)
         return found

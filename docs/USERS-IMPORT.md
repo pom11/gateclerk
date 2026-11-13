@@ -5,7 +5,7 @@ an `.xlsx` workbook. It is a gated device write: the default is a zero-byte dry 
 `--apply` is the second opt-in write exception in the README (the first is
 `gateclerk migrate apply --apply`).
 
-The write path is the captured one from `docs/OBSERVED.md` — flat `UserInfo` /
+The write path is the captured one from `docs/internal/OBSERVED.md` — flat `UserInfo` /
 `CardInfo` wrappers with `mode:"add"` — and it reuses the journal, pacing and read-back
 seams from `migrate_write.py` / `migrate_write_cards.py`. No new transport is invented.
 

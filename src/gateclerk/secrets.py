@@ -1,6 +1,6 @@
 """Secret handling: a value that cannot accidentally print itself.
 
-The rule this module exists for (docs/DESIGN.md "Constraints / invariants"): a device
+The rule this module exists for (docs/internal/DESIGN.md "Constraints / invariants"): a device
 password must never appear in a repr, a log line, or an exception message. Two of those
 are a matter of discipline, which does not survive contact with a debugger, a `--verbose`
 flag, or a pytest assertion diff — so the password is wrapped here and the wrapper is

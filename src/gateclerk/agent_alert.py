@@ -1,6 +1,6 @@
 """Alert semantics + park-on-bad-creds for the P2 site agent (card P2-05).
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
 
 * terminal 401 WITH a challenge (wrong/rotated creds) -> CRITICAL, and the device
   loop PARKS: no automatic re-probe; a slow re-probe every 30 min ONLY after

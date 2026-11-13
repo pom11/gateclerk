@@ -1,6 +1,6 @@
 """Card P2-07b: `gateclerk agent run|ack|deadletter` — the thin wiring to P2-03/04/05/06.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2a-§2e + the card's BINDING block. This module owns
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2a-§2e + the card's BINDING block. This module owns
 `src/gateclerk/agent_cli.py` (the composition) and the `agent` subcommand group on `gateclerk.cli`.
 It owns NO rule: the cadence, the walk, the UPSERT, the checkpoint, the backoff, the 24 h
 dead-letter bound, the park and the re-probe grid all live in the P2 module that shipped them,
@@ -1167,7 +1167,7 @@ def test_existing_cli_surface_is_unchanged_and_agent_is_the_only_addition() -> N
         else:
             assert tree[name] - added == sub, f"{name} changed shape: {tree[name]} != {sub}"
             assert added <= set(tree[name]), f"{name} lost an authorized command: {tree[name]}"
-    # E1-07 (docs/ENROLLMENT-MIGRATION.md §7) added the `migrate` group on top of the
+    # E1-07 (docs/internal/ENROLLMENT-MIGRATION.md §7) added the `migrate` group on top of the
     # agent card's addition, t_ce142a14 the `demo` group (offline fake device), SINKS-CLI
     # (docs/SINKS plan) the `sink` group, and CLI-INIT the `init` command (declared as a
     # callback-only Typer group in `gateclerk/init_cli.py`) — each enters the one

@@ -47,7 +47,7 @@ shadow a command and a typo still exits 2.
 
 2. **A domain pipeline keeps its stage names, and a process command keeps its process
    verb.** `migrate probe|export|diff|apply|undo` are the five steps of
-   `docs/ENROLLMENT-MIGRATION.md` §7 *in order*, and `agent run` / `demo device serve` start
+   `docs/internal/ENROLLMENT-MIGRATION.md` §7 *in order*, and `agent run` / `demo device serve` start
    a long-lived process rather than reading or writing a record — neither is a generic CRUD
    verb, so neither is renamed to one. Calling `apply` "add" would cost the operator the §7
    numbering that the docs, the `apply --apply` review gate and the undo journal all refer

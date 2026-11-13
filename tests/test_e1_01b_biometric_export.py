@@ -1,7 +1,7 @@
 """Card E1-01b: face + fingerprint TEMPLATE export (the addendum to E1-01).
 
 Everything runs offline (autouse `netoff`, FakeDevice replaying bench-A truth from
-docs/ENROLLMENT-MIGRATION.md §1 / OBSERVED.md E1 rounds 11-18). Layers of proof:
+docs/internal/ENROLLMENT-MIGRATION.md §1 / OBSERVED.md E1 rounds 11-18). Layers of proof:
 
 1. The FDSearch walk: FLAT dialect only (the wrapped style 400s — the §9 dialect
    split pinned from BOTH sides), required flat params, the FPID filter honoured,

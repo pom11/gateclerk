@@ -8,7 +8,7 @@ stall, no terminal 401, tz_offset_mismatch warning-count 0, site_labeled_windows
 then sites B and C ONE AT A TIME, each gated on a read-only §5 probe card that first
 needs the operator's host + keychain item. Push target stays ABSTRACT: cards build
 against a local stub ingest + JSONL — never invent a real endpoint. Where this file and
-docs/OBSERVED.md disagree about device behaviour, OBSERVED.md wins (it was read off
+docs/internal/OBSERVED.md disagree about device behaviour, OBSERVED.md wins (it was read off
 the box). Every device-behaviour claim below cites OBSERVED.md or DESIGN.md — no
 invented device facts.
 

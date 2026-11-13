@@ -1,6 +1,6 @@
 """Capability probe (card E1-03): what THIS device can actually do, recorded not assumed.
 
-docs/ENROLLMENT-MIGRATION.md v4 §3 makes this matrix the gate for every export AND
+docs/internal/ENROLLMENT-MIGRATION.md v4 §3 makes this matrix the gate for every export AND
 apply of the E1 migration feature: identity, a per-endpoint availability matrix,
 counts, the templateNo evidence set, the face/FP situation, and the clock-skew
 evidence the apply gate (§5 step 1a) consumes. §0.7 decides how errors are treated:
@@ -54,7 +54,7 @@ future-dated probe is refused, never tolerated.
 
 Nothing here opens a socket: `probe_device` receives an `IsapiClient` (p1-03), which
 every test satisfies with `tests/fakedevice.py` seeded to bench A's discovered truth
-(docs/OBSERVED.md "E1 enrollment-read probes").
+(docs/internal/OBSERVED.md "E1 enrollment-read probes").
 """
 
 from __future__ import annotations
@@ -402,8 +402,8 @@ def probe_device(
     except IsapiAuthError as exc:
         raise ProbeAbortedError(
             f"capability probe aborted before any surface was read: the device "
-            f"refused our credentials ({exc}); not retrying — lockout accounting "
-            "(docs/ENROLLMENT-MIGRATION.md §0.5)"
+            f"refused our credentials ({exc}); not retrying — a refused credential counts "
+            "toward the device's lockout accounting"
         ) from exc
     except GateClerkError as exc:
         raise ProbeAbortedError(

@@ -1,6 +1,6 @@
 """Capability discovery: JSON->limits, clamping, XML fallback, cache (card p1-04 DoD).
 
-Every claim these tests make is pinned to a fixture or to docs/OBSERVED.md — the device
+Every claim these tests make is pinned to a fixture or to docs/internal/OBSERVED.md — the device
 truth the card implements against. All offline: the only "device" here is FakeDevice.
 """
 
@@ -82,7 +82,7 @@ def client_for(device: FakeDevice) -> IsapiClient:
 
 
 def test_recorded_site_a_capabilities_extract_every_advertised_limit() -> None:
-    """docs/OBSERVED.md 'AcsEvent capabilities' section, field for field."""
+    """docs/internal/OBSERVED.md 'AcsEvent capabilities' section, field for field."""
     caps = parse_acs_event_capabilities(recorded_caps_json())
     assert caps.max_results == 30, "OBSERVED.md: maxResults @max=30"
     assert caps.max_results_min == 1

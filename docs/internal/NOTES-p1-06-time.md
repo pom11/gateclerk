@@ -4,9 +4,9 @@ Scope per the orchestrator's scope-lock (2026-10-15): **one module** (`src/gatec
 of the core resolution policy. The Hikvision tz-dialect zoo and the `tz_offset_mismatch`
 flag were cut out of this card and split into p1-06b/c (see "Split out" below).
 
-Truth source for every decision here: `docs/OBSERVED.md` → "The time/offset bug
+Truth source for every decision here: `docs/internal/OBSERVED.md` → "The time/offset bug
 (payroll-critical, VERIFIED)". That section overrides the offset-trusting wording in
-`docs/DESIGN.md` "Time handling".
+`docs/internal/DESIGN.md` "Time handling".
 
 ## The bug being closed
 

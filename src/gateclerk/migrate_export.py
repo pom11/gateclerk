@@ -1,6 +1,6 @@
 """The read-only enrollment export (cards E1-01 + E1-01b): device -> bundle, fail closed.
 
-Design docs/ENROLLMENT-MIGRATION.md §0.7/§1/§2/§9. This is the snapshot every E1 write
+Design docs/internal/ENROLLMENT-MIGRATION.md §0.7/§1/§2/§9. This is the snapshot every E1 write
 run is gated behind (§0.1: the export IS the rollback source), so its one absolute
 rule is **a failure is never "empty"**: any error on a required read aborts the
 export loudly (`EnrollmentReadAborted`). "The device answered zero people" is a fact

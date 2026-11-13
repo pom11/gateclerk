@@ -3,7 +3,7 @@
     "Synthetic fixture (NOT recorded from the device). Site-a's terminal is in pure",
     "access-control mode, so `attendanceStatus` is absent/null on every real event",
     "(OBSERVED.md) and no checkIn/checkOut can be captured today. This file carries the",
-    "attendance-mode shape (docs/references/acs-event-codes.md section 4) so the",
+    "attendance-mode shape (docs/internal/references/acs-event-codes.md section 4) so the",
     "direction rule and its round trip are covered offline before the owner enables",
     "attendance mode (DESIGN.md option A).",
     "expected_direction is what gateclerk.model must produce: only checkIn/checkOut set a",

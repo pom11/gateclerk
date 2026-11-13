@@ -3,6 +3,10 @@
 One-way import law (`tests/test_cli_structure.py`): `gateclerk.cli` imports this module and
 calls `migrate_cmds.register(app)`; this module imports `gateclerk.cli_shared`, never
 `gateclerk.cli`.
+
+The law the group's help text states in its own words — `apply` writes only with `--apply`,
+`undo` removes only what a journal proved this run added — is
+`docs/internal/ENROLLMENT-MIGRATION.md` §5a/§7.
 """
 
 from __future__ import annotations
@@ -48,9 +52,9 @@ __all__ = [
 migrate_app = typer.Typer(
     name="migrate",
     help=(
-        "Enrollment migration (docs/ENROLLMENT-MIGRATION.md): probe, export and diff are "
-        "read-only; `apply` performs writes only with --apply, and `undo` removes only "
-        "what a journal proved this run added (§5a)."
+        "Enrollment migration: probe, export and diff are read-only; `apply` performs "
+        "writes only with --apply, and `undo` removes only what a journal proved this run "
+        "added."
     ),
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},

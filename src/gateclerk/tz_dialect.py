@@ -2,7 +2,7 @@
 
 Explains what the device *thinks* its offset is, for `tz_offset_min_device` and to make a
 `tz_offset_mismatch` flag readable. The site's IANA zone via zoneinfo stays the only
-source of truth for event UTC (docs/DESIGN.md "Time handling" item 5), so this module must
+source of truth for event UTC (docs/internal/DESIGN.md "Time handling" item 5), so this module must
 never see a clock or an instant — tests/test_tz_dialect.py pins its import set so the rule
 cannot rot into a comment.
 

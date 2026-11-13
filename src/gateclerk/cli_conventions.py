@@ -39,7 +39,7 @@ Two exception classes, deliberate rather than accidental:
    document. Recorded because it is the one place the vocabulary is visibly not applied.
 
 2. **A domain pipeline keeps its stage names.** ``migrate probe|export|diff|apply|undo``
-   are the five steps of docs/ENROLLMENT-MIGRATION.md §7 *in order*, and ``agent run`` is a
+   are the five steps of docs/internal/ENROLLMENT-MIGRATION.md §7 *in order*, and ``agent run`` is a
    systemd ``ExecStart``. Calling ``apply`` "add" costs the operator the §7 numbering that
    the docs, the ``apply --apply`` review gate and the undo journal all speak. The
    vocabulary governs generic verbs; it does not rename a domain's own nouns.

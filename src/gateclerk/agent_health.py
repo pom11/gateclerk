@@ -1,6 +1,6 @@
 """The P2 site agent's health surface: state collector + text/JSON builder (no server).
 
-Card P2-06 (docs/P2-SITE-AGENT.md §2e, DECIDED 2026-10-19: carry over ALL listed P1
+Card P2-06 (docs/internal/P2-SITE-AGENT.md §2e, DECIDED 2026-10-19: carry over ALL listed P1
 observables; minimal vocabulary; no dashboard). The spec's `/healthz` line — ok/degraded
 + agent version + per-device `last_poll_ok_age_s` + circuit state + dead-letter depth,
 NO secrets and no hosts beyond the site label — is exactly what `healthz_text` renders.
@@ -117,7 +117,7 @@ SNAPSHOT_ONLY_NAMES: tuple[str, ...] = (
 )
 
 #: The card's §2e vocabulary, exact snake_case, sorted — the set-equality test is the
-#: contract pin (docs/P2-SITE-AGENT.md §2e). One line each, value + source, below.
+#: contract pin (docs/internal/P2-SITE-AGENT.md §2e). One line each, value + source, below.
 METRIC_NAMES: tuple[str, ...] = (
     "auth_recoveries",
     "auth_terminal_failures",

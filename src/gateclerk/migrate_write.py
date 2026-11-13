@@ -1,6 +1,6 @@
 """E1-04 write foundation: apply journal, users phase, users read-back verify.
 
-Design contract: docs/ENROLLMENT-MIGRATION.md — §5 (steps 0-3, 7), §5a (journal
+Design contract: docs/internal/ENROLLMENT-MIGRATION.md — §5 (steps 0-3, 7), §5a (journal
 lifecycle), §5b (rule D-WIPE), §6 (read-back verify), §0 (safety rules), §9
 (capture-before-fake). Every write shape here exists ONLY because it sits in a
 committed bench-A capture fixture under
@@ -310,7 +310,7 @@ class RejectKind(StrEnum):
     #: E1-11 (site-B capture, V4.13.0): the request SHAPE was accepted — our own flat
     #: FDSetUp body with the target's OWN template answers `ok` (capture E1) — but THIS
     #: template's bytes were refused: the exact envelope pair `subStatusCode:
-    #: "badJsonContent"` + `errorMsg: "faceURL"` (capture E2, docs/OBSERVED-site-B.md
+    #: "badJsonContent"` + `errorMsg: "faceURL"` (capture E2, docs/internal/OBSERVED-site-B.md
     #: "Face WRITE capture"). Not our bug (SHAPE would send someone hunting the body
     #: builder — that fix is disproven by E1) and not generic OTHER either: it names a
     #: firmware template-PORTABILITY wall whose only human next step is re-enrollment

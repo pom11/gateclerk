@@ -1,7 +1,7 @@
 """The E1 enrollment bundle: normalization, content hashes, writer, reader (card E1-01).
 
 This module is the SINGLE home of the record-normalization and content-hash rules
-(design docs/ENROLLMENT-MIGRATION.md §2). Diff (E1-02) and read-back verify (E1-04/05)
+(design docs/internal/ENROLLMENT-MIGRATION.md §2). Diff (E1-02) and read-back verify (E1-04/05)
 import `normalize_record` / `content_hash` from here — they must never re-express them,
 because the whole diff/verify contract rests on the source side and the target side
 computing byte-identical hashes with the *same* function. Two implementations that can

@@ -1,4 +1,4 @@
-"""Pins for the static deploy templates in `deploy/` (docs/P2-SITE-AGENT.md §2d, §6(d)).
+"""Pins for the static deploy templates in `deploy/` (docs/internal/P2-SITE-AGENT.md §2d, §6(d)).
 
 What these tests are FOR: a committed deploy artifact is the one place in this repo whose
 whole job is to name where a service runs, which makes it the likeliest place for a real

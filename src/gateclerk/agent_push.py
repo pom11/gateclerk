@@ -1,6 +1,6 @@
 """The P2 site agent's outbound pusher: sqlite send buffer, backoff, dead-letter.
 
-Card P2-04 (docs/P2-SITE-AGENT.md §2b + §2c + §3, SIGNED OFF 2026-10-19). Three pieces,
+Card P2-04 (docs/internal/P2-SITE-AGENT.md §2b + §2c + §3, SIGNED OFF 2026-10-19). Three pieces,
 all of them the spec's, none invented:
 
 **The queue is a buffer, not a second store.** `push_queue` rows point at stored events
@@ -297,7 +297,7 @@ def _check_endpoint(endpoint: str, *, what: str) -> None:
         allowed = " or ".join(SINK_REF_SCHEMES)
         raise PushTargetError(
             f"{what} {endpoint!r} has an unacceptable scheme: a push target must start "
-            f"with {allowed} (docs/P2-SITE-AGENT.md §3 — never invented, never defaulted)"
+            f"with {allowed} — never invented, never defaulted"
         )
 
 
@@ -1455,7 +1455,7 @@ def stub_transport(target: str) -> Transport:
         raise PushTargetError(
             f"stub ingest cannot serve {target!r}: a stub target is `stub://<local path>`. "
             "https:// targets need a real transport, and this repo does not invent "
-            "endpoints (docs/P2-SITE-AGENT.md §3)."
+            "endpoints."
         )
     remainder = target[len("stub://") :].strip()
     if not remainder:

@@ -1,7 +1,7 @@
 """Card E1-03 definition of done: the capability probe, driven against FakeDevice.
 
 `gateclerk.migrate_probe` is the gate every later E1 card (diff, apply, template port)
-reads, so these tests pin what the gate promises (docs/ENROLLMENT-MIGRATION.md v4 §3):
+reads, so these tests pin what the gate promises (docs/internal/ENROLLMENT-MIGRATION.md v4 §3):
 
 * every surface carries the DEVICE's verdict — never an inherited assumption. The
   no-assumption-leak test flips each fake knob to a non-OK answer and asserts the

@@ -1,7 +1,7 @@
 """The P2 site agent's scheduler loop: 5 min cadence, 5 min overlap, one client.
 
-Card P2-03 (docs/P2-SITE-AGENT.md §2a, DECIDED 2026-10-19; §1 seams 2/3/7/9). Device
-truth: docs/OBSERVED.md. This module *orchestrates* — every hard rule lives in the P1
+Card P2-03 (docs/internal/P2-SITE-AGENT.md §2a, DECIDED 2026-10-19; §1 seams 2/3/7/9). Device
+truth: docs/internal/OBSERVED.md. This module *orchestrates* — every hard rule lives in the P1
 module that owns it and is reused untouched (seam 6, "reuse, do not fork"):
 
 * `paging.iter_event_windows` — the p1-05c walk: chunking, the 0-based cursor, the
@@ -935,7 +935,7 @@ class DeviceLoop:
         join is one extra walk grouped by employee.
 
         It is conditional for the same reason the roster is hourly: every request spends
-        a device nonce against the ~190-use cap (docs/OBSERVED.md). A box where nobody
+        a device nonce against the ~190-use cap (docs/internal/OBSERVED.md). A box where nobody
         holds a card costs ZERO `CardInfo/Search` requests. The number goes into `raw` as
         `cardNo` — the key `agent_push._roster_user` already reads — and nothing else is
         added: the four-key wire shape (`employee_no`, `name`, `cardNo`, `hasFace`) and the

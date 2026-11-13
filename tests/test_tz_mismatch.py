@@ -1,6 +1,6 @@
 """The tz_offset_mismatch detector: card P1-06c golden pair plus its policy pins.
 
-Golden pair is site-a's real case from docs/OBSERVED.md: the device stamps +02:00 on
+Golden pair is site-a's real case from docs/internal/OBSERVED.md: the device stamps +02:00 on
 2026-10-15T16:39 Bucharest wall time, where Europe/Bucharest is really +03:00 ->
 mismatch. The same +02:00 claim in January is correct -> no mismatch. Everything here is
 offline arithmetic on a wall time; no clock, no device, no UTC instant.

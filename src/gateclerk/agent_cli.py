@@ -1423,8 +1423,8 @@ def build_site_agent(
     ):
         raise ConfigError(
             f"push_target {site.push_target!r} has no transport: this repo serves "
-            "`stub://` and `https://` only and never invents an endpoint "
-            "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at one of those."
+            "`stub://` and `https://` only and never invents an endpoint. "
+            "Unset push_target, or aim it at one of those."
         )
     db_path = resolve_db_path(site, state_root)
     root = Path(db_path).parent

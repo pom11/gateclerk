@@ -1,6 +1,6 @@
 """E1-05 cards phase: CardInfo/SetUp port, proof-of-add card undo, capacity fail-fast.
 
-Design contract: docs/ENROLLMENT-MIGRATION.md — §5 steps 2/4/5 (phase order, capacity
+Design contract: docs/internal/ENROLLMENT-MIGRATION.md — §5 steps 2/4/5 (phase order, capacity
 fail-fast, pair-identity cards), §5a (journal + undo with proof-of-add), §5b/§5b.1
 (rule D-WIPE and the banned user delete), §6 (read-back verify), §0 (safety rules),
 §9 (capture-before-fake). Parent E1-04 shipped the foundation this module is built

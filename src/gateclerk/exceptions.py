@@ -4,7 +4,7 @@ Split out from the transport so the transport card (p1-03) and its callers can s
 one vocabulary without importing httpx. The transport is expected to raise these;
 `from_http` is the single place that turns an ISAPI error envelope into one of them.
 
-The shapes are dictated by docs/DESIGN.md ("Failure modes we design for"): a 401 is
+The shapes are dictated by docs/internal/DESIGN.md ("Failure modes we design for"): a 401 is
 terminal (the device locks an account after repeated failures, so we surface it and
 stop rather than looping), and a 400/badParameters is almost always our request shape,
 so the message has to carry the request body verbatim or the error is useless.
@@ -82,7 +82,7 @@ class CredentialUnavailable(ConfigError):
     """No password could be resolved for a host, or the source refused.
 
     The message always names the source that was tried and the command or variable that
-    would satisfy it (docs/OBSERVED.md + card p1-02), so the fix is a copy-paste away —
+    would satisfy it (docs/internal/OBSERVED.md + card p1-02), so the fix is a copy-paste away —
     never a guess. Never contains the secret itself.
     """
 
@@ -182,7 +182,7 @@ class IsapiBusy(IsapiError):
     and retry, bounded.
 
     NOT `invalidOperation`: that is vendor `statusCode` 4, terminal per the table in
-    docs/references/isapi-client-gotchas.md §2.2 and DESIGN.md's Throttling line —
+    docs/internal/references/isapi-client-gotchas.md §2.2 and DESIGN.md's Throttling line —
     retrying a 4-class code is how a polling loop becomes a door-terminal lockout.
     `_BUSY_SUBCODES` in `gateclerk.isapi_response` is the mapping table; both sides of
     the boundary are pinned in tests (test_isapi_response.py + test_isapi_transport.py).
@@ -229,7 +229,7 @@ class EventBoundsError(GateClerkError):
     Some firmware answers an unbounded event search with `Invalid Content`; worse,
     an unbounded walk over the full ~10k history is exactly the slow, page-heavy
     path DESIGN.md tells us never to take. We refuse the query *before* sending it
-    (docs/DESIGN.md "Paging + checkpoint": ALWAYS include startTime/endTime).
+    (docs/internal/DESIGN.md "Paging + checkpoint": ALWAYS include startTime/endTime).
     """
 
 

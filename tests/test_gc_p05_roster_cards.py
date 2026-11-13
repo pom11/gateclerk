@@ -15,7 +15,7 @@ Proof layers, each named after the rule it locks:
   asserted on the wire of every case that pushes, and `numOfCard` — which the device
   DID send — is asserted absent, because the card forbids it on the line;
 * the card walk is conditional: `numOfCard == 0` everywhere must cost ZERO
-  `CardInfo/Search` requests (the ~190-use nonce budget, docs/OBSERVED.md, is why the
+  `CardInfo/Search` requests (the ~190-use nonce budget, docs/internal/OBSERVED.md, is why the
   roster is hourly and why a second walk has to be earned);
 * the primary-card rule is pinned by the card: numeric cards compare numerically,
   everything else as text, lowest wins.
@@ -242,7 +242,7 @@ def test_primary_card_rule_is_pinned_as_documented() -> None:
 def test_card_walk_is_skipped_when_no_user_has_a_card() -> None:
     """Zero cards on the box => zero `CardInfo/Search` requests.
 
-    A second walk costs device nonces against the ~190-use cap (docs/OBSERVED.md), so
+    A second walk costs device nonces against the ~190-use cap (docs/internal/OBSERVED.md), so
     the join has to be earned by a user who actually holds a card. The fake's request
     ledger is the independent witness — a mock counting itself would prove nothing.
     """

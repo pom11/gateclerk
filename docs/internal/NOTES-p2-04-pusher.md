@@ -1,6 +1,6 @@
 # P2-04 pusher + dead-letter — implementation notes (working notes; trimmed into the PR body)
 
-Binding spec: `docs/P2-SITE-AGENT.md` §2b (dead-letter), §2c (pusher backoff + bound),
+Binding spec: `docs/internal/P2-SITE-AGENT.md` §2b (dead-letter), §2c (pusher backoff + bound),
 §3 (abstract target) — SIGNED OFF 2026-10-19. Files: `src/gateclerk/agent_push.py` (new),
 two additive migration entries in `src/gateclerk/agent_db.py` (v3/v4),
 `tests/test_p2_04_pusher.py` (new, 56 tests).

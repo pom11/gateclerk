@@ -44,7 +44,7 @@ class NetworkBlockedError(RuntimeError):
 def _blocked(*args: object, **kwargs: object) -> None:
     raise NetworkBlockedError(
         "offline test tried to use the network — tests must run against fixtures "
-        "(tests/fixtures/) or httpx.MockTransport; see docs/DESIGN.md 'Testing'"
+        "(tests/fixtures/) or httpx.MockTransport; see docs/internal/DESIGN.md 'Testing'"
     )
 
 

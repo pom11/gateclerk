@@ -153,7 +153,7 @@ Long `--chunk 1h` backfill hit **401 Unauthorized with the correct password** at
 the same window on two runs (2026-09-08T21:00, ~190th request of the walk), exit 3.
 The device stayed **unlocked**: `lockStatus=unlock`, `retryLoginTime=4` — NOT a lockout.
 
-**Mechanism DETERMINED offline (t_a3521d8a, docs/FINDINGS-t_a3521d8a.md F1): shape (c)**
+**Mechanism DETERMINED offline (t_a3521d8a, docs/internal/FINDINGS-t_a3521d8a.md F1): shape (c)**
 — 401 carrying the ISAPI error envelope and NO `WWW-Authenticate`. httpx re-pays any 401
 that offers a challenge (stale flag irrelevant), so shapes (a)/(b) were always survivable;
 the challenge-less 401 fell to our 401-terminal rule and killed the walk. Fix = bounded
@@ -261,7 +261,7 @@ hour. Do not `str.replace("GMT","")`; map site names (IANA) in config instead.
 ## E1 enrollment-read probes — bench A, 2026-10-21 (read-only rounds 11-18)
 
 Device DS-K1T341AMF-S fw V3.2.30, same masked conventions as above. These facts fed
-design v4 (docs/ENROLLMENT-MIGRATION.md §1). Biometric BYTES (face modelData, FP
+design v4 (docs/internal/ENROLLMENT-MIGRATION.md §1). Biometric BYTES (face modelData, FP
 fingerData) are never committed here or in fixtures — shape/size/hash-prefix only.
 
 - **UserInfo/Search dialect**: body MUST be `{"UserInfoSearchCond":{searchID,

@@ -2,7 +2,7 @@
 
 Nothing here touches a socket; the transport half lives in test_isapi_transport.py
 with FakeDevice. Fixtures from tests/fixtures/recorded/site-a-ds-k1t341amf-s/ are the
-recorded truth (docs/OBSERVED.md); invented bodies are labelled as such in the test.
+recorded truth (docs/internal/OBSERVED.md); invented bodies are labelled as such in the test.
 """
 
 from __future__ import annotations

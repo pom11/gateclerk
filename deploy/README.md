@@ -18,7 +18,7 @@ that document when the production host is Alpine in Docker instead of systemd.
 
 Windows agent hosts have no unit file here (the supported route is a Task Scheduler task
 running the same `agent run` command line; see step 6). The spec is explicit about this
-split: `docs/P2-SITE-AGENT.md` §2d — agents run on Linux/Windows, macOS is the dev box, so
+split: `docs/internal/P2-SITE-AGENT.md` §2d — agents run on Linux/Windows, macOS is the dev box, so
 launchd is an example and not a product.
 
 These are static artifacts. **This directory contains no code**, and the command the unit
@@ -233,7 +233,7 @@ journalctl -u gateclerk-agent@site-a -n 50                  # one line per page:
                                                         # kind, serial — never a host, never a payload
 ```
 
-Then the four canary numbers the rollout gate counts (`docs/P2-SITE-AGENT.md` §5 / the
+Then the four canary numbers the rollout gate counts (`docs/internal/P2-SITE-AGENT.md` §5 / the
 P2-06 `/healthz` vocabulary): checkpoint advancing, `auth_terminal_failures` 0,
 `tz_offset_mismatch` warning-count 0, `site_labeled_windows` 0.
 
@@ -269,7 +269,7 @@ Rotate on the device, write the new value into the 0600 source file, then
 restart is not enough — the park is deliberate and survives restarts, so ack it explicitly
 (`gateclerk agent ack --site <site>`, P2-07b) after the new credential is in place. Do not
 work around the park: a lockout-counting device is the reason it exists
-(`docs/OBSERVED.md` "lockout accounting").
+(`docs/internal/OBSERVED.md` "lockout accounting").
 
 ## 8. Uninstall
 

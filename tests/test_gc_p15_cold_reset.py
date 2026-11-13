@@ -1,6 +1,6 @@
 """Card GC-P15: a serial reset is still detected when the poll window comes back empty.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2a request math + the R1 rule ("no punch may be
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2a request math + the R1 rule ("no punch may be
 lost silently"). A terminal that is factory-reset or replaced restarts `serialNo` near
 1. Until now the ONLY place that decision lived was inside the per-chunk loop of
 `tick()`: with no chunk, no decision — so a replacement unit that had produced nothing

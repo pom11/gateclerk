@@ -1,6 +1,6 @@
 """Card E1-09: probe persistence must honor the repo-out guard (§9.1 finding 1).
 
-Live-validated on bench A (E1-08, docs/ENROLLMENT-MIGRATION.md §9.1): `export --out`
+Live-validated on bench A (E1-08, docs/internal/ENROLLMENT-MIGRATION.md §9.1): `export --out`
 refuses a destination inside a git repo via ``migrate_bundle._refuse_repo_out``, but
 `migrate probe` persisted its schema-2 document to ``probes_root(bundle_root())`` with
 no check at all — and the DEFAULT root resolves under ``~/gateclerk``, itself a git repo

@@ -1,7 +1,7 @@
 # Progress
 
 Short milestone notes for humans. (Board truth: `hermes kanban --board gateclerk list`;
-device truth: docs/OBSERVED.md.)
+device truth: docs/internal/OBSERVED.md.)
 
 ## 2026-10-15 — P1 kickoff → mid-flight
 
@@ -13,7 +13,7 @@ device truth: docs/OBSERVED.md.)
   `System/*` answers XML despite format=json, `AcsEvent/Total` not supported. **Time
   bug confirmed**: device stamps +02:00 during Bucharest summer; UTC math now uses
   site-tz policy (Europe/Bucharest), device offset kept as audit-only flag. All in
-  docs/OBSERVED.md; 10 masked fixtures recorded for offline CI.
+  docs/internal/OBSERVED.md; 10 masked fixtures recorded for offline CI.
 - **Owner scope-lock**: device side only. BC (P3) not designed/carded; P2 = sketch.
   Creds policy relaxed (private repo; keychain default, gitignored .env fine, no
   hygiene machinery).
@@ -28,7 +28,7 @@ device truth: docs/OBSERVED.md.)
 ## Next expected
 - P1-12 (device_tz mapping) gate + merge -> orchestrator live read-only re-run
   (2026-05-21 13:00-14:30, expect no warning + 20 records) -> tz axis closed.
-- Owner decisions still pending: P2-00 spec sign-off (docs/P2-SITE-AGENT.md),
+- Owner decisions still pending: P2-00 spec sign-off (docs/internal/P2-SITE-AGENT.md),
   3-site rollout order. BC/P3 stays closed.
 
 ## 2026-10-19 — P1-12 merged (PR #27 -> b2ca061) + live acceptance PASSED (mapping silences warning, records identical)
@@ -56,7 +56,7 @@ device truth: docs/OBSERVED.md.)
   P2-fix-A catch as its receipt. Canary re-arms for free if a real site appears.
 - NEW FEATURE E1 — enrollment migration device↔device (first feature that WRITES):
   operator dropped the sign-off gate ("you own the design end to end"). Design doc
-  docs/ENROLLMENT-MIGRATION.md v1 written FROM LIVE PROBES of bench A (read-only,
+  docs/internal/ENROLLMENT-MIGRATION.md v1 written FROM LIVE PROBES of bench A (read-only,
   ~15 requests total across 8 rounds): UserInfo/CardInfo search work (4 users, 0
   cards, record shape incl. RightPlan+Valid+password); UserInfoDetail/FingerPrint/
   PlanTemplate all notSupport on this fw; FDSearch rejects ~8 body shapes (R1, both
@@ -205,7 +205,7 @@ device truth: docs/OBSERVED.md.)
   pin renders "no evidence (device claims nothing)", never agreement (mutant documented).
 - PR #25 (P2-00 decision spec, docs-only) -> `e97d8fe`: 264 lines, 23 OBSERVED/DESIGN
   citations; ~190 nonce figure correctly attributed to OBSERVED + fw V3.2.30; P2 stays
-  NOT scheduled pending OWNER SIGN-OFF on docs/P2-SITE-AGENT.md.
+  NOT scheduled pending OWNER SIGN-OFF on docs/internal/P2-SITE-AGENT.md.
 - OWNER DECISION: no physical device-clock fix -> per-device `device_tz` mapping in
   sites.toml (claims +02:00, actually Europe/Bucharest); mapped zone authoritative,
   warning silenced for the known-wrong claim, provenance fields untouched. Carded
@@ -472,7 +472,7 @@ device truth: docs/OBSERVED.md.)
   CI); `direction` derivable only from `attendanceStatus`, contradicting attribution
   rejected; `employee_no` NFC-normalized (fingerprint identity); password hash stripped
   before storage; JSONL lossless for the p1-08 CLI.
-- **Hotspot standing**: `docs/DESIGN.md` touched by PR #7 (open) + PR #11 (open) + this
+- **Hotspot standing**: `docs/internal/DESIGN.md` touched by PR #7 (open) + PR #11 (open) + this
   merged cycle — sequence the next DESIGN.md edits.
 
 ### 2026-10-16 evening — follow-up: t_ca64f6c2 (loose fixture floor) merged → `7cecaa7`
@@ -501,7 +501,7 @@ device truth: docs/OBSERVED.md.)
   with a reason (never a confidently wrong number). Diagnostics-only rule (DESIGN item 5)
   is *mechanically* pinned by an ast+tokenize test — good pattern, reused elsewhere.
 - **CI format gate was red on main for every PR** since the docs merge (ruff-format on
-  python blocks inside `docs/references/isapi-client-gotchas.md`). Reproduced on a clean
+  python blocks inside `docs/internal/references/isapi-client-gotchas.md`). Reproduced on a clean
   `origin/main` worktree before blaming the branch; fix landed as the worker's own
   whitespace-only commit (78b0b6e). If CI is red, check it against main first.
 - **PR #2 (p1-06 tz core) = changes requested, NOT merged.** Policy is correct: all five
@@ -539,7 +539,7 @@ device truth: docs/OBSERVED.md.)
   re-enroll on site"; supplied K1T-family shapes for FDSearch + FingerPrintUpload
   from memory and ordered ONE capture session for users+card+FP+face fixtures.
 - Every supplied shape VERIFIED LIVE on bench A (read-only rounds 11-18, one attempt
-  per shape, no retries — raw facts + masking in docs/OBSERVED.md, design in v4 §1):
+  per shape, no retries — raw facts + masking in docs/internal/OBSERVED.md, design in v4 §1):
   * FDSearch RESOLVED (FLAT dialect!): rows carry `modelData` = the face TEMPLATE
     (272 B, FR500005 magic) — portable bytes; faceURL PHOTO bytes dead (404s).
     v3's "faces unexportable" was my wrong-dialect mistake, not a device limit.
@@ -830,7 +830,7 @@ Invalid Content). => Body builder VERIFIED CORRECT on V4.13.0; the wall is TEMPL
 GENERATION (V3.2.30 FR500005 rejected by V4.13.0, B native FR702706). Picture route
 dead both ends (A faceURL JPEG export 404; B isSupportFDSearchDataPackage:false).
 Cross-generation face carry = firmware wall -> faces need re-enrollment on B (operator
-decision). Truth in docs/OBSERVED-site-B.md (0a2c6a9, pushed). E1-11 carded: capture-
+decision). Truth in docs/internal/OBSERVED-site-B.md (0a2c6a9, pushed). E1-11 carded: capture-
 backed template_rejected class + pre-apply facePortability warning (report-only) +
 real-client tests; NO body-builder change (provably right), NO new device shapes
 without operator-sanctioned capture (lockout budget). Separate observability gap
@@ -845,7 +845,7 @@ Capture truth is now code: the faces phase classifies the EXACT captured pair
 stays shape_rejected) as RejectKind.template_rejected, journals it under the unchanged
 schema as the additive `rejectClass` key (old journals read with class None; unknown
 values fail closed), and aborts naming the wall and the human step ("faces require
-re-enrollment on the target — docs/OBSERVED-site-B.md"); zero retry unchanged (§0.6).
+re-enrollment on the target — docs/internal/OBSERVED-site-B.md"); zero retry unchanged (§0.6).
 Pre-apply, plan/diff compare readable template families (first 8 bytes, `FR\d{6}` —
 transport, never a parse): source family the target has never held earns a REPORT-ONLY
 facePortability note per person (table notes + `-o json` field), silence — never a
