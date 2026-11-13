@@ -43,6 +43,53 @@ TARGETS: tuple[str, ...] = (
     "linux-arm64",
 )
 
+# GC-P13: a release artifact must run on a host that has nothing but a bare `python3`,
+# so the `.pyz` carries its own copy of every third-party module `gateclerk.cli`
+# imports. These are IMPORT names, not distribution names.
+#
+# The list is the real import closure, not the transitive `Requires-Dist` graph:
+#   * typer 0.27 vendors click as `typer/_click` and no longer needs a top-level `click`;
+#   * typer 0.27 does need `shellingham` and `annotated_doc`, which an older list missed;
+#   * anyio 4.15 imports `sniffio` only inside a try/except, so it is optional;
+#   * anyio 4.15 imports `typing_extensions` unconditionally, and it ships as a single
+#     `.py` file rather than a package directory.
+# `tests/test_gc_p13_selfcontained_pyz.py` asserts the archive covers the closure, so a
+# dependency bump that adds a package fails the suite instead of the release.
+RUNTIME_PACKAGES: tuple[str, ...] = (
+    "typer",
+    "shellingham",
+    "annotated_doc",
+    "rich",
+    "markdown_it",
+    "mdurl",
+    "pygments",
+    "httpx",
+    "httpcore",
+    "h11",
+    "anyio",
+    "idna",
+    "certifi",
+    "typing_extensions",
+)
+
+# Vendored when the build environment happens to have them, skipped when it does not.
+# Three reasons each name here is optional rather than required:
+#   * `click`/`sniffio` are not in this lockfile at all (see above). Keeping them here
+#     means a future typer that un-vendors click still produces a working artifact.
+#   * `openpyxl`/`et_xmlfile` back the optional `excel` extra — `users import` explains
+#     the missing extra instead of crashing, so the package must remain buildable and
+#     runnable without them. A hard requirement here would fail a release build over a
+#     feature that is deliberately optional. They are installed in the dev group, so a
+#     normal `uv run --frozen` build does vendor them.
+OPTIONAL_RUNTIME_PACKAGES: tuple[str, ...] = (
+    "click",
+    "sniffio",
+    "openpyxl",
+    "et_xmlfile",
+)
+
+_ARCHIVE_STAMP = (2026, 11, 4, 0, 0, 0)
+
 
 def read_pyproject_version(repo_dir: Path) -> str:
     data = tomllib.loads((repo_dir / "pyproject.toml").read_text(encoding="utf-8"))
@@ -123,29 +170,100 @@ def build_source_tarball(repo_dir: Path, version: str, out_path: Path) -> Path:
     return out_path
 
 
-def build_target_zipapp(repo_dir: Path, version: str, target: str, out_path: Path) -> Path:
-    """Build an executable `.pyz` archive for `target` with `gateclerk` and `__main__.py`."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    src_pkg = repo_dir / "src" / "gateclerk"
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for py_file in sorted(src_pkg.rglob("*.py")):
-            rel = py_file.relative_to(repo_dir / "src").as_posix()
-            zinfo = zipfile.ZipInfo(rel, date_time=(2026, 11, 4, 0, 0, 0))
-            zinfo.compress_type = zipfile.ZIP_DEFLATED
-            zinfo.external_attr = (0o644 & 0xFFFF) << 16
-            zf.writestr(zinfo, py_file.read_bytes())
+def _copy_runtime_member(name: str, staging: Path) -> bool:
+    """Copy one import name into `staging`. Returns False when it is not installed.
 
-        main_info = zipfile.ZipInfo("__main__.py", date_time=(2026, 11, 4, 0, 0, 0))
-        main_info.compress_type = zipfile.ZIP_DEFLATED
-        main_info.external_attr = (0o644 & 0xFFFF) << 16
-        main_code = (
+    Handles both package directories (`rich/`) and single-file modules
+    (`typing_extensions.py`), which `submodule_search_locations` alone would reject.
+    """
+    import importlib.util
+    import shutil
+
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        return False
+
+    if spec.submodule_search_locations:
+        source = Path(next(iter(spec.submodule_search_locations)))
+        shutil.copytree(
+            source,
+            staging / name,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        return True
+
+    if spec.origin and spec.origin.endswith(".py"):
+        shutil.copy2(spec.origin, staging / Path(spec.origin).name)
+        return True
+
+    return False
+
+
+def _vendor_runtime_packages(staging: Path) -> None:
+    """Copy every third-party module the CLI needs into the staging directory.
+
+    A package in `RUNTIME_PACKAGES` that is missing from the build environment is a hard
+    error: shipping an artifact that dies with `ModuleNotFoundError` on a production host
+    is worse than a build that fails here.
+    """
+    for name in RUNTIME_PACKAGES:
+        if not _copy_runtime_member(name, staging):
+            raise ValueError(f"runtime package {name!r} is not installed in this build env")
+    for name in OPTIONAL_RUNTIME_PACKAGES:
+        _copy_runtime_member(name, staging)
+
+
+def build_target_zipapp(repo_dir: Path, version: str, target: str, out_path: Path) -> Path:
+    """Build an executable, self-contained `.pyz` archive for `target`.
+
+    The archive stages `gateclerk` plus every runtime dependency in a temp directory and
+    is then written with a FIXED member timestamp rather than `zipapp.create_archive`,
+    which stamps `__main__.py` with the wall clock and would make `SHA256SUMS` differ
+    between two builds of the same tree (asserted by tests/test_release_packaging.py).
+    """
+    import shutil
+    import tempfile
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gateclerk-pyz-") as tmp:
+        staging = Path(tmp)
+        shutil.copytree(
+            repo_dir / "src" / "gateclerk",
+            staging / "gateclerk",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        _vendor_runtime_packages(staging)
+        # A host Python older than the project floor fails inside typer's typing imports
+        # with a cryptic `cannot import name 'TypeGuard'`. Say what is actually wrong.
+        (staging / "__main__.py").write_text(
             f"# target: {target} version: {version}\n"
+            "import sys\n"
+            "\n"
+            "if sys.version_info < (3, 12):\n"
+            "    sys.stderr.write(\n"
+            f"        'gateclerk {version} requires Python 3.12 or newer; "
+            "this is %d.%d.%d.\\n'\n"
+            "        % sys.version_info[:3]\n"
+            "    )\n"
+            "    raise SystemExit(2)\n"
+            "\n"
             "from gateclerk.cli import main\n"
             "if __name__ == '__main__':\n"
-            "    raise SystemExit(main())\n"
+            "    raise SystemExit(main())\n",
+            encoding="utf-8",
         )
-        zf.writestr(main_info, main_code.encode("utf-8"))
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for member in sorted(staging.rglob("*")):
+                if not member.is_file():
+                    continue
+                zinfo = zipfile.ZipInfo(
+                    member.relative_to(staging).as_posix(), date_time=_ARCHIVE_STAMP
+                )
+                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                zinfo.external_attr = (0o644 & 0xFFFF) << 16
+                zf.writestr(zinfo, member.read_bytes())
 
     shebang = b"#!/usr/bin/env python3\n"
     out_path.write_bytes(shebang + buf.getvalue())
