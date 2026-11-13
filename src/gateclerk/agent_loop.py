@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -836,17 +836,57 @@ class DeviceLoop:
         avoid), mapped through p1-07's `user_record_from_device` — which is where the
         device `password` hash is stripped, so the roster leg inherits the redaction
         rather than re-implementing it (seam 6: reuse, do not fork).
+
+        Then the GC-P05 join. `UserInfo/Search` answers `numOfCard` but NOT `cardNo` on
+        the probed firmware (pinned by the recorded capture), so the user walk alone can
+        never fill BC Table 70605's "Card No." column — and `Nelegati` links a card to a
+        person through BC, with this roster as its input. `CardInfo/Search` is the only
+        route that names the number, and each of its rows carries `employeeNo`, so the
+        join is one extra walk grouped by employee.
+
+        It is conditional for the same reason the roster is hourly: every request spends
+        a device nonce against the ~190-use cap (docs/OBSERVED.md). A box where nobody
+        holds a card costs ZERO `CardInfo/Search` requests. The number goes into `raw` as
+        `cardNo` — the key `agent_push._roster_user` already reads — and nothing else is
+        added: the four-key wire shape (`employee_no`, `name`, `cardNo`, `hasFace`) and the
+        password strip stay exactly as they were, and a card number never reaches a log.
         """
         if self._roster is not None:
             return list(self._roster())
-        from gateclerk.paging import PagingLimits, iter_users
+        from gateclerk.paging import PagingLimits, card_info_search, iter_users
         from gateclerk.pipeline import user_record_from_device
 
         limits = self._limits or (
             paging_limits_from_caps(self._caps) if self._caps is not None else PagingLimits()
         )
         reader = _search_reader(self.client, "user_info_search")
-        return [user_record_from_device(raw) for raw in iter_users(reader, limits=limits)]
+        users: list[Any] = [
+            user_record_from_device(raw) for raw in iter_users(reader, limits=limits)
+        ]
+        if any(_card_count(user) > 0 for user in users):
+            cards_reader = _search_reader(self.client, "card_info_search")
+            by_employee: dict[str, list[str]] = {}
+            for card in card_info_search(cards_reader, limits=limits).collect({}):
+                employee = card.get("employeeNo", card.get("employeeNoString"))
+                number = card.get("cardNo")
+                # A missing or blank number is skipped rather than rostered: the device
+                # row names no card, and `str(None)`/`""` must never become a "card
+                # number". `_primary_card` ignores blanks anyway, so dropping them here
+                # also means one malformed row cannot end the walk with an empty-min
+                # ValueError.
+                if employee is None or number is None or not str(number).strip():
+                    continue
+                by_employee.setdefault(str(employee).strip(), []).append(str(number))
+            users = [
+                replace(
+                    user,
+                    raw={**user.raw, "cardNo": _primary_card(by_employee[user.employee_no])},
+                )
+                if by_employee.get(user.employee_no)
+                else user
+                for user in users
+            ]
+        return users
 
     # --- internals ----------------------------------------------------------------------
 
@@ -1134,6 +1174,42 @@ class _WalkCounts:
         self.refreshed += refreshed
         self.unchanged += unchanged
         self.termination = chunk.termination  # last completed chunk wins
+
+
+def _primary_card(card_numbers: Sequence[str]) -> str:
+    """The ONE card number a multi-card employee is rostered under.
+
+    Pinned rule (GC-P05 — BC Table 70605's "Card No." column and the `Nelegati` linking
+    workflow key on this one value, so it must be stable across roster runs, not whichever
+    page order the device happened to answer in):
+
+    * a card number that is all digits compares by its NUMERIC value — `"900"` is lower
+      than `"1002"`, which lexicographic order gets backwards and would misattribute a
+      punch to the wrong person;
+    * anything else compares as TEXT, and loses to every numeric card;
+    * the LOWEST value wins when one employee has several cards;
+    * blank entries are ignored, never "lowest".
+    """
+
+    def key(value: str) -> tuple[int, int, str]:
+        text = value.strip()
+        return (0, int(text), text) if text.isdigit() else (1, 0, text)
+
+    return min((c for c in card_numbers if c.strip()), key=key)
+
+
+def _card_count(user: Any) -> int:
+    """`numOfCard` as an int, tolerant of the two spellings sibling firmware uses.
+
+    The probed firmware answers an int; a numeric string is answered by sibling models of
+    the same family, and neither may be read as "has no cards" (a missed join is a blank
+    "Card No." in BC, which is the bug this card fixes). A bool, a negative or anything
+    unreadable counts as 0 — the walk is skipped, which is the conservative direction.
+    """
+    value = user.raw.get("numOfCard")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return int(value) if isinstance(value, str) and value.isdigit() else 0
 
 
 def _search_reader(client: Any, endpoint: str = "acs_event_search") -> Any:
