@@ -13,6 +13,10 @@ Two exports, one module:
        `device_cred_env_var`, `device_cred_ref`, `ingest_token_keychain_service`,
        `ingest_token_env_var`, plus sink `token_env` / `token_keychain` validated via
        `sink_cli.token_ref_problem`)
+     * every sink field the parser honours: `type` (including the `mnotify` alert route),
+       `url`, `path`, `rotation`, `enabled`, `to`, `timeout_s`, `accepts_roster` and
+       `headers` as sorted `k=v` pairs — a reserved header name (`Authorization`,
+       `X-GateClerk-Site`) or a secret-shaped value drops the whole header table
      * unknown keys and stripped userinfo/secrets are DROPPED and counted in a
        `dropped_keys` summary on stderr.
 
@@ -181,8 +185,21 @@ ALLOWED_SINK_KEYS: frozenset[str] = frozenset(
         "token_env",
         "token_keychain",
         "enabled",
+        # Real `SinkSpec` fields (sinks.py): dropping them told the operator the site had
+        # no alert route / no roster opt-out when it had both.
+        "to",
+        "timeout_s",
+        "headers",
+        "accepts_roster",
     }
 )
+
+#: The transport's own two header names. `sinks.py` refuses them in a configured
+#: `headers` table — `Authorization` holds the bearer token (which has exactly one home,
+#: the ref rungs) and `X-GateClerk-Site` confirms the site the token already determines.
+#: An inventory that printed either would put a credential the config was not allowed to
+#: hold into the export, so a table carrying one is dropped whole.
+RESERVED_SINK_HEADERS: frozenset[str] = frozenset({"authorization", "x-gateclerk-site"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +314,47 @@ def _safe_scalar_ident(raw: object, *, key_label: str, default: str = "") -> tup
     return text, []
 
 
+def _safe_recipient(raw: object) -> tuple[str, list[str]]:
+    """One mail address: text with `@`, no whitespace, no secret-shaped value.
+
+    The `mnotify` alert sink's only routing field. A malformed recipient is dropped and
+    counted rather than projected as if the site had a working alert route — the export is
+    what an operator signs off on before a cutover.
+    """
+    if raw is None:
+        return "", []
+    if not isinstance(raw, str) or raw.count("@") != 1 or any(c.isspace() for c in raw):
+        return "", ["sink.to"]
+    text = raw.strip()
+    return ("", ["sink.to"]) if redact_b64(text) != text else (text, [])
+
+
+def _safe_headers(raw: object) -> tuple[str, list[str]]:
+    """Sorted `k=v` pairs for inventory; a credential-carrying table is dropped whole.
+
+    A header value is config, not a secret — except under the two names `RESERVED_SINK_HEADERS`
+    lists, which is exactly why `sinks.py` refuses them in a config. Both the reserved name
+    and the secret-shape check drop the WHOLE table: a partial header set in the inventory
+    would be a second kind of lie.
+    """
+    if raw is None:
+        return "", []
+    if not isinstance(raw, dict):
+        return "", ["sink.headers"]
+    pairs: list[str] = []
+    for key, value in sorted(raw.items(), key=lambda item: str(item[0])):
+        if not isinstance(key, str) or not isinstance(value, str):
+            return "", ["sink.headers"]
+        if any(c in key + value for c in "\r\n"):
+            return "", ["sink.headers"]
+        if key.strip().lower() in RESERVED_SINK_HEADERS:
+            return "", ["sink.headers"]
+        if redact_b64(value) != value:
+            return "", ["sink.headers"]
+        pairs.append(f"{key}={value}")
+    return ";".join(pairs), []
+
+
 def _ingest_env_name(site_name: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9]", "_", site_name).strip("_").upper()
     return f"GATECLERK_INGEST_TOKEN_{sanitized}" if sanitized else ""
@@ -320,7 +378,7 @@ def _project_sink(
     sink_type = (
         str(raw_sink.get("type", "")).strip() if isinstance(raw_sink.get("type"), str) else ""
     )
-    if sink_type not in ("https", "csv", "jsonl", ""):
+    if sink_type not in ("https", "csv", "jsonl", "mnotify", ""):
         dropped.append("sink.type")
         sink_type = ""
 
@@ -359,6 +417,30 @@ def _project_sink(
     enabled_raw = raw_sink.get("enabled", True)
     enabled = enabled_raw if isinstance(enabled_raw, bool) else True
 
+    # The four remaining `SinkSpec` fields: the alert route (`to`, `timeout_s`), the
+    # roster opt-out (`accepts_roster`) and the extra request headers. Every one of them
+    # was previously reported as an unknown key, which hid the site's alert route.
+    to, d_to = _safe_recipient(raw_sink.get("to"))
+    dropped.extend(d_to)
+
+    timeout_raw = raw_sink.get("timeout_s")
+    timeout_ok = (
+        isinstance(timeout_raw, (int, float))
+        and not isinstance(timeout_raw, bool)
+        and timeout_raw > 0
+    )
+    timeout_s = timeout_raw if timeout_ok else None
+    if timeout_raw is not None and not timeout_ok:
+        dropped.append("sink.timeout_s")
+
+    accepts_raw = raw_sink.get("accepts_roster", True)
+    accepts_roster = accepts_raw if isinstance(accepts_raw, bool) else True
+    if not isinstance(accepts_raw, bool):
+        dropped.append("sink.accepts_roster")
+
+    headers, d_headers = _safe_headers(raw_sink.get("headers"))
+    dropped.extend(d_headers)
+
     return (
         {
             "name": name,
@@ -369,6 +451,10 @@ def _project_sink(
             "token_env": token_env,
             "token_keychain": token_kc,
             "enabled": enabled,
+            "to": to,
+            "timeout_s": timeout_s,
+            "headers": headers,
+            "accepts_roster": accepts_roster,
         },
         dropped,
     )
