@@ -141,9 +141,10 @@ credential format:
 
 `deploy/gateclerk.env` and `deploy/mnotify.toml` are **operator files, not repo files**: they
 carry site endpoints and tokens, so neither is tracked — only the `*.example` templates beside
-them are, and `git clone` will not produce the real ones. The block below creates both from
-those templates; `deploy/compose.yaml` then binds `./mnotify.toml` read-only at
-`/etc/mnotify/config.toml`. Fill both in before starting.
+them are, and `git clone` will not produce the real ones. `.gitignore` ignores both real paths and
+not the templates, so filling them in cannot leak into a commit through `git add -A`. The block
+below creates both from those templates; `deploy/compose.yaml` then binds `./mnotify.toml`
+read-only at `/etc/mnotify/config.toml`. Fill both in before starting.
 
 ```
 cp deploy/gateclerk.env.example deploy/gateclerk.env

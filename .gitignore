@@ -30,3 +30,10 @@ htmlcov/
 # local-only sites config (real device hosts never in the public repo; P2 decision 2026-10-19)
 sites.toml
 !examples/sites.toml
+# operator-created deploy files. deploy/compose.yaml tells the operator to create these by
+# copying the tracked templates beside them and to keep the filled-in copies mode 0600 and
+# "out of git": gateclerk.env carries the site tokens, mnotify.toml the notify config. Named
+# as exact paths rather than `*.env` so this rule can never shadow a tracked template or a
+# future fixture; tests/test_deploy_templates.py pins both directions.
+deploy/gateclerk.env
+deploy/mnotify.toml
