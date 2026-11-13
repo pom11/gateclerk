@@ -54,13 +54,28 @@ Still broken while the projected sink has `"type": ""` and `dropped` names `sink
 
 ## CHANGE
 
-1. Add the four keys to `ALLOWED_SINK_KEYS`:
+1. Add the four keys to `ALLOWED_SINK_KEYS`, next to the eight keys already in the literal.
+   It is a `frozenset[str]`, so every entry is a bare string with a trailing comma inside the
+   existing `frozenset({...})` — the merged shape of the four new entries:
+
    ```python
-   ("to",)
-   ("timeout_s",)
-   ("headers",)
-   ("accepts_roster",)
+   frozenset(
+       {
+           "to",
+           "timeout_s",
+           "headers",
+           "accepts_roster",
+       }
+   )
    ```
+
+   Not `("to",)`. A `tuple` can never equal the TOML key `k` that `_project_sink` tests with
+   `if k not in ALLOWED_SINK_KEYS`, so the tuple form drops nothing and reports nothing: the
+   four keys stay in `dropped_unknown_keys` and the export still hides the site's alert route
+   — the exact lie this card fixes, restored. (A bare `"to",` line written *outside* a set
+   display is what `ruff format` rewrites into `("to",)`; that is how this sketch drifted, and
+   why the entries are shown inside the display here.)
+
 2. Allow `"mnotify"` in `_project_sink`:
    ```python
    if sink_type not in ("https", "csv", "jsonl", "mnotify", ""):
