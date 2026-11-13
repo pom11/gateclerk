@@ -613,36 +613,43 @@ def test_bc_unavailable_502_backs_off_then_a_replay_is_accepted(db: sqlite3.Conn
     assert capture.requests[1].content == capture.requests[0].content, "same bytes replayed"
 
 
-def test_unknown_device_serial_422_stays_retryable(db: sqlite3.Connection) -> None:
-    """Contract 3: 422 unknown_device_serials refuses the WHOLE batch; the fix is
-    BC-side (register on page 70602) and then the agent just retries.
+def test_unknown_device_serial_422_dead_letters_then_replays(db: sqlite3.Connection) -> None:
+    """Contract 3's 422 is a PAYLOAD answer: GC-P08 dead-letters it on the first failure.
 
-    So 422 must behave like any other failure for the queue — back off, keep the payload,
-    survive until the owner registers the serial — and must NOT be treated as accepted.
+    The T15-era text of this test pinned the opposite ("422 stays retryable") and the reasoning
+    was sound for its time: the fix for `unknown_device_serials` really is BC-side (register the
+    serial on page 70602), and a queue that retried the refused line for 24 h at least kept the
+    punch. GC-P08 moves that payload somewhere the owner can SEE it — `dead_letter`, holding the
+    full JSONL line, `HttpStatus422` and `attempts = 1` — instead of spending the site's request
+    budget on a line the ingest will never accept.
+
+    The two claims that were always the point of this test stay pinned: a refusal is NEVER
+    counted as a send, and the payload survives intact. What changed is the recovery — one
+    operator step (`agent_push.replay_dead_letter`, which carries the attempt count and outage
+    clock over) replaces an automatic retry, and the row then goes out with the same bytes.
     """
     event_id = stored(db, make_record())
     agent_push.enqueue_events(db, [event_id], endpoint=HTTPS_TARGET, now=T0)
-    client, _capture = client_for(422, 200)
+    client, capture = client_for(422, 200)
     transport = agent_push.https_transport(SITE, token=TOKEN, client=client)
 
     first = agent_push.drain(db, endpoint=HTTPS_TARGET, transport=transport, now=T0, rng=Rng(1.0))
     assert first.push_ok == 0 and first.push_failed == 1
-    assert (
-        db.execute("SELECT last_error_class FROM push_queue").fetchone()["last_error_class"]
-        == "HttpStatus422"
-    )
+    assert first.dead_lettered == (event_id,) and first.retried == ()
+    assert len(capture.requests) == 1, "a line the ingest will never accept is sent once"
 
-    due = db.execute("SELECT next_attempt_at FROM push_queue").fetchone()["next_attempt_at"]
-    assert (
-        agent_push.drain(
-            db,
-            endpoint=HTTPS_TARGET,
-            transport=transport,
-            now=datetime.fromisoformat(due),
-            rng=Rng(1.0),
-        ).push_ok
-        == 1
-    )
+    dead = db.execute("SELECT * FROM dead_letter").fetchall()
+    assert len(dead) == 1, "the refused payload must be kept where an owner can list it"
+    assert dead[0]["attempts"] == 1 and dead[0]["error_class"] == "HttpStatus422"
+    assert db.execute("SELECT COUNT(*) FROM push_queue").fetchone()[0] == 0
+
+    # The serial gets registered on the BC page and the owner replays: the SAME line is
+    # accepted, and a success clears both the queue row and the dead-letter row.
+    agent_push.replay_dead_letter(db, dead[0]["id"], now=T0)
+    second = agent_push.drain(db, endpoint=HTTPS_TARGET, transport=transport, now=T0, rng=Rng(1.0))
+    assert second.push_ok == 1
+    assert json.loads(capture.requests[1].content.decode("utf-8"))["site"] == SITE
+    assert db.execute("SELECT COUNT(*) FROM dead_letter").fetchone()[0] == 0
 
 
 def test_site_token_mismatch_403_is_recorded_as_a_failure_not_a_send(

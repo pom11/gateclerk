@@ -496,6 +496,13 @@ def drain(
     if a failure is not allowed to stop the drain). Success DELETEs the queue row and any
     dead-letter row for the same key — the store keeps the event either way.
 
+    What a failure COSTS depends on what the failure was: a permanent payload rejection
+    (`PERMANENT_REJECT_STATUSES` — 400, 422) dead-letters on the FIRST failure because a line
+    the ingest will never accept is not an outage and re-sending it for a day only spends the
+    site's request budget; a transient one (a 5xx, a raised network error) keeps the 24 h bound
+    and the jitter ladder; and 401/403 keep retrying, because those are credential problems
+    that `HttpsIngestTransport`'s token re-read can heal without a restart.
+
     `row_meta` (SINKS-WIRING) is the queue's side of the file sinks' contract: a transport
     that declares `renders_rows = True` is handed the row's own facts (`event_id`,
     `sink_name`, `enqueued_at`) and turns them plus the stored payload into the line it
@@ -537,7 +544,11 @@ def drain(
         # a write) is what lets the failure and its reschedule land in ONE transaction.
         first_failed_at = row["first_failed_at"] or stamp
         elapsed = (now - _parse(first_failed_at)).total_seconds()
-        if elapsed >= dead_letter_after_s:
+        permanent = (
+            isinstance(outcome, HttpStatusRejectedError)
+            and outcome.status in PERMANENT_REJECT_STATUSES
+        )
+        if elapsed >= dead_letter_after_s or permanent:
             _move_to_dead_letter(
                 conn,
                 row,
@@ -599,6 +610,13 @@ class HttpStatusRejectedError(Exception):
     def __init__(self, status: int, *args: object) -> None:
         super().__init__(f"the ingest answered {status}", *args)
         self.status = status
+
+
+#: Statuses that say the payload itself will never be accepted. Retrying them for
+#: 24 h only burns the site's request budget; the owner must fix or discard the row.
+#: 401/403 are deliberately NOT here: those are token/config problems that a re-read
+#: can fix (see the token refresh in `HttpsIngestTransport.__call__`).
+PERMANENT_REJECT_STATUSES: frozenset[int] = frozenset({400, 422})
 
 
 def _send_row(
@@ -1178,9 +1196,20 @@ class HttpsIngestTransport:
             content=payload.encode("utf-8"),
             headers=headers,
         )
+        status = int(response.status_code)
+        if status in (401, 403):
+            # The next attempt re-reads the credential ladder (rotated token, wrong site,
+            # credential file just installed). Do not dead-letter: this is an install step.
+            #
+            # The memo in `_resolve_token` exists for a reason — every macOS `security` read
+            # can raise an ACL prompt, so a drain must not re-ask per row. Dropping it ONLY on
+            # an auth rejection keeps that property (a 200 or a 5xx never costs a re-read) and
+            # is the whole recovery: this call still returns the status it got, and the row is
+            # already rescheduled, so the SAME row is not re-sent inside this drain pass.
+            self._token = None
         # The response body is NOT folded into any exception or log: a server message
         # is uncontrolled text, and §2b's error class needs only the status.
-        return int(response.status_code)
+        return status
 
     def close(self) -> None:
         """Release the socket pool — only for the client this transport built."""
