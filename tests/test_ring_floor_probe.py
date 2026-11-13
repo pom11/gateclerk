@@ -37,7 +37,13 @@ from test_p2_07b_agent_cli import AgentHarness, punch_events, wall_digits
 
 
 def _probe_conditions(device: FakeDevice) -> list[dict[str, Any]]:
-    """Every AcsEvent POST body that was the one-page ring-floor probe."""
+    """Every AcsEvent POST body that was the one-page ring-floor probe.
+
+    GC-P15 added a SECOND one-page probe (the quiet-tick reset read), so `maxResults
+    == 1` alone no longer names this one. The discriminator is the direction: the ring
+    floor is the OLDEST retained event (no `timeReverseOrder` key, pinned at line ~140
+    below), the reset probe is the newest (key present and true).
+    """
     out: list[dict[str, Any]] = []
     for served in device.served:
         if served.path != EVENT_PATH or not served.body:
@@ -47,7 +53,11 @@ def _probe_conditions(device: FakeDevice) -> list[dict[str, Any]]:
         except ValueError:  # pragma: no cover - every body this suite sends is JSON
             continue
         cond = body.get("AcsEventCond") if isinstance(body, dict) else None
-        if isinstance(cond, dict) and cond.get("maxResults") == 1:
+        if (
+            isinstance(cond, dict)
+            and cond.get("maxResults") == 1
+            and "timeReverseOrder" not in cond
+        ):
             out.append(cond)
     return out
 

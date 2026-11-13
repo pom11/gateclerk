@@ -116,6 +116,24 @@ _COLD_START_BACK = "cadence + overlap"
 #: of site-a's 1/min noise stream, well above any overlap or paging jitter.
 RESET_MIN_SERIAL_DROP = 100
 
+# --- GC-P15: the quiet-tick reset probe ----------------------------------------------------
+# The check above lives INSIDE the per-chunk loop, so a tick that reads no records never
+# reaches it: a replaced/factory-reset terminal whose ring was wiped (and whose new
+# generation has produced only `major=3` heartbeats so far) answers the narrow poll's
+# `major=5` request with NO MATCH, the decision is skipped, and the checkpoint sits on a
+# dead generation while the replacement's punches pile up unreachable — the silent loss
+# R1 forbids. The probe re-asks the ONE question that decides it (`what is the newest
+# serial the device still holds?`) over the retained window, newest-first, at most once
+# an hour. `major=0` is deliberate: the narrow poll's filter is exactly what hid the
+# evidence (OBSERVED.md "Server-side filter truth"), and a filter we did not probe is a
+# performance hint, never a promise — the client-side re-filter in `_assemble` stays.
+#: A quiet tick still needs a reset answer, but a wider read costs a request. Once an
+#: hour is enough for a hardware swap; the narrow poll window still runs every tick.
+RESET_PROBE_INTERVAL_S = 60 * 60
+#: The device ring holds roughly a week. A reset older than the ring cannot be proven
+#: from events; `deviceInfo` remains the fallback evidence.
+RESET_PROBE_WINDOW_S = 7 * 24 * 60 * 60
+
 #: GC-P03: how often a RUNNING loop re-reads `GET /ISAPI/System/time`. The card's
 #: tension in one number: the claimed UTC offset is the label every event window goes
 #: out with, and it moves at a DST transition — cached for the life of the process it
@@ -354,6 +372,14 @@ class DeviceLoop:
         #: them; GC-P04 wires the skew into the alert policy and the health gauge.
         self._last_device_time: Any = None
         self._last_skew: Skew | None = None
+        # --- GC-P15: the quiet-tick reset probe (module constant above) ----------------------
+        #: Monotonic stamp of the last quiet-tick probe. The budget is the whole point:
+        #: the extra page is one request per hour, never one per quiet tick (every
+        #: request spends the ~190-use nonce budget, OBSERVED.md).
+        self._last_reset_probe_at: float | None = None
+        #: The "below the checkpoint but no evidence" line is said ONCE per process, not
+        #: once per probe hour: a permanently glitchy counter is not an hourly alarm.
+        self._reset_probe_refused_warned = False
 
     # --- the tick -----------------------------------------------------------------------
 
@@ -486,6 +512,60 @@ class DeviceLoop:
                     # from 0; agent_store only refuses negatives) — `or` would drop it.
                     checkpoint_serial = advance.checkpoint_serial
                 current = read_checkpoint(self.conn, self.device_serial)
+            # GC-P15: a quiet tick still owes a reset answer. `counts.records == 0` is
+            # precisely the shape that hides a swap — the ring was wiped and the
+            # replacement has produced only heartbeats, so the narrow `major=5` poll came
+            # back NO MATCH and the per-chunk check above never ran. Ask the one deciding
+            # question directly, at most once an hour (the budget lives with the constant).
+            if (
+                current is not None
+                and counts.records == 0
+                and reset is None
+                and (
+                    self._last_reset_probe_at is None
+                    or self._monotonic() - self._last_reset_probe_at >= RESET_PROBE_INTERVAL_S
+                )
+            ):
+                self._last_reset_probe_at = self._monotonic()
+                newest, newest_time = self._probe_newest_serial(current)
+                if (
+                    newest is not None
+                    and newest < current.checkpoint_serial
+                    and _is_after_checkpoint(newest_time, current, self.site_tz)
+                ):
+                    # `_reset_evidence` keeps its own refusal semantics here too: a
+                    # changed `deviceInfo` serial is an identity change, not a serialNo
+                    # reset, and it raises out of the tick (checkpoint unmoved) exactly as
+                    # it does in the in-window branch. Only the READ is bend-not-break.
+                    evidence = self._reset_evidence(current, newest)
+                    if evidence is not None:
+                        reset_checkpoint(
+                            self.conn,
+                            self.device_serial,
+                            expected_serial=current.checkpoint_serial,
+                            new_serial=newest,
+                            checkpoint_time=newest_time,
+                            firmware=self._caps.firmware if self._caps is not None else None,
+                            now=self._now(),
+                        )
+                        current = read_checkpoint(self.conn, self.device_serial)
+                        reset = evidence
+                        advanced = True
+                        checkpoint_serial = newest
+                    elif not self._reset_probe_refused_warned:
+                        # A same-firmware drop smaller than the floor is a glitch, not a
+                        # reset: no rewind, and nothing stored (nothing was walked). Said
+                        # once — the hourly probe must not turn one bad counter into a
+                        # permanent alarm stream.
+                        self._reset_probe_refused_warned = True
+                        fresh_firmware = self._caps.firmware if self._caps is not None else None
+                        self._warn(
+                            f"warning: quiet-tick probe saw newest serial {newest} below "
+                            f"checkpoint {current.checkpoint_serial} without reset evidence "
+                            f"(firmware {current.firmware!r} -> {fresh_firmware!r}, drop "
+                            f"below {RESET_MIN_SERIAL_DROP}); treated as a device glitch, "
+                            "checkpoint unmoved"
+                        )
             checkpoint = read_checkpoint(self.conn, self.device_serial)
             return TickResult(
                 device_serial=self.device_serial,
@@ -1013,6 +1093,66 @@ class DeviceLoop:
             old_firmware=old_firmware,
             new_firmware=new_firmware,
         )
+
+    def _probe_newest_serial(self, checkpoint: Checkpoint) -> tuple[int | None, str | None]:
+        """One newest-first page over the retained window; no cursor walk (GC-P15).
+
+        The quiet tick's question is a single one — what is the newest serial the device
+        still holds? — and `timeReverseOrder=True` with `maxResults=1` is the one request
+        that answers it (paging honours both; the newest-by-time record is then read by
+        the same helper the in-window check uses, so the two arms cannot disagree). The
+        floor is the checkpoint, never below it: a record older than the checkpoint could
+        not prove a new generation anyway (`_is_after_checkpoint` refuses it) and would
+        only re-serve rows the store already holds. `major=0` is the point of the whole
+        read — the narrow poll's `major=5` filter is exactly what hid the evidence.
+
+        Deliberately bend-not-break on the READ, like `probe_ring_floor`: a probe that
+        dies is "no evidence this hour", never a failed poll — the narrow walk already
+        completed and its truth stands. FAIL CLOSED on the floor too: an instant we
+        cannot place has no place in a request, and widening to the whole week on a
+        stamp the loop has otherwise already parsed would spend the hour's one page on a
+        window that could not be justified. The caller's `_reset_evidence` is NOT
+        wrapped: its identity refusal is a decision, not a transport accident.
+        """
+        lower = self._now() - timedelta(seconds=RESET_PROBE_WINDOW_S)
+        if checkpoint.checkpoint_time:
+            try:
+                lower = max(lower, _parse_stamp(checkpoint.checkpoint_time, site_tz=self.site_tz))
+            except Exception as exc:
+                self._warn(
+                    f"warning: quiet-tick reset probe cannot place checkpoint "
+                    f"{checkpoint.checkpoint_time!r} on the timeline ({type(exc).__name__}); "
+                    "probing nothing this hour, checkpoint "
+                    f"{checkpoint.checkpoint_serial} unmoved"
+                )
+                return None, None
+        limits = self._limits or (
+            paging_limits_from_caps(self._caps) if self._caps is not None else PagingLimits()
+        )
+        try:
+            for chunk in iter_event_windows(
+                _search_reader(self.client),
+                since=lower,
+                until=self._now(),
+                chunk=timedelta(seconds=RESET_PROBE_WINDOW_S),
+                site_tz=self.site_tz,
+                device_offset_min=self._claim,
+                limits=limits,
+                page_size=1,
+                max_pages=1,
+                inter_page_delay=self._inter_page_delay,
+                sleep=self._sleep,
+                clock=self._monotonic,
+                major=0,
+                time_reverse_order=True,
+            ):
+                return _newest_serial_by_time(chunk.records)
+        except Exception as exc:  # the poll's own result stands; a probe is evidence only
+            self._warn(
+                f"warning: quiet-tick reset probe failed ({type(exc).__name__}); no reset "
+                f"evidence this hour, checkpoint {checkpoint.checkpoint_serial} unmoved"
+            )
+        return None, None
 
     def _window(self) -> tuple[datetime, datetime]:
         """`[checkpoint_time - overlap_s, now]`, or the cold-start floor (module doc).
