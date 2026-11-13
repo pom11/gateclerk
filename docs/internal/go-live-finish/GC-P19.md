@@ -68,7 +68,7 @@ real host, credentials and people stay in the operator's local files.
 9. **Drain the old unit.** One final `ok` tick on the Mac, then
    `launchctl bootout gui/$(id -u)/com.gateclerk.agent.<site>`. Require
    `push_queue = 0` and `dead_letter = 0` before unplugging (`:500-530`).
-10. **Record.** Evidence file `docs/internal/gateclerk-finish/evidence/GC-P19-<site>.md`
+10. **Record.** Evidence file `docs/internal/go-live-finish/evidence/GC-P19-<site>.md`
     with: date, operator initials, install shape, host placeholder, doctor exit, first
     `pushed` count, enrollment count, old-unit drain counts. No secret, no real host, no
     person's name.

@@ -79,8 +79,11 @@ Still broken while the command prints nothing (no `clean` subcommand under `migr
            for path in (*chosen_bundles, *chosen_runs):
                shutil.rmtree(path)
        return CleanReport(
-           root=root, older_than=older_than, apply=apply,
-           bundles=tuple(chosen_bundles), runs=tuple(chosen_runs),
+           root=root,
+           older_than=older_than,
+           apply=apply,
+           bundles=tuple(chosen_bundles),
+           runs=tuple(chosen_runs),
        )
    ```
    Export `CleanReport`/`clean_artifacts` in `migrate_bundle.__all__` (check the existing
@@ -189,14 +192,14 @@ uv run --frozen ruff check src/gateclerk
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

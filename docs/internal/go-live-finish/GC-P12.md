@@ -56,10 +56,10 @@ Still broken while the projected sink has `"type": ""` and `dropped` names `sink
 
 1. Add the four keys to `ALLOWED_SINK_KEYS`:
    ```python
-   "to",
-   "timeout_s",
-   "headers",
-   "accepts_roster",
+   ("to",)
+   ("timeout_s",)
+   ("headers",)
+   ("accepts_roster",)
    ```
 2. Allow `"mnotify"` in `_project_sink`:
    ```python
@@ -75,6 +75,7 @@ Still broken while the projected sink has `"type": ""` and `dropped` names `sink
            return "", ["sink.to"]
        text = raw.strip()
        return ("", ["sink.to"]) if redact_b64(text) != text else (text, [])
+
 
    def _safe_headers(raw: object) -> tuple[str, list[str]]:
        """Sorted `k=v` pairs for inventory; header values are config, never secrets."""
@@ -163,14 +164,14 @@ uv run --frozen ruff check src/gateclerk
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

@@ -75,7 +75,7 @@ No product code. Add one proof test and commit its output as evidence.
 5. Run the test and save the output:
    ```bash
    uv run --frozen pytest -q tests/test_gc_p21_alerts_proof.py -vv \
-     | tee docs/internal/gateclerk-finish/evidence/GC-P21-alerts.log
+     | tee docs/internal/go-live-finish/evidence/GC-P21-alerts.log
    ```
    The log is the G3 evidence. It contains only synthetic demo values.
 
@@ -119,14 +119,14 @@ proves the policy and the queue, not the mail transport (GC-P19 configures that)
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

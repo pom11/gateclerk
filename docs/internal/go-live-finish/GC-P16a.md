@@ -63,8 +63,9 @@ If a retention/prune function already exists in `agent_store.py`, stop and close
        ids = sorted(event_ids)
        conn.execute("BEGIN IMMEDIATE")
        try:
-           conn.execute("CREATE TEMP TABLE IF NOT EXISTS prune_ids "
-                        "(event_id INTEGER NOT NULL PRIMARY KEY)")
+           conn.execute(
+               "CREATE TEMP TABLE IF NOT EXISTS prune_ids (event_id INTEGER NOT NULL PRIMARY KEY)"
+           )
            conn.execute("DELETE FROM temp.prune_ids")
            conn.executemany(
                "INSERT OR IGNORE INTO temp.prune_ids VALUES (?)",
@@ -93,10 +94,8 @@ If a retention/prune function already exists in `agent_store.py`, stop and close
    `self._last_prune_at: datetime | None = None` field. In `SiteAgent.tick()`, after
    `self._push(moment, report)` and before `self._write_health()`:
    ```python
-   if (
-       self.ledger is not None
-       and (self._last_prune_at is None
-            or (moment - self._last_prune_at) >= timedelta(days=1))
+   if self.ledger is not None and (
+       self._last_prune_at is None or (moment - self._last_prune_at) >= timedelta(days=1)
    ):
        self._last_prune_at = moment
        cutoff = (moment - timedelta(days=DEFAULT_LOCAL_RETENTION_DAYS)).isoformat()
@@ -168,14 +167,14 @@ INDEX `NOT IN PLAN`), `src/gateclerk/users_import.py` (GC-P16b), and the bundle 
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

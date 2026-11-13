@@ -67,9 +67,7 @@ If a call site exists in `agent_loop.py` or `agent_cli.py`, stop and close the c
    if result.clock_skew is not None:
        report.alerts.extend(self.policy.observe_skew(result.clock_skew))
        if self.collector is not None:
-           self.collector.observe_skew(
-               loop.device_serial or PENDING_SERIAL, result.clock_skew
-           )
+           self.collector.observe_skew(loop.device_serial or PENDING_SERIAL, result.clock_skew)
    ```
    Use the same device key the rest of the pass uses (`loop.device_serial or
    PENDING_SERIAL`). Do not add the alert a second time in the `if result.ok` block.
@@ -133,14 +131,14 @@ alert/health unit tests.
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

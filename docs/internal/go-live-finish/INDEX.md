@@ -1,9 +1,28 @@
-# Gateclerk finish — gateclerk card index
+# Go-live finish — gateclerk card index
 
-Directory: `docs/internal/gateclerk-finish/`
-Board: `gateclerk`   Integration branch: `feat/gateclerk-finish`   PR target for every worker card: `feat/gateclerk-finish` (never `main`/`master`).
-Plan: `~/dev/Example_customizations_bc/docs/superpowers/plans/2026-11-13-gateclerk-finish.md`, rev 4, section 4.3.
+Directory: `docs/internal/go-live-finish/`
+Board: `gateclerk`   Integration branch: `INTEGRATION_BRANCH`   PR target for every worker card: `INTEGRATION_BRANCH` (never `main`/`master`).
+Plan: private plan location outside this repository, rev 4, section 4.3 — the path is carried in the board cards and deliberately not written here.
 Audit: `docs/internal/AUDIT-2026-11-13.md`.
+
+## Conventions
+
+This tree is export-ready: `tests/test_public_audit.py` sweeps every tracked file at
+`HEAD` for the pre-cutover product/tenant spellings, so the identifiers below are named
+by placeholder and their literal spellings live **outside** this repository. The
+in-tree program name is `go-live finish` (this directory was renamed from a
+legacy-derived spelling).
+
+| Placeholder | Means | Where the literal spelling lives |
+|---|---|---|
+| `INTEGRATION_BRANCH` | this program's integration branch — the PR target of every worker card | the `HANDOFF` section of each worker card on the `gateclerk` board |
+| `<RECEIVER>_…` | the Cloud Run ingest receiver (another repository) and its legacy-prefixed constant / env-var names | the private plan and the card that cites them |
+| tenant sandbox | the ERP sandbox cited by the Sandbox baseline note below | the private plan |
+
+A worker must never introduce a literal pre-cutover spelling into a tracked file — not
+in code, comments, docstrings, fixtures, evidence logs or commit messages. When a card
+depends on one, it stays in the card body and the change describes it without
+spelling it.
 
 ## Cards
 
@@ -67,9 +86,9 @@ parallel**; the `Depends on` column above is the enforced order.
 | GC-P16a | `src/gateclerk/agent_cli.py`, `src/gateclerk/agent_store.py` |
 | GC-P16b | `src/gateclerk/users_import.py` |
 | GC-P16c | `src/gateclerk/migrate_bundle.py`, `src/gateclerk/migrate_cmds.py` |
-| GC-P17 | new evidence file only (`docs/internal/gateclerk-finish/evidence/GC-P17-container.log`) |
-| GC-P18 | new evidence file only (`docs/internal/gateclerk-finish/evidence/GC-P18-bench.log`) |
-| GC-P19 | new evidence file only (`docs/internal/gateclerk-finish/evidence/GC-P19-<site>.md`) |
+| GC-P17 | new evidence file only (`docs/internal/go-live-finish/evidence/GC-P17-container.log`) |
+| GC-P18 | new evidence file only (`docs/internal/go-live-finish/evidence/GC-P18-bench.log`) |
+| GC-P19 | new evidence file only (`docs/internal/go-live-finish/evidence/GC-P19-<site>.md`) |
 | GC-P20 | `src/gateclerk/export_cli.py`, `src/gateclerk/export_cmds.py` |
 | GC-P21 | new test + evidence file only |
 | MN-P01 | none (DISCARD) |
@@ -106,7 +125,7 @@ G3 evidence runs. Docker is not running in this worktree, so GC-P17's container 
 not executed here; the worker must run it on a host with Docker and stop with
 `LEFT: Docker daemon unavailable` rather than invent a log.
 
-**Sandbox baseline (measured 12:30 today):** sandbox `SANDBOX` runs `28.0.2.203` and all
+**Sandbox baseline (measured 12:30 today):** the tenant sandbox (named in the private plan) runs `28.0.2.203` and all
 seven headless suites pass there (setup 5, scan 6, schedule 8, calc 16, recalc 4, lock 9,
 api 22 = 70 arms, 0 failed). No gateclerk card runs those suites or talks to BC; this fact
 is for the BC/app boards and for GC-P19's operator record. If any gateclerk card is later
@@ -159,8 +178,10 @@ were invented for them.
 2. **GC-14's `push-ledger.jsonl` growth.** GC-P16a prunes `events`, but the append-only
    ledger is not compacted or replaced by a SQLite marker. The plan's retention card names
    the event store, results CSV and bundle TTL, not the ledger.
-3. **GC-08's receiver env prefix.** The actual receiver uses `GATECLERK_INGEST_TOKEN_<SITE>`
-   / `GATECLERK_SITES`; the agent uses `GATECLERK_INGEST_TOKEN_<SITE>`. The plan says this is
+3. **GC-08's receiver env prefix.** The actual receiver uses its own legacy-prefixed
+   ingest vars (`<RECEIVER>_INGEST_TOKEN_<SITE>` /
+   `<RECEIVER>_SITES`; literal pre-cutover spellings are in the board cards); the agent uses
+   `GATECLERK_INGEST_TOKEN_<SITE>`. The plan says this is
    not a defect (separate processes, separate secret stores); GC-P09 fixes only the stale
    comment.
 4. **Audit GC-01's `is_punch_candidate` SQL column.** There is no such column in `events`;

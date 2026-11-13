@@ -105,8 +105,8 @@ the command output and close it.
    Add the verify-mode parameters after the six existing exclusion parameters and before
    `max(1, int(limit))`:
    ```python
-           *sorted(NON_AUTH_VERIFY_MODES),
-           max(1, int(limit)),
+   (*sorted(NON_AUTH_VERIFY_MODES),)
+   (max(1, int(limit)),)
    ```
    The final parameter tuple is: endpoint, sink, legacy, endpoint, sink, legacy, verify
    modes..., limit.
@@ -174,14 +174,14 @@ uv run --frozen ruff check src/gateclerk
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

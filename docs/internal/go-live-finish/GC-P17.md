@@ -41,7 +41,7 @@ re-scoped before any container work.
 
 No product code. Produce and commit the evidence file described below. The card is a proof
 card; the only repo change is
-`docs/internal/gateclerk-finish/evidence/GC-P17-container.log`.
+`docs/internal/go-live-finish/evidence/GC-P17-container.log`.
 
 1. Build the runtime image from the repo root:
    ```bash
@@ -69,13 +69,13 @@ card; the only repo change is
    ```
 4. Copy the evidence into the repo. The log must contain: image id, `demo demo` JSON with
    `csv.rows > 0`, the mock sink's `lines > 0`, and the two ticks' per-sink counters. Save
-   it as `docs/internal/gateclerk-finish/evidence/GC-P17-container.log`:
+   it as `docs/internal/go-live-finish/evidence/GC-P17-container.log`:
    ```bash
-   mkdir -p docs/internal/gateclerk-finish/evidence
+   mkdir -p docs/internal/go-live-finish/evidence
    {
      docker image inspect gateclerk-agent:gc17 --format 'image={{.Id}}'
      cat "${TMPDIR:-/tmp}/gc-p17/run.json"
-   } > docs/internal/gateclerk-finish/evidence/GC-P17-container.log
+   } > docs/internal/go-live-finish/evidence/GC-P17-container.log
    ```
 5. Do not point the demo at BC. It has no `push_target`; both sinks are local. No device
    write, no network beyond loopback.
@@ -126,14 +126,14 @@ and `deploy/Dockerfile`. This card is local-only.
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

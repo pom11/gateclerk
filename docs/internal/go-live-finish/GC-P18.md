@@ -35,7 +35,7 @@ address, host name or credential is written into this card or the evidence file.
 ## CHANGE
 
 No product code. The operator runs the steps and records evidence in
-`docs/internal/gateclerk-finish/evidence/GC-P18-bench.log`.
+`docs/internal/go-live-finish/evidence/GC-P18-bench.log`.
 
 1. Make a bench copy of the config with no push target and no sinks, under
    `${TMPDIR:-/tmp}/gc-p18/sites.toml`. Use the existing bench block but remove
@@ -73,7 +73,7 @@ No product code. The operator runs the steps and records evidence in
    snapshot after it; `device` reports the cached probe (GC-P11). A `warn` for a stale
    snapshot after `--once` is acceptable; the checkpoint is the proof.
 5. Save the three JSON outputs and the command lines (with placeholders, not real values)
-   to `docs/internal/gateclerk-finish/evidence/GC-P18-bench.log`. The operator initials and
+   to `docs/internal/go-live-finish/evidence/GC-P18-bench.log`. The operator initials and
    dates the file.
 
 What must NOT change:

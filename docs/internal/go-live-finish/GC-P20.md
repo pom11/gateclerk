@@ -93,8 +93,11 @@ The underlying data is present: `events.outcome`, `events.unknown_code`,
        effective_fmt, effective_output, err_fmt = _resolve_fmt_and_output(fmt, output)
        try:
            count, message = export_cli.export_non_punch_fingerprints(
-               config_path=config, site=site, state_root=state_root,
-               fmt=effective_fmt, output_path=effective_output,
+               config_path=config,
+               site=site,
+               state_root=state_root,
+               fmt=effective_fmt,
+               output_path=effective_output,
            )
        except ConfigError as exc:
            raise _config_exit(err_fmt, str(exc)) from exc
@@ -161,14 +164,14 @@ store schema. Do not add a `--employee` filter: the report is deliberately ident
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

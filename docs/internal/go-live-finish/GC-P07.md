@@ -54,15 +54,15 @@ If the builder no longer calls `_sink_token`, stop and close the card.
 1. Extend `HttpsIngestTransport.__init__` with two overrides, defaulting to the site's own
    refs:
    ```python
-   token_env: str | None = None,
-   token_keychain: str | None = None,
+   token_env: str | None = (None,)
+   token_keychain: str | None = (None,)
    ```
    Store `self._token_env = token_env` and `self._token_keychain = token_keychain` beside
    `self._env`/`self._keychain`.
 2. In `_resolve_token`, pass the overrides:
    ```python
-   env_var=self._token_env or ingest_token_env_var(self.site),
-   keychain_service=self._token_keychain or ingest_keychain_service(self.site),
+   env_var = (self._token_env or ingest_token_env_var(self.site),)
+   keychain_service = (self._token_keychain or ingest_keychain_service(self.site),)
    ```
    Keep the lazy cache and the `IngestTokenUnavailableError` wrapping.
 3. Extend `https_transport(...)` with the same two keyword arguments and pass them to the
@@ -138,14 +138,14 @@ the doctor sink check (GC-P06), and the token refresh/dead-letter policy (GC-P08
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

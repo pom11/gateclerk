@@ -86,9 +86,7 @@ If a periodic refresh call exists outside that block, stop and close the card.
            self._claim_note = f"System/time unreadable: {exc}"
            return
        self._last_device_time = reading
-       self._last_skew = compute_skew(
-           reading, our_now=self._now(), site_tz=self.site_tz
-       )
+       self._last_skew = compute_skew(reading, our_now=self._now(), site_tz=self.site_tz)
        self._claim = reading.claimed_offset_minutes
        self._claim_note = (
            None if self._claim is not None else (reading.note or "no claimed UTC offset")
@@ -101,10 +99,7 @@ If a periodic refresh call exists outside that block, stop and close the card.
 
 6. In `tick()`, immediately after `self._ensure_device_state()` and the serial check, add:
    ```python
-   if (
-       self._claim_read_at is None
-       or self._monotonic() - self._claim_read_at >= DEVICE_CLAIM_REFRESH_S
-   ):
+   if self._claim_read_at is None or self._monotonic() - self._claim_read_at >= DEVICE_CLAIM_REFRESH_S:
        self._refresh_device_claim()
    ```
    This means one clock GET at bootstrap and one every 15 minutes, not one per tick.
@@ -164,14 +159,14 @@ existing scheduler tests.
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

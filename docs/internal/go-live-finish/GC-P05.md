@@ -54,6 +54,7 @@ True`, and `grep` finds nothing in `agent_loop.py`.
        def key(value: str) -> tuple[int, int, str]:
            text = value.strip()
            return (0, int(text), text) if text.isdigit() else (1, 0, text)
+
        return min((c for c in card_numbers if c.strip()), key=key)
    ```
 
@@ -67,9 +68,8 @@ True`, and `grep` finds nothing in `agent_loop.py`.
            return value
        return int(value) if isinstance(value, str) and value.isdigit() else 0
 
-   users: list[Any] = [
-       user_record_from_device(raw) for raw in iter_users(reader, limits=limits)
-   ]
+
+   users: list[Any] = [user_record_from_device(raw) for raw in iter_users(reader, limits=limits)]
    if any(_card_count(user) > 0 for user in users):
        cards_reader = _search_reader(self.client, "card_info_search")
        by_employee: dict[str, list[str]] = {}
@@ -150,14 +150,14 @@ tests. Do not send model, firmware or card type on this line.
 
 ## HANDOFF
 
-Branch base `origin/main`; PR target `feat/gateclerk-finish`.
+Branch base `origin/main`; PR target `INTEGRATION_BRANCH` (`INDEX.md` § Conventions; the literal name is in your card).
 
 1. Run the GATE.
-2. Open the PR against `feat/gateclerk-finish`.
+2. Open the PR against `INTEGRATION_BRANCH`.
 3. When the gate is green and the PR is mergeable, run `gh pr merge <number> --squash`
    yourself.
 4. Never merge into `main`/`master`; never force-push.
-5. If the PR is not mergeable (conflict), rebase on `origin/feat/gateclerk-finish`, re-run
+5. If the PR is not mergeable (conflict), rebase on `origin/INTEGRATION_BRANCH`, re-run
    the GATE, then merge. If that fails twice, stop and report `LEFT:`.
 
 The card is complete only after the merge.

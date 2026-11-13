@@ -18,6 +18,17 @@ on every test run:
 | AI attribution trailers | Zero automated attribution trailers in tracked files | **0 matches** |
 | License | Root `LICENSE` file (MIT) + `pyproject.toml` `license = { text = "MIT" }` (all runtime dependencies MIT/BSD-3 compatible: `httpx` BSD-3-Clause, `typer` MIT, `rich` MIT, `orjson` Apache-2.0/MIT) | **Verified** |
 
+### Internal planning docs
+
+`docs/internal/go-live-finish/` holds the go-live card index and the worker card specs.
+They stay in-tree (a worker reads them from its own worktree) and carry no pre-cutover
+spelling: an identifier whose *name* is itself a legacy token — the integration branch,
+the tenant sandbox, the receiver repository and its env-var constants — is written as a
+placeholder (`INTEGRATION_BRANCH`, `<RECEIVER>_…`) and resolved from the board card or
+the private plan. `docs/internal/go-live-finish/INDEX.md` § Conventions is the
+authoritative table. Board card titles keep their own spellings; the board database is
+not part of the exported tree.
+
 ---
 
 ## 2. Commit-history audit & why fresh-history export is required
