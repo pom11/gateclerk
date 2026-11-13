@@ -49,9 +49,10 @@ from gateclerk.output import OutputFormat, render
 # --- agent (P2-07b): the commands the site unit runs ----------------------------------------
 #
 # A NEW group only; nothing above this line is touched. `gateclerk agent run` is the process
-# `deploy/gateclerk-agent@.service` starts, and `ack` / `deadletter` are the two owner commands
-# the unit cannot do for itself. The bodies are thin on purpose: every rule (the cadence, the
-# walk, the UPSERT, the park, the backoff, the dead letter) lives in the P2 module that shipped
+# `deploy/gateclerk-agent@.service` starts, and `ack` / `deadletter` / `probe` are the owner
+# commands the unit cannot do for itself. The bodies are thin on purpose: every rule (the
+# cadence, the walk, the UPSERT, the park, the backoff, the dead letter, the probe window)
+# lives in the P2 module that shipped
 # it and is imported, never re-expressed here. `gateclerk.agent_cli` is imported inside the
 # bodies, not at the top: it imports P2-06's collector, which imports `cli._warn_tz_mismatch`
 # back, and the CLI must stay importable without the agent present.
@@ -77,6 +78,27 @@ deadletter_app = typer.Typer(
     cls=_alias_group(("agent", "deadletter")),
 )
 agent_app.add_typer(deadletter_app)
+probe_app = typer.Typer(
+    name="probe",
+    help="What the running loop last asked each device (GC-P15): the `probe_audit` rows.",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+agent_app.add_typer(probe_app)
+
+#: How old a `probe_audit` row may be and still be called `current` by `agent probe list`.
+#:
+#: THE BOUND BELONGS TO THE READER, NEVER TO THE ROW — that is the reading rule
+#: `agent_store.read_probe_window` states and `agent_store.probe_is_current` enforces: a row
+#: is evidence about `[window_from_utc, window_to_utc]` as of `window_to_utc`, and any wider
+#: claim is this constant's, i.e. this command's opinion, stated where an operator can change
+#: it (`--max-age-s`) instead of baked into the row.
+#:
+#: It equals the loop's own page budget, so the screen's default asks the natural question:
+#: "is the loop due another probe by now?". `tests/test_gc_p15_probe_reader.py` pins it
+#: against `agent_loop.RESET_PROBE_INTERVAL_S`, so the two cannot drift unnoticed — the same
+#: writer/reader-constant discipline GC-P11's `PROBE_CACHE_PARTS` uses.
+PROBE_STALE_DEFAULT_S = 3600.0
 
 
 def _agent_site(site: str, config: str | None, *, output: OutputFormat) -> cfg.SiteConfig:
@@ -295,11 +317,117 @@ def deadletter_remove(
     render([{"id": id_, "removed": True}], fmt=output.value, columns=("id", "removed"))
 
 
+@probe_app.command("list")
+def probe_list(
+    site: AgentSiteOpt,
+    config: AgentConfigOpt = None,
+    state_root: AgentStateRootOpt = None,
+    device_serial: Annotated[
+        str | None,
+        typer.Option(
+            "--device-serial",
+            help="One device (its serial). Omit for every device this store has a row for.",
+        ),
+    ] = None,
+    max_age_s: Annotated[
+        float,
+        typer.Option(
+            "--max-age-s",
+            help="How old a row may be and still count as current FOR THIS READER.",
+        ),
+    ] = PROBE_STALE_DEFAULT_S,
+    output: OutputOpt = OutputFormat.TABLE,
+) -> None:
+    """The last probe the loop made of each device, what it asked, and what it cost (GC-P15).
+
+    `probe_audit` records every COMPLETED quiet-tick read — including the one that came back
+    NO MATCH — so "the agent is silent" and "the agent looked and the ring was empty" stop
+    looking identical. This command is that row's operator read: the window the loop asked
+    for, the pages it actually sent, how long ago the read ran, and whether that counts as
+    current for this reader.
+
+    READ THE ROW FOR WHAT IT IS. `window_to_utc` is the instant the read ran and
+    `[window_from_utc, window_to_utc]` the range it covered, so a row proves what the device
+    held OVER THAT RANGE, AS OF THAT INSTANT — never "quiet ever since". `current` is this
+    command's bound on that (yours to move with `--max-age-s`), not a property of the row: a
+    row that is not current still answers the historical question and answers nothing about
+    now. No row for a device means no completed probe of it, which is NOT a fault — the
+    recorded probe runs only on a QUIET tick (the narrow poll returned no records), so a busy
+    site never earns one. Empty output exits 0 for that reason; a store that does not exist
+    exits 2, because that is a site whose agent has never run.
+
+    NOT the same surface as the device line in `gateclerk status`, which reads
+    `status/device-probe.json`: that is what `gateclerk doctor` last concluded about the SITE,
+    a cached verdict with a 60 s TTL. This is what the LOOP last asked each DEVICE and at what
+    cost, one row per device and probe kind, written by the running agent. Different file,
+    different clock, different question — do not read one as the other.
+    """
+    from gateclerk import agent_cli, agent_store
+
+    if max_age_s < 0:
+        # Refused, not clamped: a negative bound would mark every row not-current and read as
+        # "nothing is evidence", which is the opposite of what a typo'd flag should do.
+        raise _config_exit(
+            output,
+            f"--max-age-s {max_age_s} is negative: a row's bound is how long it stays "
+            "current, and no bound does that",
+        )
+    target = _agent_site(site, config, output=output)
+    db_path = agent_cli.resolve_db_path(target, state_root)
+    if not Path(db_path).exists():
+        # The ack precedent: a missing store is a reason, not a traceback. Here it also has a
+        # real answer for the operator — no agent run means no probe was ever made.
+        raise _config_exit(
+            output,
+            f"no store at {db_path} for site {target.name!r}: nothing has been probed "
+            "(has `gateclerk agent run` ever run for this site?)",
+        )
+    try:
+        conn = agent_cli.connect(db_path)
+    except (ConfigError, OSError) as exc:
+        raise _config_exit(output, str(exc)) from exc
+
+    # The reader's OWN clock: `agent_cli._now` is the same freeze seam `agent run` threads, so
+    # this screen and the loop that wrote the row live in one time universe (and a test can
+    # pin the age without touching a wall clock).
+    now = agent_cli._now()
+    rows = [
+        {
+            "device_serial": row.device_serial,
+            "kind": row.kind,
+            "window_from_utc": row.window_from_utc,
+            "window_to_utc": row.window_to_utc,
+            "reads": row.reads,
+            # `age_s` is `now - window_to_utc`, never `now - window_from_utc`: the latter would
+            # show a probe that ran this second as an hour old, i.e. read the width of the
+            # window asked for as though it were elapsed silence.
+            "age_s": round(agent_store.probe_age_s(row, now=now), 1),
+            "current": agent_store.probe_is_current(row, now=now, max_age_s=max_age_s),
+        }
+        for row in agent_store.all_probe_windows(conn)
+        if device_serial is None or row.device_serial == device_serial
+    ]
+    render(
+        rows,
+        fmt=output.value,
+        columns=(
+            "device_serial",
+            "kind",
+            "window_from_utc",
+            "window_to_utc",
+            "reads",
+            "age_s",
+            "current",
+        ),
+    )
+
+
 def register(app: typer.Typer) -> None:
     """Attach the `agent` group to the root app.
 
     Called by `gateclerk.cli` at import time, in the position the group's `add_typer` used to
     sit, so the command order in `gateclerk --help` stays byte-identical. The `deadletter`
-    subgroup is attached to `agent_app` at module scope (above), where it was attached before.
+    and `probe` subgroups are attached to `agent_app` at module scope (above), where
+    `deadletter` was attached before.
     """
     app.add_typer(agent_app)

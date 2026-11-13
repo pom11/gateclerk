@@ -14,7 +14,7 @@ spells it this way; superseded spellings keep working as hidden aliases.
 
 | verb     | means                                                   | command |
 |----------|---------------------------------------------------------|---------|
-| `list`   | enumerate records; no identifying argument               | `users list`, `agent deadletter list`, `sink list` |
+| `list`   | enumerate records; no identifying argument               | `users list`, `agent deadletter list`, `agent probe list`, `sink list` |
 | `get`    | read one named thing                                     | (see exception 1) |
 | `status` | report the condition of something that is running        | `status` |
 | `test`   | answer "does this resolve / work", with no side effect   | `creds test`, `sink test` |

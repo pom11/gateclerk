@@ -83,10 +83,13 @@ __all__ = [
     "UnusableRecordError",
     "WatermarkCheck",
     "advance_checkpoint",
+    "all_probe_windows",
     "check_db_watermark",
     "db_size_bytes",
     "event_jsonl",
     "event_rowid",
+    "probe_age_s",
+    "probe_is_current",
     "prune_pushed_events",
     "read_checkpoint",
     "read_oldest_serial",
@@ -756,19 +759,27 @@ def read_probe_window(
     READ THE ROW FOR WHAT IT IS: one answer about ITS OWN WINDOW. `window_to_utc` is the
     instant the read ran and `[window_from_utc, window_to_utc]` the range it covered, so the
     question this row can answer is "what did the device hold, over that range, as of that
-    instant" — never "has the device been quiet ever since". A consumer that wants the
-    latter must compare `probed_at` with its own clock and treat the row as stale the moment
+    instant" — never "has the device been quiet ever since". A consumer that wants
+    the latter must compare `probed_at` with its own clock and treat the row as stale the moment
     the window it describes ends; reading an old row as an all-time answer would page (or
     stay silent) on evidence that has expired. P2-05's `check_stall` does not consult this
     table yet — that wiring and its alert vocabulary are a separate decision.
+
+    That rule as code, for any consumer: `probe_age_s` (age against `window_to_utc`, on the
+    caller's clock) and `probe_is_current` (against the CALLER's bound, never a derived one).
+    The operator-facing read of the whole table is `all_probe_windows`, rendered by
+    `gateclerk agent probe list`.
     """
     row = conn.execute(
         "SELECT device_serial, kind, window_from_utc, window_to_utc, reads"
         " FROM probe_audit WHERE device_serial = ? AND kind = ?",
         (device_serial, kind),
     ).fetchone()
-    if row is None:
-        return None
+    return None if row is None else _probe_window_from_row(row)
+
+
+def _probe_window_from_row(row: sqlite3.Row) -> ProbeWindow:
+    """One `probe_audit` row -> `ProbeWindow`, verbatim (the one mapping both reads share)."""
     return ProbeWindow(
         device_serial=row["device_serial"],
         kind=row["kind"],
@@ -776,6 +787,59 @@ def read_probe_window(
         window_to_utc=row["window_to_utc"],
         reads=row["reads"],
     )
+
+
+def all_probe_windows(conn: sqlite3.Connection) -> tuple[ProbeWindow, ...]:
+    """Every `probe_audit` row, device then kind — the OPERATOR's read of the table.
+
+    This is the read path the "we looked" evidence was missing: `read_probe_window` answers
+    one device+kind for the loop's own budget, and nothing before this function showed a
+    human what the loop last asked any device. It returns rows, not verdicts — the same
+    discipline `dead_letter_rows` follows, so the CLI stays a renderer.
+
+    Ordering is by `(device_serial, kind)`, the primary key: stable, and a device's two
+    kinds can never interleave confusingly. A device with no completed probe simply has no
+    row — see `probe_age_s` for why the ABSENCE of a row is not a fault.
+    """
+    rows = conn.execute(
+        "SELECT device_serial, kind, window_from_utc, window_to_utc, reads"
+        " FROM probe_audit ORDER BY device_serial, kind"
+    ).fetchall()
+    return tuple(_probe_window_from_row(row) for row in rows)
+
+
+def probe_age_s(row: ProbeWindow, *, now: datetime) -> float:
+    """How long ago this probe ran, measured on the CALLER's clock.
+
+    THE ONLY LEGITIMATE AGE OF A ROW. `window_to_utc` is the instant the read ran
+    (`_PROBE_AUDIT_V8`: `until = self._now()` at request time), so the row's freshness is
+    `now - window_to_utc` — never `now - window_from_utc`, which would report a probe that
+    just ran as already an hour old and would read the *width of the window asked for* as
+    though it were elapsed silence.
+
+    Negative is possible and honest: it means the writer's clock is ahead of the reader's
+    (a `doctor` run against a state root the agent wrote), and clamping it to 0 would hide
+    exactly the skew P2-06 reports as its own warning.
+    """
+    return (now - row.probed_at).total_seconds()
+
+
+def probe_is_current(row: ProbeWindow, *, now: datetime, max_age_s: float) -> bool:
+    """Is this row still evidence for a reader that asks "has the loop looked lately"?
+
+    A row is evidence about ITS OWN WINDOW and nothing else, so "current" cannot be derived
+    from the row — a row whose upper bound is one second old proves the device held nothing
+    over `[window_from_utc, window_to_utc]` and says nothing whatever about the second after
+    `window_to_utc`. The bound therefore comes from the CONSUMER (`max_age_s`), and this
+    function refuses to invent one: the reader states how long it is willing to treat a
+    past read as a present fact, and anything older answers only the historical question.
+
+    The boundary is inclusive (exactly `max_age_s` is still current), the opposite posture
+    from `check_db_watermark`'s strictly-above rule, because that one is an over-budget
+    trigger and this one is a reader's expiry. A row reported not-current here must not be
+    read as "quiet ever since" — that is the trap the whole reading rule exists to close.
+    """
+    return probe_age_s(row, now=now) <= max_age_s
 
 
 # --- the disk watermark (gauge; alerting is P2-05) -----------------------------------------

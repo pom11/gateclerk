@@ -109,6 +109,7 @@ EXPECTED_LEAVES: set[str] = {
     "agent ack",
     "agent deadletter list",
     "agent deadletter remove",
+    "agent probe list",
     "agent run",
     "creds explain",
     "creds get",
@@ -172,9 +173,9 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 34 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
-    # `users import` / `users template`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 36
+    # 37 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
+    # `users import` / `users template`; +1 for GC-P15 follow-up 2's `agent probe list`.
+    assert len(leaves) == len(EXPECTED_LEAVES) == 37
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
@@ -241,6 +242,9 @@ READ_ONLY_LEAVES: tuple[tuple[str, ...], ...] = (
     ("sink", "test"),
     ("status",),
     ("agent", "deadletter", "list"),
+    # GC-P15 follow-up 2: `agent probe list` reads `probe_audit` and writes nothing, so it
+    # belongs to the read half the sweep covers (and its help must not advertise a write).
+    ("agent", "probe", "list"),
     ("demo", "device", "urls"),
 )
 
