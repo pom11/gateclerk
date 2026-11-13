@@ -31,6 +31,7 @@ loudly rather than running a wrong agent.
 from __future__ import annotations
 
 import ipaddress
+import os
 import plistlib
 import re
 import shutil
@@ -702,11 +703,25 @@ TEMPLATE_PATHS = (
     "examples/sites.toml",
 )
 
-#: NOT asserted here: `deploy/mnotify-secrets/` is the fourth path in the same compose.yaml
-#: sentence ("never committed") and has no rule of its own yet — `.gitignore`'s `secrets/`
-#: matches a directory named exactly `secrets`, not this one. It is a directory of secret
-#: files rather than a copy of a template, so it gets its own card (t_bc27f4fc) instead of
-#: riding along on this pin. Stated here so the pin's claim is not read as "all four".
+#: The fourth path in that same compose.yaml sentence ("put the mnotify secret files in
+#: ./mnotify-secrets ... never committed"), and the most sensitive of the four:
+#: MICRO_NOTIFY_SECRETS=file reads one file per account out of this directory, which
+#: compose.yaml:61,89 bind-mounts read-only at /run/secrets/mnotify. Unlike the three above
+#: it is not a copy of a template — there is no tracked counterpart to shadow — so it is not
+#: in `OPERATOR_PATHS`; it is measured on a tree that exists (see
+#: `_git_ignored_secrets_tree`) and joins the same set-equality assertion as its own path
+#: spellings. `.gitignore` matches it with `/deploy/mnotify-secrets*` (no trailing slash):
+#: measured, a trailing-slash rule still catches the directory and a file under it, but not
+#: the symlink form below.
+SECRETS_DIR = "deploy/mnotify-secrets"
+
+#: A symlink of the same shape, which is what an operator reaches for when the secrets live
+#: outside the checkout: compose.yaml binds `./mnotify-secrets` read-only and does not care
+#: whether the source is a directory. Measured: a trailing-slash rule (`/deploy/mnotify-secrets*/`)
+#: matches the directory, the directory-with-slash spelling and a file under it, but NOT this
+#: symlink — `git status` still lists it, and `git add -A` commits it as a mode-120000 blob.
+#: It is pinned here so the prefix form is not quietly "tidied" into a directory-only rule.
+SECRETS_LINK = "deploy/mnotify-secrets-link"
 
 
 def _git_ignored(paths: tuple[str, ...]) -> set[str]:
@@ -730,24 +745,79 @@ def _git_ignored(paths: tuple[str, ...]) -> set[str]:
     return {line for line in proc.stdout.splitlines() if line}
 
 
+def _git_ignored_secrets_tree() -> set[str]:
+    """Which spellings of the secrets path git calls ignored, measured on a tree that exists.
+
+    The directory needs this because `git check-ignore --no-index` consults the working tree
+    when it decides whether a *directory* path is ignored: for a directory that does not
+    exist it stays silent even when a rule matches it (measured: rc=1, no output), which
+    would let a deleted rule look fine. So the empty directory is created for the length of
+    the check — the file-under-it spelling needs only the directory to exist, nothing is
+    ever written into it.
+
+    Four spellings go in, because a rule can answer one and not another: the directory as
+    compose.yaml names it, that path with a trailing slash, a file under it, and the symlink
+    form. The last one is what a trailing-slash rule silently misses (see `SECRETS_LINK`).
+
+    Nothing here may touch a path that already exists. A developer checkout on the deploy
+    host has the real `deploy/mnotify-secrets/` with the live account files in it, and this
+    runs in that tree; so the directory and the symlink are removed only if this call made
+    them, and a pre-existing symlink is measured as it stands rather than replaced.
+    """
+    root = REPO_ROOT / SECRETS_DIR
+    link = REPO_ROOT / SECRETS_LINK
+    made_dir = not root.exists()
+    made_link = False
+    if made_dir:
+        root.mkdir(parents=True)
+    try:
+        if not (link.exists() or link.is_symlink()):
+            link.symlink_to(os.path.relpath(DEPLOY / "gateclerk.env.example", DEPLOY))
+            made_link = True
+        return _git_ignored(
+            (
+                f"{SECRETS_DIR}/",
+                f"{SECRETS_DIR}/hook.url",
+                SECRETS_DIR,
+                SECRETS_LINK,
+            )
+        )
+    finally:
+        if made_link:
+            link.unlink(missing_ok=True)
+        if made_dir:
+            root.rmdir()
+
+
 def test_operator_deploy_files_are_gitignored() -> None:
     """The filled-in files that carry the real tokens cannot be swept up by `git add -A`.
 
     The Run block in `deploy/CONTAINER.md` tells an operator to `cp` the two templates to
-    their real names and fill them in. Before `.gitignore` named those two paths, the only
-    thing standing between the filled-in files and the public repo was a sentence in
-    `deploy/compose.yaml` ("keep it mode 0600 and out of git") — an instruction, not a
-    policy, and one `git add -A` away from committing live tokens. The pin therefore checks
-    git's own answer for all six paths in one assertion, because both directions break an
-    operator: a dropped rule leaks tokens, a broadened one hides the template a fresh clone
-    is supposed to copy.
+    their real names and fill them in, and to provision `deploy/mnotify-secrets/` with one
+    secret file per account. Before `.gitignore` named those paths, the only thing standing
+    between them and the public repo was a sentence in `deploy/compose.yaml` ("keep it mode
+    0600 and out of git" / "never committed") — an instruction, not a policy, and one
+    `git add -A` away from committing live tokens. The pin therefore checks git's own answer
+    for all four operator paths and all three templates in one assertion, because both
+    directions break an operator: a dropped rule leaks tokens, a broadened one hides the
+    template a fresh clone is supposed to copy.
     """
-    ignored = _git_ignored((*OPERATOR_PATHS, *TEMPLATE_PATHS))
-    unprotected = sorted(set(OPERATOR_PATHS) - ignored)
-    shadowed = sorted(ignored - set(OPERATOR_PATHS))
+    secrets_ignored = _git_ignored_secrets_tree()
+    ignored = _git_ignored((*OPERATOR_PATHS, *TEMPLATE_PATHS)) | secrets_ignored
+    # What the ignore layer is supposed to answer: every operator path (the three files and
+    # the four spellings of the secrets path) and nothing else.
+    expected_ignored = set(OPERATOR_PATHS) | {
+        SECRETS_DIR,
+        f"{SECRETS_DIR}/",
+        f"{SECRETS_DIR}/hook.url",
+        SECRETS_LINK,
+    }
+    unprotected = sorted(expected_ignored - ignored)
+    shadowed = sorted(ignored - expected_ignored)
     assert not unprotected, (
-        f"operator-created deploy file(s) no longer ignored: {unprotected} — "
-        "a filled-in token file is one `git add -A` from being committed"
+        f"operator-created deploy path(s) no longer ignored: {unprotected} — "
+        "a filled-in token file is one `git add -A` from being committed, and "
+        f"{SECRETS_DIR} is the micro-notify account secrets MICRO_NOTIFY_SECRETS_DIR points at"
     )
     assert not shadowed, (
         f"ignore rule(s) now hide tracked template(s): {shadowed} — "
