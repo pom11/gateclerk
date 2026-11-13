@@ -65,10 +65,24 @@ Still broken while the projected sink has `"type": ""` and `dropped` names `sink
    ```python
    if sink_type not in ("https", "csv", "jsonl", "mnotify", ""):
    ```
-3. Project the new values. Add two small validators near `_safe_scalar_ident`:
+3. Project the new values. Add two small validators near `_safe_scalar_ident`, and this
+   module-level constant above `ConfigExportResult` (next to the other allowlists):
    ```python
+   #: The transport's own two header names. `sinks.py` refuses them in a configured
+   #: `headers` table — `Authorization` holds the bearer token (which has exactly one home,
+   #: the ref rungs) and `X-GateClerk-Site` confirms the site the token already determines.
+   #: An inventory that printed either would put a credential the config was not allowed to
+   #: hold into the export, so a table carrying one is dropped whole.
+   RESERVED_SINK_HEADERS: frozenset[str] = frozenset({"authorization", "x-gateclerk-site"})
+
+
    def _safe_recipient(raw: object) -> tuple[str, list[str]]:
-       """One mail address: text with `@`, no whitespace, no secret-shaped value."""
+       """One mail address: text with `@`, no whitespace, no secret-shaped value.
+
+       The `mnotify` alert sink's only routing field. A malformed recipient is dropped and
+       counted rather than projected as if the site had a working alert route — the export is
+       what an operator signs off on before a cutover.
+       """
        if raw is None:
            return "", []
        if not isinstance(raw, str) or raw.count("@") != 1 or any(c.isspace() for c in raw):
@@ -78,20 +92,39 @@ Still broken while the projected sink has `"type": ""` and `dropped` names `sink
 
 
    def _safe_headers(raw: object) -> tuple[str, list[str]]:
-       """Sorted `k=v` pairs for inventory; header values are config, never secrets."""
+       """Sorted `k=v` pairs for inventory; a credential-carrying table is dropped whole.
+
+       A header value is config, not a secret — except under the two names `RESERVED_SINK_HEADERS`
+       lists, which is exactly why `sinks.py` refuses them in a config. Both the reserved name
+       and the secret-shape check drop the WHOLE table: a partial header set in the inventory
+       would be a second kind of lie.
+       """
        if raw is None:
            return "", []
        if not isinstance(raw, dict):
            return "", ["sink.headers"]
-       pairs = []
-       for key, value in sorted(raw.items()):
+       pairs: list[str] = []
+       for key, value in sorted(raw.items(), key=lambda item: str(item[0])):
            if not isinstance(key, str) or not isinstance(value, str):
                return "", ["sink.headers"]
            if any(c in key + value for c in "\r\n"):
                return "", ["sink.headers"]
+           if key.strip().lower() in RESERVED_SINK_HEADERS:
+               return "", ["sink.headers"]
+           if redact_b64(value) != value:
+               return "", ["sink.headers"]
            pairs.append(f"{key}={value}")
        return ";".join(pairs), []
    ```
+
+   The shipped `_safe_headers` is deliberately NOT the first draft of this snippet, which
+   rendered every value verbatim under the premise "header values are config, never secrets".
+   `tests/test_export_config.py:75` plants `Authorization` in a sink table and `PLANTED_SECRETS`
+   (`:39`) asserts that value never reaches the export, so the premise is false in this repo's
+   own fixture. Two tests pin the drop-whole behaviour and fail on a "restore":
+   `test_reserved_header_names_are_dropped_not_printed` (in
+   `tests/test_gc_p12_export_mnotify.py`) and `test_no_secret_value_appears_in_the_export`.
+
 4. In `_project_sink`, build the four values and add them to the returned dict:
    ```python
    to, d_to = _safe_recipient(raw_sink.get("to"))
@@ -118,6 +151,9 @@ What must NOT change:
 - `mnotify` remains an alert-only sink (`SiteConfig.event_sinks` excludes it); this card
   only fixes the inventory.
 - No secret value is ever printed.
+- A `headers` table carrying `Authorization` / `X-GateClerk-Site` or a value that fails
+  `redact_b64` is dropped WHOLE (one `sink.headers` drop, never a partial table): header
+  values are config only under names the transport does not itself own.
 
 ## TESTS
 
