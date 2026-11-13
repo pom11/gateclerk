@@ -1050,8 +1050,12 @@ class IngestTokenUnavailableError(PushError):
 def ingest_token_env_var(site: str) -> str:
     """The env variable naming one site's ingest token: `GATECLERK_INGEST_TOKEN_<SITE>`.
 
-    Site names are uppercased for the lookup because the function uppercases site codes
-    before comparing (`GATECLERK_SITES` / `GATECLERK_INGEST_TOKEN_SITE-A` on both ends).
+    That spelling is the AGENT's own contract (`GATECLERK_INGEST_TOKEN_SITE-A` for
+    `site-a`). The Cloud Run receiver reads its own site-list env var and its own
+    legacy-prefixed token names from its own secret store (deliberately not spelled here;
+    see the private plan); the two ends are configured independently and neither name has
+    to match. Site names are uppercased for the lookup because the receiver uppercases
+    site codes before comparing.
     """
     return f"{INGEST_TOKEN_ENV_PREFIX}{site.strip().upper()}"
 
