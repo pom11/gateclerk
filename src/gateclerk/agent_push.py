@@ -1016,12 +1016,10 @@ def dead_letter_rows(
 #: validator (`HTTPS://` in a config is a mistake worth a loud error).
 INGEST_SCHEME = "https://"
 
-#: The env rung mirrors the function's OWN variable name (`_GATECLERK_INGEST_SECRET_PREFIX`
-#: in functions/main.py): one name per site works in the agent's environment and in the
-#: Cloud Run runtime, so an operator sets exactly one thing per site either way. The
-#: spelling lives in `gateclerk.credentials` (the resolver owns the ref names and the inverse
-#: ref -> env-var mapping) and is imported by name above, so `agent_push.INGEST_TOKEN_ENV_PREFIX`
-#: and the resolver's are the same object rather than two strings that happen to match.
+#: The env rung is the AGENT's own contract: `GATECLERK_INGEST_TOKEN_<SITE>`.
+#: The Cloud Run receiver reads its own Secret Manager/env names, which
+#: are legacy-prefixed and deliberately not spelled here (see the private plan).
+#: The two processes are configured separately; neither name has to match.
 
 #: The keychain service holding one site's ingest token. The account is the site (the
 #: device credential's account is the host — different item, different purpose, both
