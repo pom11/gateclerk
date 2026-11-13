@@ -114,14 +114,29 @@ class FakeMonotonic:
 
 
 def device_event(serial: int, wall: str) -> dict[str, Any]:
-    """One stored event stamped site-a-style: ITS wall digits + ITS claimed +02:00."""
+    """One stored event stamped site-a-style: ITS wall digits + ITS claimed +02:00.
+
+    The fields are the RECORDED page's granted pass (`events_major5_page1.json`: minor 75,
+    `employeeNoString`, `currentVerifyMode: cardOrFaceOrFp`), not a bare code. GC-P01 makes
+    `queue_new_events` carry only punch candidates, and an event a working site polls IS a
+    pass; a fake stamped `minor: 0` with no verify mode classifies as `unknown_code`, so it
+    is stored and — correctly — never queued, which would leave every queue/drain assertion
+    here reasoning about data the classifier refuses to call a punch.
+    """
     return {
         "serialNo": serial,
         "employeeNoString": "1",
         "name": "User E1",
         "major": 5,
-        "minor": 0,
+        "minor": 75,
         "time": f"{wall}+02:00",
+        "cardType": 1,
+        "cardReaderNo": 1,
+        "doorNo": 1,
+        "type": 0,
+        "userType": "normal",
+        "currentVerifyMode": "cardOrFaceOrFp",
+        "mask": "no",
     }
 
 

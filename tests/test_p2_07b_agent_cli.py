@@ -950,11 +950,17 @@ def test_ledger_known_rows_never_consume_the_batch_limit(tmp_path: Path) -> None
     from gateclerk.agent_db import connect
 
     conn = connect(tmp_path / "agent.sqlite3")
+    # GC-P01: the queue only takes punch candidates, so these placeholder rows carry the
+    # flattened verdict columns the predicate reads (major/outcome/unknown_code/employee_no/
+    # verify_mode) — a bare row is stored, correctly, and never queued. What this test is
+    # about — the ledger exclusion sitting INSIDE the WHERE — is untouched.
     for serial in (300, 301, 302):
         conn.execute(
             "INSERT INTO events (jsonl, revision, stored_at, updated_at, key_algorithm,"
             " idempotency_hash, idempotency_json, fingerprint_hash, fingerprint_json,"
-            " site, device_serial, serial_no, raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " site, device_serial, serial_no, raw,"
+            " major, minor, outcome, unknown_code, employee_no, verify_mode)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "{}",
                 1,
@@ -969,6 +975,12 @@ def test_ledger_known_rows_never_consume_the_batch_limit(tmp_path: Path) -> None
                 SERIAL,
                 serial,
                 "{}",
+                5,
+                75,
+                "granted",
+                0,
+                "1",
+                "cardOrFaceOrFp",
             ),
         )
     conn.commit()

@@ -89,6 +89,7 @@ from gateclerk.config import (
     credential_ref,
     resolve_credentials,
 )
+from gateclerk.event_codes import NON_AUTH_VERIFY_MODES
 from gateclerk.isapi_transport import IsapiClient
 from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
 
@@ -319,6 +320,36 @@ def discard_dead_letter(
     return True
 
 
+#: Placeholders for `_PUNCH_CANDIDATE_SQL`'s verify-mode arm — one `?` per mode, so the
+#: list is bound as parameters and typed exactly once (in `event_codes`).
+_VERIFY_MODE_PLACEHOLDERS = ", ".join("?" for _ in sorted(NON_AUTH_VERIFY_MODES))
+
+#: The punch rule as SQL (GC-P01 / E22) — `event_codes._punch_decision` read against the
+#: flattened columns `agent_db` gives every stored record. This is the ONLY place the queue
+#: decides what a punch is, and every arm has a twin in the classifier:
+#:
+#: * `major = 5` — the authentication major (`PUNCH_MAJOR`); everything else (the major-3
+#:   heartbeat, alarms) is noise a timesheet must never see.
+#: * `outcome = 'granted'` + `unknown_code = 0` — the curated table's verdict. Together with
+#:   `major = 5` these also cover `AUTH_PASS_MINORS` *by construction*: that set is derived
+#:   from the same table as exactly its granted major-5 codes, so an unknown or non-pass
+#:   minor can never be granted. Repeating the minor list here would be a second rule that
+#:   can drift; `tests/test_gc_p01_grant_filter.py` fails if the derivation ever stops
+#:   holding.
+#: * `employee_no` — an unattributed pass cannot enter a timesheet.
+#: * `verify_mode` — a door-state record carries `invalid`/NULL: nobody authenticated. The
+#:   comparison mirrors `_verify_is_auth_mode` (strip + lowercase, then membership), and an
+#:   unseen mode stays a REAL mode — the list is what the classifier itself rejects.
+_PUNCH_CANDIDATE_SQL = (
+    "e.major = 5"
+    " AND e.outcome = 'granted'"
+    " AND e.unknown_code = 0"
+    " AND e.employee_no IS NOT NULL AND e.employee_no <> ''"
+    " AND e.verify_mode IS NOT NULL"
+    f" AND lower(trim(e.verify_mode)) NOT IN ({_VERIFY_MODE_PLACEHOLDERS})"
+)
+
+
 def queue_new_events(
     conn: Any,
     *,
@@ -328,13 +359,23 @@ def queue_new_events(
     ledger: PushLedger | None = None,
     sink_name: str = IMPLICIT_SINK_NAME,
 ) -> tuple[int, ...]:
-    """Queue every stored event that has no send buffer for this sink; return queue ids.
+    """Queue every stored *punch candidate* that has no send buffer for this sink.
 
     The missing link between P2-02's store and P2-04's drain (module docstring). It lives
     here rather than in `agent_push` because it is not a push rule — the pusher stays exactly
     as shipped. `limit` bounds one pass (P2-04's batch cap): a first-ever pass over a
     year-old store must not build an unbounded queue in one transaction; the rest is still
     there, due, on the next pass.
+
+    WHAT IT QUEUES, AND WHY THE RULE IS IN THE QUERY (GC-P01 / E22)
+    A site's `events` table deliberately holds EVERYTHING the device reported — a refused
+    card, a door-state record, a code the curated table cannot name — because GC-P20's
+    diagnostics read them there. Only a granted authentication pass by a known employee is a
+    punch, and a queued row becomes a real attendance line in BC Table 70607. So this query,
+    not the store, is the gate: a denied, informational, unknown-code or unattributed event
+    stays in `events` and is never queued for ANY sink. The store keeps it; the queue refuses
+    it. The predicate is `_PUNCH_CANDIDATE_SQL` and it is the classifier's rule
+    (`event_codes._punch_decision`), which the recorded-fixture equivalence test pins.
 
     `sink_name` (SINKS-WIRING) is which sink this pass is queueing FOR: every exclusion is
     per (event, sink), because an event the ingest has already accepted still has to reach
@@ -365,9 +406,15 @@ def queue_new_events(
     # re-queueing would re-push a punch the legacy target already took. A newly configured sink
     # has genuinely never seen the event, so excluding it there would be silent loss, not
     # dedupe. The gate is a BOUND 0/1 — the query text stays a literal.
+    # The f-string below is not an injection surface: the only interpolated text is the
+    # module-level `_PUNCH_CANDIDATE_SQL`, built once at import from the frozen
+    # `NON_AUTH_VERIFY_MODES`, and the modes themselves travel as bound parameters — no
+    # caller-supplied value ever reaches the query text. S608 reads the statement's text and
+    # cannot see that, so it is silenced on the CLOSING line of the string (the only line in
+    # the statement where a comment cannot land inside the SQL).
     legacy_wild = 1 if sink_name == IMPLICIT_SINK_NAME else 0
     rows = conn.execute(
-        """
+        f"""
         SELECT e.id AS id
           FROM events AS e
          WHERE NOT EXISTS (
@@ -381,9 +428,10 @@ def queue_new_events(
            AND NOT EXISTS (
                  SELECT 1 FROM temp.agent_push_ledger AS l
                   WHERE l.event_id = e.id)
+           AND {_PUNCH_CANDIDATE_SQL}
          ORDER BY e.id
          LIMIT ?
-        """,
+        """,  # noqa: S608 - static query text + one import-time constant; modes bind as params
         (
             endpoint,
             sink_name,
@@ -391,6 +439,7 @@ def queue_new_events(
             endpoint,
             sink_name,
             legacy_wild,
+            *sorted(NON_AUTH_VERIFY_MODES),
             max(1, int(limit)),
         ),
     ).fetchall()
