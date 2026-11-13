@@ -24,7 +24,7 @@ Three rules make this module trustworthy rather than convenient:
 * **Budget respect (§0.5).** Exactly one request per probed surface, and an error
   response is NEVER retried (the transport already treats notSupport/badContent as
   terminal; the probe adds no retry of its own — pinned against FakeDevice's
-  per-path authorized-request counter, tests/test_e1_03_migrate_probe.py). A 401
+  per-path authorized-request counter, tests/test_migrate_probe.py). A 401
   ABORTS the whole probe: a credential problem is not a per-surface fact, and
   knocking again is exactly the lockout accounting §0.5 forbids. Settled axes are
   not re-probed (policy reaffirmed in OBSERVED.md): the faceURL photo-bytes question

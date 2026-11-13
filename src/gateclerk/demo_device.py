@@ -98,7 +98,8 @@ __all__ = [
 
 # --- the masked device vocabulary (one home; tests/fakedevice.py imports these) ----------
 
-#: The masked realm the fixtures recorded (tests/fixtures/.../digest_challenge_401.txt).
+#: The masked realm the fixtures recorded
+#: (tests/fixtures/recorded/site-a-ds-k1t341amf-s/digest_challenge_401.txt).
 #: Shared home: `tests/fakedevice.py` imports it from here so the offline fake and the
 #: demo box cannot drift into two realms (pinned by tests/test_demo_device.py).
 DEMO_REALM = "DS-39DED0D1"
