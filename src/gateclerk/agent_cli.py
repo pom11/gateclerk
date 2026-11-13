@@ -56,6 +56,7 @@ the transport's `Secret` and never in this module, a report, or a log line.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -95,6 +96,7 @@ from gateclerk.isapi_transport import IsapiClient
 from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
 
 __all__ = [
+    "AGENT_PIDFILE_NAME",
     "HEALTH_DIR_NAME",
     "HEALTH_FILE_NAME",
     "PARK_DIR_NAME",
@@ -124,6 +126,12 @@ HEALTH_FILE_NAME = "agent.json"
 #: GC-P10's lock-file suffix under the state dir: `gateclerk-<site>.lock`, one lock per
 #: site — the on-disk statement of the deployment law "one site, one process, one store".
 POLLER_LOCK_SUFFIX = ".lock"
+#: GC-P11's pidfile under the state dir — the file `gateclerk status` reads for its agent
+#: line (`status_cli.PIDFILE_NAME`, same literal; the tests in
+#: tests/test_gc_p11_status_writers.py pin the two paths together, because `agent_cli` must
+#: not grow an import edge onto the status screen that reads it). Per site, never global:
+#: one site can be running while its neighbour is not.
+AGENT_PIDFILE_NAME = "agent.pid"
 #: systemd exposes `LoadCredential=<name>:<path>` as this env var pointing at a dir of files.
 CREDENTIALS_DIRECTORY_ENV = "CREDENTIALS_DIRECTORY"
 
@@ -676,6 +684,11 @@ class SiteAgent:
         #: `run()` releases in its `finally`; `close()` covers a caller that built the
         #: agent and never ran it.
         self._poller_lock: Any = None
+        #: GC-P11's pidfile (`<state root>/agent.pid`): None until `run()` writes it. The
+        #: agent line of `gateclerk status` reads exactly this file, so its whole life is
+        #: the lock's: written inside the lock's `try`, cleared by `close()` only if the
+        #: content still names us.
+        self._pidfile: Path | None = None
 
     # --- one pass -------------------------------------------------------------------------
 
@@ -792,6 +805,15 @@ class SiteAgent:
         sleep = self._sleep if self._sleep is not None else time.sleep
         ticks = 0
         try:
+            # GC-P11: `gateclerk status` reads `<state root>/agent.pid` for its agent line,
+            # and until now nothing wrote it. Inside the lock's try is the whole contract:
+            # a process that lost the lock never writes (the write above this try is
+            # unreachable for it), and the state dir already exists because the lock file
+            # was just created in it. `Path.write_text` is not atomic, but a one-line pid
+            # is read with `.strip()` by a reader that treats a torn read as "unreadable —
+            # agent state unknown" (status_cli's WARN branch), never as a false alive.
+            self._pidfile = Path(self._db_path).parent / AGENT_PIDFILE_NAME
+            self._pidfile.write_text(f"{os.getpid()}\n", encoding="utf-8")
             try:
                 while max_ticks is None or ticks < max_ticks:
                     self._cycle_started = time.monotonic()
@@ -867,9 +889,20 @@ class SiteAgent:
         The GC-P10 poller lock is released first if it is still held — the normal case
         is a no-op (`run()`'s `finally` already dropped it and stored None); what this
         covers is a caller that built the agent and closed it without ever running it.
+        The GC-P11 pidfile goes in the same breath, under the same twice-safe pattern, and
+        only when it still names THIS process.
         """
         release_poller_lock(self._poller_lock)
         self._poller_lock = None
+        # GC-P11: the pidfile is `gateclerk status`' agent line, so a stale one is a lie on
+        # the operator's screen — but deleting a file we no longer own is a worse lie (a
+        # poller that started after our last tick would silently lose its evidence). The
+        # content check is the guard; a missing or unreadable file is already nothing to do.
+        if self._pidfile is not None:
+            with contextlib.suppress(OSError):
+                if self._pidfile.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    self._pidfile.unlink()
+            self._pidfile = None
         close_sink = getattr(getattr(self.policy, "sink", None), "close", None)
         if callable(close_sink):
             close_sink()
