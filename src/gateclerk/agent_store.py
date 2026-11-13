@@ -38,6 +38,12 @@ Watermark (spec §2b decision (b): keep-everything + watermark alert — alertin
 is P2-05): `db_size_bytes` is the gauge value, `check_db_watermark` says whether it is
 *over* the threshold (strictly; exactly-at is not over).
 
+Retention (GC-P16a): `prune_pushed_events` is the ONE `DELETE FROM events` in the
+product, and it can only reach a row the poller has proof of having delivered (the
+caller passes `PushLedger.sent_event_ids()`) and that has aged past the local window.
+Everything else stays the owner's call, and everything the queue or the dead-letter
+still points at survives. See the function's own docstring for the four guards.
+
 Two refusals this module owns, both anti-loss:
 
 * `UnusableRecordError` — a record with `serial_no=None` cannot honour the pinned key:
@@ -81,6 +87,7 @@ __all__ = [
     "db_size_bytes",
     "event_jsonl",
     "event_rowid",
+    "prune_pushed_events",
     "read_checkpoint",
     "read_oldest_serial",
     "read_probe_window",
@@ -796,3 +803,85 @@ def check_db_watermark(path: Path | str, warn_bytes: int) -> WatermarkCheck:
     the boundary is testable without config and alertable without this module.
     """
     return WatermarkCheck(size_bytes=db_size_bytes(path), warn_bytes=warn_bytes)
+
+
+# --- GC-P16a: local retention (BC is the store, the agent is a buffer) ---------------------
+
+
+def prune_pushed_events(
+    conn: sqlite3.Connection,
+    *,
+    event_ids: set[int],
+    before_utc: str,
+) -> int:
+    """Delete pushed events older than the cutoff; queued/dead-lettered rows survive.
+
+    WHY. Table 70607 owns the permanent payroll record, so an event this poller has
+    already delivered — or the owner has already discarded — is a local copy of PII
+    (`name`, `employee_no`, the `raw` device dict) with no reason to live on forever.
+    This is the only statement in the product that deletes from `events`; the rest of
+    retention (the bundle TTL, the ledger's own growth) is elsewhere, and an owner's
+    hand-made purge is still theirs alone (spec §2b).
+
+    Four rows it can never delete, each guard load-bearing:
+
+    * anything not named in `event_ids`. The caller hands over the poller's own ledger
+      (`PushLedger.sent_event_ids()`), so "we have proof this left the building" is a
+      precondition rather than a hope — an unpushed event is the diagnostic buffer
+      staying useful, and an empty ledger short-circuits before a write transaction
+      opens at all;
+    * anything with no `event_time_utc` or no older than `before_utc`. An unresolved
+      time is not evidence of age (`tz.py`: an unresolvable stamp keeps the row with
+      `event_time_utc = None` and `tz_unresolved`), and the window is a retention
+      promise, not an eager delete;
+    * anything `push_queue` still points at. `ON DELETE RESTRICT` already refuses that
+      delete at the db level; the explicit `NOT EXISTS` says the same thing in the query
+      so the intent survives a future edit of either half;
+    * anything with a `dead_letter` row. That table deliberately has NO foreign key (the
+      record of a punch that never reached the ingest must outlive the event — v4), so
+      here `NOT EXISTS` is the only thing between this statement and an unrecoverable
+      loss. `tests/test_gc_p16a_prune_events.py` pins it with the control that removes
+      the dead-letter row and shows the same event then does go.
+
+    `before_utc` is compared as TEXT, and that is chronological for this column and only
+    for this column: `event_time_utc` is written from `ResolvedTime.utc` (`tz.py:334`,
+    `astimezone(UTC)`), so every stored value is `+00:00` ISO. A caller holding a
+    non-UTC clock must normalise before formatting — the tick hook in `agent_cli` does.
+
+    One transaction per batch, the module's idiom (`store_events` above): staging and
+    delete all apply or none, because these rows cannot be recovered locally — the
+    ledger is the only proof they were ever here.
+
+    Returns the number of rows deleted, and nothing else: no id, name or payload crosses
+    this boundary (P2-06's rule for state surfaces, applied to a return value).
+    """
+    if not event_ids:
+        return 0
+    ids = sorted(event_ids)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS prune_ids (event_id INTEGER NOT NULL PRIMARY KEY)"
+        )
+        conn.execute("DELETE FROM temp.prune_ids")
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.prune_ids VALUES (?)",
+            ((event_id,) for event_id in ids),
+        )
+        cur = conn.execute(
+            """
+            DELETE FROM events
+             WHERE id IN (SELECT event_id FROM temp.prune_ids)
+               AND event_time_utc IS NOT NULL
+               AND event_time_utc < ?
+               AND NOT EXISTS (SELECT 1 FROM push_queue AS q WHERE q.event_id = events.id)
+               AND NOT EXISTS (SELECT 1 FROM dead_letter AS d WHERE d.event_id = events.id)
+            """,
+            (before_utc,),
+        )
+        deleted = cur.rowcount
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return deleted

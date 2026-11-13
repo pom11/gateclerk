@@ -81,7 +81,7 @@ from gateclerk.agent_alert import (
 from gateclerk.agent_db import connect
 from gateclerk.agent_health import AgentHealthCollector, snapshot_to_json
 from gateclerk.agent_loop import DeviceLoop, TickResult, build_device_loop
-from gateclerk.agent_store import check_db_watermark
+from gateclerk.agent_store import check_db_watermark, prune_pushed_events
 from gateclerk.config import (
     PUSH_TARGET_SCHEMES,
     ConfigError,
@@ -97,6 +97,7 @@ from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
 
 __all__ = [
     "AGENT_PIDFILE_NAME",
+    "DEFAULT_LOCAL_RETENTION_DAYS",
     "HEALTH_DIR_NAME",
     "HEALTH_FILE_NAME",
     "PARK_DIR_NAME",
@@ -162,6 +163,16 @@ def _now() -> datetime:
 #: The poller's own record of what it has already pushed (see `PushLedger`).
 PUSH_LEDGER_FILE_NAME = "push-ledger.jsonl"
 
+#: GC-P16a: how long a row the poller has PROVEN delivered may still sit in the local
+#: store. BC (Table 70607) has held the permanent copy since the push landed, so every
+#: day past this window the agent keeps a row is a day of un-governed PII (`name`,
+#: `employee_no`, `raw`) on a box in a corridor. 14 days is the diagnostic window the
+#: card fixes — long enough to answer "what did the terminal show last week" from the
+#: store and the exported bundle, short enough that a stolen SD card is not a year of
+#: punches. Deliberately a constant, not a config key (GC-P16a CHANGE 4): an operator who
+#: needs another window changes this one number and the test that pins it.
+DEFAULT_LOCAL_RETENTION_DAYS = 14
+
 
 class PushLedger:
     """Which events this site's poller has already pushed (or the owner discarded), on disk.
@@ -215,6 +226,25 @@ class PushLedger:
         # default blew up on the first legacy-line lookup (found by tests/test_p2_07b).
         out |= self._known.get((endpoint, None), set())
         return out
+
+    def sent_event_ids(self) -> set[int]:
+        """Every event this poller has recorded as `sent` or `gone`, across all sinks.
+
+        GC-P16a's side of the retention contract: the prune needs one fact — "has this
+        event left the building?" — and this is the only accessor that answers it for
+        EVERY (endpoint, sink) at once, where `known()` answers it for one pair. The
+        union is deliberately the widest set the poller has proof for, and `gone`
+        (the owner discarded it, so it will never be pushed) counts exactly as `sent`
+        does.
+
+        Ids and nothing else on purpose. The ledger line also carries the endpoint and
+        the sink name, and the store behind those ids carries the payload: the caller
+        deletes by id, so this is where the accessor stops. `agent_store.prune_pushed_events`
+        returns a count for the same reason — retention code must not become a second
+        route for PII to leave the store.
+        """
+        known = self._known if self._known is not None else self._load()
+        return {event_id for ids in known.values() for event_id in ids}
 
     def _bucket(self, endpoint: str, sink_name: str) -> set[int]:
         known = self._known if self._known is not None else self._load()
@@ -680,6 +710,13 @@ class SiteAgent:
         #: that is what distinguishes an outage from a quiet door.
         self._last_ok_at: dict[str, datetime] = self._last_ok_from_health()
         self._cycle_started = time.monotonic()
+        #: GC-P16a: the instant of the last retention pass, in THIS process. The prune is a
+        #: full-table statement, so the cadence that fits it is a day, not the 5-minute
+        #: tick (288 of them a day would buy no extra retention). Deliberately in memory and
+        #: not on disk: a restart re-prunes once, which is the harmless direction — keeping
+        #: PII one day longer than promised is the failure this card exists to remove, and
+        #: nothing is lost by running the statement twice.
+        self._last_prune_at: datetime | None = None
         #: GC-P10's flock handle (see `acquire_poller_lock`): None until `run()` takes it.
         #: `run()` releases in its `finally`; `close()` covers a caller that built the
         #: agent and never ran it.
@@ -777,6 +814,32 @@ class SiteAgent:
         # that knows both forms.
         if self.sinks:
             self._push(moment, report)
+        # GC-P16a: local retention, once a day. BC (Table 70607) owns the permanent
+        # record, so a row the push pass has just PROVEN delivered (`PushLedger`) and
+        # that has aged out of the diagnostic window is a local PII copy with no reason
+        # to live. The statement itself refuses anything unpushed, queued or
+        # dead-lettered — this is only the cadence and the window.
+        #
+        # The window is computed in UTC because the column it filters is UTC
+        # (`tz.py:334` writes `astimezone(UTC).isoformat()`), and the delete compares
+        # them as TEXT: an un-normalised `+02:00` cutoff would be a lexical comparison
+        # two or three hours off, silently aging every row by the site's offset.
+        #
+        # `_last_prune_at` is set BEFORE the call, so a failing statement (a write lock
+        # held by a CLI `deadletter delete`, say: `connect()` sets no busy_timeout)
+        # cannot retry-loop for the rest of the day. It DOES still propagate out of the
+        # tick, exactly as the card specifies — the fleet's policy for a housekeeping
+        # failure is not this card's to invent, and it is carded as a follow-up.
+        if self.ledger is not None and (
+            self._last_prune_at is None or (moment - self._last_prune_at) >= timedelta(days=1)
+        ):
+            self._last_prune_at = moment
+            cutoff = (moment - timedelta(days=DEFAULT_LOCAL_RETENTION_DAYS)).astimezone(UTC)
+            prune_pushed_events(
+                self.conn,
+                event_ids=self.ledger.sent_event_ids(),
+                before_utc=cutoff.isoformat(),
+            )
         report.parked = self.parked_keys()
         self._write_health()
         return report.build(moment)
