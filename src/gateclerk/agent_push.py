@@ -1091,6 +1091,8 @@ class HttpsIngestTransport:
         "_keychain",
         "_owns_client",
         "_token",
+        "_token_env",
+        "_token_keychain",
         "confirm_site",
         "site",
         "timeout",
@@ -1104,6 +1106,8 @@ class HttpsIngestTransport:
         token: str | Secret | None = None,
         env: Mapping[str, str] | None = None,
         keychain: Any = None,
+        token_env: str | None = None,
+        token_keychain: str | None = None,
         client: Any = None,
         confirm_site: bool = True,
         connect_timeout_s: float = DEFAULT_INGEST_CONNECT_TIMEOUT_S,
@@ -1119,6 +1123,12 @@ class HttpsIngestTransport:
         self.confirm_site = bool(confirm_site)
         self._env = env
         self._keychain = keychain
+        #: Token REF OVERRIDEs (names, never values) for a caller that authenticates as the
+        #: site but reads its bearer from somewhere else — the sink layer's `token_env` /
+        #: `token_keychain`. None keeps the site's own refs. Stored unresolved on purpose:
+        #: a REF costs nothing at construction, where a READ can raise (see `_resolve_token`).
+        self._token_env = token_env
+        self._token_keychain = token_keychain
         self._explicit = (
             Secret(token, label=f"flag:{self.site}") if isinstance(token, str) else token
         )
@@ -1226,6 +1236,10 @@ class HttpsIngestTransport:
           error column reads "install step", not "outage";
         * the resolution is cached, because every `security` call can raise a macOS ACL
           prompt and a drain must not re-ask per row.
+
+        `self._token_env` / `self._token_keychain` override WHICH REF each rung reads (the sink
+        layer's job — see `sink_writers.build_https_sink_transport`); the LADDER is unchanged
+        either way, so an override only redirects a rung, it never removes one.
         """
         if self._token is not None:
             return self._token
@@ -1240,8 +1254,8 @@ class HttpsIngestTransport:
                 # would silently route past the patch (a fake that is never called reads as
                 # a pass, which is the worst direction for a credential test to fail in).
                 keychain=self._keychain if self._keychain is not None else KeychainReader(),
-                env_var=ingest_token_env_var(self.site),
-                keychain_service=ingest_keychain_service(self.site),
+                env_var=self._token_env or ingest_token_env_var(self.site),
+                keychain_service=self._token_keychain or ingest_keychain_service(self.site),
             )
         except CredentialUnavailable as exc:
             # The resolver's own text already opens with "no ingest bearer token for site
@@ -1295,6 +1309,8 @@ def https_transport(
     token: str | Secret | None = None,
     env: Mapping[str, str] | None = None,
     keychain: Any = None,
+    token_env: str | None = None,
+    token_keychain: str | None = None,
     client: Any = None,
     confirm_site: bool = True,
     connect_timeout_s: float = DEFAULT_INGEST_CONNECT_TIMEOUT_S,
@@ -1306,12 +1322,19 @@ def https_transport(
     across this repo: a test that reads the real keychain or opens a real socket is not
     a test (conftest's netoff would kill the socket anyway). Production passes nothing
     but the site and gets flag>env>keychain resolution over `gateclerk-ingest-<site>`.
+
+    `token_env` / `token_keychain` redirect the env and platform-store RUNGS to a different
+    REF (names only, never values) while the site stays the authenticated identity — the
+    sink layer's `[[site.sink]]` block uses them so one site may deliver through two
+    sinks with two bearers. Nothing is read here: the ladder runs on the first send.
     """
     return HttpsIngestTransport(
         site,
         token=token,
         env=env,
         keychain=keychain,
+        token_env=token_env,
+        token_keychain=token_keychain,
         client=client,
         confirm_site=confirm_site,
         connect_timeout_s=connect_timeout_s,

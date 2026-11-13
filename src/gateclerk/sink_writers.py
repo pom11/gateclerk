@@ -517,6 +517,14 @@ def build_https_sink_transport(
     own rungs (`GATECLERK_INGEST_TOKEN_<SITE>` / `gateclerk-ingest-<site>`), which is why the
     implicit `legacy` sink needs no new keychain item at upgrade.
 
+    The refs are handed to the transport UNRESOLVED, which is the whole point: resolving them
+    here meant a `security` read at agent startup, and on a headless host (no `security`
+    binary) that read raises — the agent died before its first queue even though the same
+    token sat in `~/.config/gateclerk/credentials.json`. Resolution now happens on the first
+    send, inside `HttpsIngestTransport._resolve_token`, where every rung of the ladder —
+    flag, env, platform store, then the 0600 credential file — gets its turn and a missing
+    token surfaces as the install-step class instead of a startup crash.
+
     A sink's extra `headers` ride on the request through a thin wrapper rather than by editing
     the transport: the two headers the wire contract owns (`Authorization`,
     `X-GateClerk-Site`) stay the transport's, and `token_available` passes through so the
@@ -526,10 +534,12 @@ def build_https_sink_transport(
 
     base = https_transport(
         site,
-        token=_sink_token(site, spec, env=env, keychain=keychain),
+        token=None,
         env=env,
         keychain=keychain,
         client=client,
+        token_env=spec.token_env,
+        token_keychain=spec.token_keychain,
     )
     extra = dict(spec.headers or {})
     return base if not extra else _HeaderAppendingTransport(base, extra)
@@ -583,37 +593,3 @@ class _DelegatingClient:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
-
-
-def _sink_token(
-    site: str,
-    spec: SinkSpec,
-    *,
-    env: Mapping[str, str] | None,
-    keychain: Any,
-) -> Any:
-    """Resolve a sink's token REF to a `Secret`, or None for the transport's own rungs.
-
-    `token_env` outranks `token_keychain` (the p1-02 spirit: the cheaper, more explicit source
-    first), and an env var that exists but is empty is not a token — `Secret`'s own rule
-    treats a blank as absent, so the site rungs still get their turn. A keychain read that
-    fails raises `CredentialUnavailable` from `config`, which `HttpsIngestTransport` turns into
-    its ingest-specific message naming the service and the `security` command. No value is
-    ever printed here; the label names the SOURCE only.
-    """
-    from gateclerk.config import DeviceTarget, KeychainReader
-    from gateclerk.secrets import Secret
-
-    environ: Mapping[str, str] = os.environ if env is None else env
-    if spec.token_env:
-        value = environ.get(spec.token_env)
-        if value:
-            return Secret(value, label=f"env:{spec.token_env}")
-    if spec.token_keychain:
-        reader = keychain if keychain is not None else KeychainReader()
-        item = reader.read(
-            DeviceTarget(host=site, site=site, keychain_service=spec.token_keychain),
-            with_comment=False,
-        )
-        return item.password
-    return None
