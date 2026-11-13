@@ -61,10 +61,13 @@ from gateclerk.agent_db import connect
 from gateclerk.agent_push import Transport as PushTransport
 from gateclerk.agent_push import device_users_line
 from gateclerk.agent_store import (
+    PROBE_KIND_RESET,
     Checkpoint,
     CheckpointRegressionError,
     advance_checkpoint,
     read_checkpoint,
+    read_probe_window,
+    record_probe_window,
     reset_checkpoint,
     store_events,
 )
@@ -376,7 +379,16 @@ class DeviceLoop:
         #: Monotonic stamp of the last quiet-tick probe. The budget is the whole point:
         #: the extra page is one request per hour, never one per quiet tick (every
         #: request spends the ~190-use nonce budget, OBSERVED.md).
+        #:
+        #: GC-P15 follow-up: this is the CLOCK, not the memory. A fresh process used to
+        #: start with None here, so "at most one page per hour" was really "one page per
+        #: restart" — `agent_store.record_probe_window` now keeps the durable instant, and
+        #: `_seed_reset_probe_budget` spends it once here so the wall clock never gets a
+        #: second vote after that.
         self._last_reset_probe_at: float | None = None
+        #: The durable budget is read at most once per process (the first quiet tick that
+        #: could spend it), never per tick and never again after a probe has run.
+        self._reset_probe_budget_seeded = False
         #: The "below the checkpoint but no evidence" line is said ONCE per process, not
         #: once per probe hour: a permanently glitchy counter is not an hourly alarm.
         self._reset_probe_refused_warned = False
@@ -516,15 +528,13 @@ class DeviceLoop:
             # precisely the shape that hides a swap — the ring was wiped and the
             # replacement has produced only heartbeats, so the narrow `major=5` poll came
             # back NO MATCH and the per-chunk check above never ran. Ask the one deciding
-            # question directly, at most once an hour (the budget lives with the constant).
+            # question directly, at most once an hour (the budget lives with the constant,
+            # and since the follow-up card in `probe_audit` — see `_reset_probe_due`).
             if (
                 current is not None
                 and counts.records == 0
                 and reset is None
-                and (
-                    self._last_reset_probe_at is None
-                    or self._monotonic() - self._last_reset_probe_at >= RESET_PROBE_INTERVAL_S
-                )
+                and self._reset_probe_due()
             ):
                 self._last_reset_probe_at = self._monotonic()
                 newest, newest_time = self._probe_newest_serial(current)
@@ -1094,6 +1104,54 @@ class DeviceLoop:
             new_firmware=new_firmware,
         )
 
+    def _reset_probe_due(self) -> bool:
+        """Is the quiet tick's one extra page due? (GC-P15's budget, durable memory.)
+
+        Two halves on two deliberately different clocks:
+
+        * the durable row (`agent_store.probe_audit`), read ONCE per process on the first
+          quiet tick that could spend the page and converted into a monotonic deadline. A
+          process that restarts inherits the hour it did not spend instead of starting the
+          hour over — which is the whole point: an operator restarting a sick unit a few
+          times an hour used to buy it a few extra pages an hour (§2a nonce budget);
+        * the monotonic delta, which governs everything after that seed. The wall clock gets
+          exactly one vote and never unlocks a request on its own: a forward NTP correction,
+          an operator's `date -s` or a mislabelled stamp must not be able to buy a page, and
+          a backward one may only ever delay the probe.
+        """
+        if not self._reset_probe_budget_seeded:
+            self._seed_reset_probe_budget()
+        return (
+            self._last_reset_probe_at is None
+            or self._monotonic() - self._last_reset_probe_at >= RESET_PROBE_INTERVAL_S
+        )
+
+    def _seed_reset_probe_budget(self) -> None:
+        """Spend the hour a previous process already spent (once: see `_reset_probe_due`).
+
+        The stored instant is a wall-clock fact and the gate is a monotonic delta, so the
+        seed converts one into the other exactly once: `_last_reset_probe_at = now_mono -
+        elapsed`, the value at which the gate first reopens when the remaining hour is up.
+        A stored instant ahead of our clock (elapsed < 0) pushes that deadline out and can
+        only ever delay a probe — fail towards silence, never towards a request.
+        """
+        self._reset_probe_budget_seeded = True
+        if self._last_reset_probe_at is not None or self.device_serial is None:
+            return  # an in-memory budget already governs; a row may only fill a blank one
+        try:
+            audit = read_probe_window(self.conn, self.device_serial, kind=PROBE_KIND_RESET)
+            elapsed = None if audit is None else (self._now() - audit.probed_at).total_seconds()
+        except Exception as exc:  # an unreadable budget is the old behaviour: probe now
+            self._warn(
+                f"warning: the stored reset-probe budget could not be read "
+                f"({type(exc).__name__}); probing this quiet tick rather than trusting "
+                "nothing about the last hour"
+            )
+            return
+        if elapsed is None:
+            return  # this device has never completed a probe: the first one is simply due
+        self._last_reset_probe_at = self._monotonic() - elapsed
+
     def _probe_newest_serial(self, checkpoint: Checkpoint) -> tuple[int | None, str | None]:
         """One newest-first page over the retained window; no cursor walk (GC-P15).
 
@@ -1129,11 +1187,22 @@ class DeviceLoop:
         limits = self._limits or (
             paging_limits_from_caps(self._caps) if self._caps is not None else PagingLimits()
         )
+        upper = self._now()
+        asked = 0
+        reader = _search_reader(self.client)
+
+        def counting_reader(body: Mapping[str, Any]) -> dict[str, Any]:
+            # "What did this cost" is answered by the requests actually sent, not by a
+            # constant that would still say 1 on the day paging stops sending one.
+            nonlocal asked
+            asked += 1
+            return reader(body)
+
         try:
             for chunk in iter_event_windows(
-                _search_reader(self.client),
+                counting_reader,
                 since=lower,
-                until=self._now(),
+                until=upper,
                 chunk=timedelta(seconds=RESET_PROBE_WINDOW_S),
                 site_tz=self.site_tz,
                 device_offset_min=self._claim,
@@ -1146,13 +1215,52 @@ class DeviceLoop:
                 major=0,
                 time_reverse_order=True,
             ):
+                # GC-P15 follow-up: the answer is only useful if it outlives the tick.
+                # ONE call site, on the way out of the READ and before any decision branch:
+                # the chunk with no records — the NO MATCH this follow-up card exists to keep —
+                # leaves exactly the same trace as the chunk that proves a swap, because the
+                # same statement writes both. A read that dies reaches the `except` below and
+                # writes nothing: `record_probe_window` refuses to call a failed read a
+                # completed one. A window the checkpoint collapsed to zero width asks nothing
+                # (`chunk_window` yields no chunk when `since == until`), so it writes nothing
+                # either — the row means "a page was asked for over this window and came back",
+                # and a probe that sent no request cannot claim that.
+                self._record_reset_probe(lower, upper, asked)
                 return _newest_serial_by_time(chunk.records)
         except Exception as exc:  # the poll's own result stands; a probe is evidence only
             self._warn(
                 f"warning: quiet-tick reset probe failed ({type(exc).__name__}); no reset "
                 f"evidence this hour, checkpoint {checkpoint.checkpoint_serial} unmoved"
             )
+            return None, None
+        # Zero-width window: paging requested nothing, so there is no completed read to audit.
         return None, None
+
+    def _record_reset_probe(self, window_from: datetime, window_to: datetime, reads: int) -> None:
+        """Persist what this probe asked for and what it cost (`probe_audit`, one row).
+
+        Bend-not-break, on the store side too and for the same reason GC-P15 gives for the
+        read: the narrow poll's truth already stands, and losing the audit row must not turn
+        a quiet tick into a failed one. What is lost is said — a probe that silently stopped
+        recording is the exact failure mode this card exists to close, so an operator hears
+        about it on the same channel as every other probe problem.
+        """
+        if self.device_serial is None:  # pragma: no cover - tick() checks first
+            return
+        try:
+            record_probe_window(
+                self.conn,
+                self.device_serial,
+                kind=PROBE_KIND_RESET,
+                window_from=window_from,
+                window_to=window_to,
+                reads=reads,
+            )
+        except Exception as exc:
+            self._warn(
+                f"warning: quiet-tick probe could not record its window "
+                f"({type(exc).__name__}); the answer stands for this tick and nothing else"
+            )
 
     def _window(self) -> tuple[datetime, datetime]:
         """`[checkpoint_time - overlap_s, now]`, or the cold-start floor (module doc).

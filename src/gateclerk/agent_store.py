@@ -63,12 +63,15 @@ from typing import Any
 from gateclerk.model import RECORD_JSON_KEYS, EventRecord, event_keys, to_jsonl
 
 __all__ = [
+    "PROBE_KINDS",
+    "PROBE_KIND_RESET",
     "Checkpoint",
     "CheckpointAdvanced",
     "CheckpointNotCompletedError",
     "CheckpointRegressionError",
     "CheckpointReset",
     "MixedDeviceError",
+    "ProbeWindow",
     "StoreError",
     "StoreResult",
     "UnusableRecordError",
@@ -80,6 +83,8 @@ __all__ = [
     "event_rowid",
     "read_checkpoint",
     "read_oldest_serial",
+    "read_probe_window",
+    "record_probe_window",
     "reset_checkpoint",
     "store_events",
 ]
@@ -180,6 +185,21 @@ def _now_iso(now: datetime | None) -> str:
     if moment.tzinfo is None:
         raise ValueError("store timestamps must be tz-aware (payroll data; pyproject DTZ)")
     return moment.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def _from_iso(stamp: str) -> datetime:
+    """Read back a stamp `_now_iso` wrote — the only format this db's clock columns use.
+
+    The counterpart exists because `probe_audit`'s window pair is read by the loop's
+    budget, not just by an operator: parsing it here (instead of at each call site) keeps
+    one reader for one format, and a naive stamp — which nothing here writes — is refused
+    rather than compared against an aware `now` (that comparison would raise TypeError
+    inside a poll tick).
+    """
+    moment = datetime.fromisoformat(stamp)
+    if moment.tzinfo is None:
+        raise ValueError(f"stamp {stamp!r} is naive; every clock column here is UTC ISO")
+    return moment
 
 
 # --- the UPSERT ---------------------------------------------------------------------------
@@ -598,6 +618,156 @@ def read_checkpoint(conn: sqlite3.Connection, device_serial: str) -> Checkpoint 
         updated_at=row["updated_at"],
         serial_epoch=row["serial_epoch"],
         firmware=row["firmware"],
+    )
+
+
+# --- the probe audit trail (GC-P15 follow-up) ----------------------------------------------
+#
+# A quiet tick answers "was the terminal swapped?" with one newest-first AcsEvent page
+# (`agent_loop._probe_newest_serial`) and, before this section, threw the answer away: the
+# only durable trace of a probe was `reset_checkpoint`, which runs only when the probe
+# CONFIRMED a reset. These two functions are the store half of the missing answer — what
+# the probe ASKED (the window) and what it COST (the pages it sent) — written even when the
+# page came back NO MATCH, because "we looked and nothing moved" is exactly the state
+# P2-05's `check_stall` cannot otherwise distinguish from "we never looked".
+#
+# One row per (device, kind): the ring-floor read asks a different question and must never
+# satisfy this probe's budget (see `_PROBE_AUDIT_V8` in agent_db for the schema argument).
+
+#: The quiet-tick reset probe (`agent_loop.RESET_PROBE_INTERVAL_S` / `_probe_newest_serial`).
+PROBE_KIND_RESET = "reset"
+
+#: Every kind `record_probe_window` accepts. A kind nothing reads would fork a second
+#: budget line no operator can see, so a new kind must arrive together with its reader.
+PROBE_KINDS: frozenset[str] = frozenset({PROBE_KIND_RESET})
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeWindow:
+    """One device's last COMPLETED probe of one kind: what it asked, what it cost.
+
+    The stamps are the stored text (one format, `_now_iso`); `probed_at` is the parsed
+    instant the loop's budget is measured against.
+    """
+
+    device_serial: str
+    kind: str
+    window_from_utc: str
+    window_to_utc: str
+    reads: int
+
+    @property
+    def probed_at(self) -> datetime:
+        """When the probe ran — the upper bound it asked for (`_PROBE_AUDIT_V8`)."""
+        return _from_iso(self.window_to_utc)
+
+
+#: One UPSERT and nothing else: `reset_checkpoint`'s kill-safety argument applies verbatim
+#: here — the systemd unit can die between any two statements, so the row must land whole.
+_PROBE_UPSERT = """
+INSERT INTO probe_audit (
+    device_serial, kind, window_from_utc, window_to_utc, reads
+) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(device_serial, kind) DO UPDATE
+SET window_from_utc = excluded.window_from_utc,
+    window_to_utc = excluded.window_to_utc,
+    reads = excluded.reads
+RETURNING reads
+"""
+
+
+def record_probe_window(
+    conn: sqlite3.Connection,
+    device_serial: str,
+    *,
+    kind: str,
+    window_from: datetime,
+    window_to: datetime,
+    reads: int,
+) -> ProbeWindow:
+    """Record what one COMPLETED probe asked for and what it cost (one UPSERT).
+
+    Both window bounds go through `_now_iso`, so this column pair is the same UTC ISO
+    instant-format as every other clock column here; the caller passes the SAME instants it
+    put on the wire (relabeled for the device inside paging), not a re-derivation.
+
+    Refusals, all before any write, all loud:
+    * an unknown `kind` — a kind nothing reads is a forked budget (see `PROBE_KINDS`);
+    * `window_to < window_from` — an inverted window was never asked for; `chunk_window`
+      refuses to page one, so a row claiming it would be a stamp for a request that could
+      not have been sent (an equal pair is legal: paging yields no chunk and no request);
+    * a negative `reads`, or a naive bound (the db has no naive instants).
+
+    Deliberately NOT recorded: a probe whose read raised. A row here means "a page came
+    back over this window" (empty included); stamping a dead read as one of those would
+    make the failure indistinguishable from the clean answer the row exists to prove, and
+    the loop's own `warn` line is where a dead probe is reported.
+    """
+    if kind not in PROBE_KINDS:
+        raise ValueError(
+            f"unknown probe kind {kind!r}; this db records {sorted(PROBE_KINDS)} — a kind "
+            "nothing reads would keep a budget no operator can see, so add its reader first"
+        )
+    for name, bound in (("window_from", window_from), ("window_to", window_to)):
+        if bound.tzinfo is None:
+            raise ValueError(
+                f"probe {name} must be tz-aware (payroll data; pyproject DTZ) — a naive "
+                "bound has no place in a window the store is asked to remember"
+            )
+    if window_to < window_from:
+        raise ValueError(
+            f"probe window is inverted ({window_from.isoformat()} -> "
+            f"{window_to.isoformat()}): paging refuses to walk one, so no request "
+            "ever asked for it"
+        )
+    if reads < 0:
+        raise ValueError(f"probe reads {reads} is negative — a request count counts up")
+    lower = _now_iso(window_from)
+    upper = _now_iso(window_to)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_PROBE_UPSERT, (device_serial, kind, lower, upper, reads)).fetchone()
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return ProbeWindow(
+        device_serial=device_serial,
+        kind=kind,
+        window_from_utc=lower,
+        window_to_utc=upper,
+        reads=reads,
+    )
+
+
+def read_probe_window(
+    conn: sqlite3.Connection, device_serial: str, *, kind: str
+) -> ProbeWindow | None:
+    """The device's last recorded probe of `kind` (None = it has never completed one).
+
+    READ THE ROW FOR WHAT IT IS: one answer about ITS OWN WINDOW. `window_to_utc` is the
+    instant the read ran and `[window_from_utc, window_to_utc]` the range it covered, so the
+    question this row can answer is "what did the device hold, over that range, as of that
+    instant" — never "has the device been quiet ever since". A consumer that wants the
+    latter must compare `probed_at` with its own clock and treat the row as stale the moment
+    the window it describes ends; reading an old row as an all-time answer would page (or
+    stay silent) on evidence that has expired. P2-05's `check_stall` does not consult this
+    table yet — that wiring and its alert vocabulary are a separate decision.
+    """
+    row = conn.execute(
+        "SELECT device_serial, kind, window_from_utc, window_to_utc, reads"
+        " FROM probe_audit WHERE device_serial = ? AND kind = ?",
+        (device_serial, kind),
+    ).fetchone()
+    if row is None:
+        return None
+    return ProbeWindow(
+        device_serial=row["device_serial"],
+        kind=row["kind"],
+        window_from_utc=row["window_from_utc"],
+        window_to_utc=row["window_to_utc"],
+        reads=row["reads"],
     )
 
 
