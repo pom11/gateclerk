@@ -1,0 +1,58 @@
+# GC-P21 alert proof -- the three alert paths observed on the repo's own demo device.
+# No real terminal, no BC, no production store, no mail transport. Every value below is
+# the synthetic demo fixture (demo_device.DemoDevice, `Demo*` identities) answered over a
+# loopback listener inside this pytest process; the push transport in proof 1 is a fake.
+#
+# Produced by the GC-P21 worker on the integration branch at 25af206 (CPython 3.12.13,
+# pytest 9.1.1), from the repo root, with:
+#
+#   uv run --frozen pytest -q tests/test_gc_p21_alerts_proof.py -vv -rA --no-header \
+#     | tee docs/internal/go-live-finish/evidence/GC-P21-alerts.log
+#
+# Two documented additions to the command in the card body:
+#
+#   * `-rA` prints each passing test's captured stdout. Without it the log would be three
+#     PASSED lines and none of the observed values the card asks to be proven -- the
+#     `GC-P21 ... proof:` lines below are what the tests measured, not what they hoped.
+#   * `--no-header` drops pytest's banner, which names the developer's absolute checkout
+#     path. Nothing else in the output is edited: the sections below this header are the
+#     verbatim run output, including the run's own summary line.
+#
+# The card's step 4 says the demo clock reads 08:00 and expects `now = 2026-06-15T09:05+02:00`
+# to be about +3600 s off it. That arithmetic does not hold against the fixture: the demo box
+# answers System/time with localTime 2026-06-15T18:05:00+02:00 (demo_device.py's
+# _DEMO_LOCAL_TIME) and the site zone is Europe/Bucharest, which is +03:00 in June. So the
+# test DERIVES its clock from the live box's own answer -- one real GET through the
+# unmodified client, one hour behind it -- and the skew it then measures is exactly +3600 s.
+# The card's intent (a one-hour device clock, one warning) is what the proof pins.
+#
+# Proof 2 stops the demo listener and also drops the client's pooled keep-alive session,
+# because a dead box closes every socket it owned and `DemoDevice.stop()` only closes the
+# listener. The agent is left with no listener and no live session: every further request
+# opens a new connection and is refused, which is the failure shape `AlertPolicy` counts.
+#
+# This file is read back and pinned by tests/test_gc_p21_evidence.py, so a stale or edited
+# copy fails the GATE. Nothing here names a real device, tenant, host or credential.
+
+============================= test session starts ==============================
+collecting ... collected 3 items
+
+tests/test_gc_p21_alerts_proof.py::test_push_failure_keeps_the_row_and_reports_it PASSED [ 33%]
+tests/test_gc_p21_alerts_proof.py::test_offline_device_raises_checkpoint_stall PASSED [ 66%]
+tests/test_gc_p21_alerts_proof.py::test_clock_skew_on_the_demo_device_raises_clock_skew PASSED [100%]
+
+==================================== PASSES ====================================
+________________ test_push_failure_keeps_the_row_and_reports_it ________________
+----------------------------- Captured stdout call -----------------------------
+GC-P21 push proof: 503 -> push_failed=1 push_ok=0 dead_lettered=0 queue_rows=1 attempts=1 error_class=HttpStatus503
+_________________ test_offline_device_raises_checkpoint_stall __________________
+----------------------------- Captured stdout call -----------------------------
+GC-P21 stall proof: listener closed and session dropped, offline_failure=IsapiError, strikes=3 gap_s=903 alerts=['checkpoint_stall:critical'] checkpoint_serial=1046 unmoved=1
+_____________ test_clock_skew_on_the_demo_device_raises_clock_skew _____________
+----------------------------- Captured stdout call -----------------------------
+GC-P21 skew proof: device_wall=2026-06-15T18:05:00 our_wall=2026-06-15 17:05:00 skew_seconds=3600.0 warn=True threshold=120.0 alerts=['clock_skew']
+=========================== short test summary info ============================
+PASSED tests/test_gc_p21_alerts_proof.py::test_push_failure_keeps_the_row_and_reports_it
+PASSED tests/test_gc_p21_alerts_proof.py::test_offline_device_raises_checkpoint_stall
+PASSED tests/test_gc_p21_alerts_proof.py::test_clock_skew_on_the_demo_device_raises_clock_skew
+============================== 3 passed in 1.48s ===============================
