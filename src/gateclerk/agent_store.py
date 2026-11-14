@@ -654,6 +654,11 @@ PROBE_KIND_RESET = "reset"
 
 #: Every kind `record_probe_window` accepts. A kind nothing reads would fork a second
 #: budget line no operator can see, so a new kind must arrive together with its reader.
+#: The ring-floor read is deliberately NOT one (card t_bde31e68): it has no budget to
+#: remember — its gate, `agent_cli.SiteAgent._last_ok_at`, is already durable across
+#: restarts and moves on the tick that spends the page — and a five-column row carries no
+#: answer to the question that read asks. `tests/test_gc_p15_ring_floor_kind.py` refuses
+#: the name, so it cannot join the set by accident; adding it is a decision, not an edit.
 PROBE_KINDS: frozenset[str] = frozenset({PROBE_KIND_RESET})
 
 
@@ -803,8 +808,12 @@ def all_probe_windows(conn: sqlite3.Connection) -> tuple[ProbeWindow, ...]:
     discipline `dead_letter_rows` follows, so the CLI stays a renderer.
 
     Ordering is by `(device_serial, kind)`, the primary key: stable, and a device's two
-    kinds can never interleave confusingly. A device with no completed probe simply has no
-    row — see `probe_age_s` for why the ABSENCE of a row is not a fault.
+    kinds can never interleave confusingly. The clause is written out even though the PK
+    index already satisfies it — without an `ORDER BY` sqlite scans the table in rowid order
+    (`EXPLAIN QUERY PLAN`: the autoindex only enters the plan once ordering is asked for),
+    so the guarantee is the clause and not the index; dropping the clause is what
+    `tests/test_gc_p15_ring_floor_kind.py` goes red on. A device with no completed probe
+    simply has no row — see `probe_age_s` for why the ABSENCE of a row is not a fault.
     """
     rows = conn.execute(
         "SELECT device_serial, kind, window_from_utc, window_to_utc, reads"

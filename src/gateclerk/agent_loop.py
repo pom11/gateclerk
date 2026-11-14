@@ -624,6 +624,30 @@ class DeviceLoop:
         probe is "no evidence this incident", and the failing-poll arm still speaks.
         The caller decides when it is worth asking. A parked/skipped device is never
         asked because only an ok tick offers this callable.
+
+        Deliberately UNRECORDED — `probe_audit` keeps one kind and this read is not it
+        (card t_bde31e68; the decision is pinned by
+        `tests/test_gc_p15_ring_floor_kind.py`, which refuses the name). Both purposes a
+        durable floor could have served were checked against the code and both fail:
+
+        * it is not a budget. The gate that offers this read is
+          `agent_cli.SiteAgent._last_ok_at`, which is seeded across restarts by
+          `_last_ok_from_health` (health-snapshot mtime minus `last_poll_ok_age_s`) and is
+          advanced by the very ok tick that spends the page — so a restart cannot re-spend
+          it. There is no in-process cadence here to persist, unlike
+          `_last_reset_probe_at`, which IS a repeating hourly budget and is exactly why the
+          reset probe earned a row. An unreadable seed reads as "gap unknown" and spends
+          NOTHING, so the failure direction is a missed probe, never a second page;
+        * the row could not answer the question. `agent_store.ProbeWindow` is five columns
+          and carries no result (see `read_probe_window`'s reading rule), so a
+          `ring_floor` row would say "a page came back over this window, empty included"
+          while what this read exists to answer is "did the ring evict events we had not
+          read?". It would look like loss evidence and carry none — the all-time misreading
+          the reading rule exists to close, in a new costume.
+
+        The answer therefore lives only where it is true: compared against the PRE-tick
+        checkpoint the caller captured, on the tick that asked. `check_stall` must keep
+        asking the device; no stored row may stand in for this call.
         """
         if self.device_serial is None or self.conn is None:
             return None
