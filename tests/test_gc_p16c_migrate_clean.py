@@ -14,6 +14,9 @@ refuses to trade away are pinned separately:
                                  DIRECTORY and a stray FILE under `bundles/` both survive)
                                  `test_mtime_exactly_at_cutoff_is_kept` (the cutoff is
                                  strict, not inclusive)
+* a purge that would eat the only undo evidence says so, and still purges
+                                `test_a_run_with_no_undo_journal_is_unresolved`
+                                `test_unresolved_runs_are_still_deleted_and_exit_stays_0`
 
 The age model is the directory's own mtime, so the fixtures stamp mtimes with `os.utime`
 instead of sleeping or faking a clock: a TTL that could only be exercised through an
@@ -64,6 +67,21 @@ def _stamp(path: Path, *, age_days: float) -> Path:
     moment = (datetime.now(UTC) - timedelta(days=age_days)).timestamp()
     os.utime(path, (moment, moment))
     return path
+
+
+def _run(root: Path, name: str, *, journals: tuple[str, ...], age_days: float) -> Path:
+    """A `runs/<name>` dir as §5a lays it out: one file per journal, then aged.
+
+    `_dir` is not enough here because this card's question is about WHICH files a run dir
+    holds — a manifest-shaped fixture cannot distinguish a finished run from one that
+    stopped halfway. Files are written before the stamp for `_dir`'s reason: writing into
+    a directory bumps its mtime, and an aged-first fixture silently measures the stamp.
+    """
+    path = root / "runs" / name
+    path.mkdir(parents=True)
+    for file_name in journals:
+        (path / file_name).write_text('{"phase": "cards"}\n', encoding="utf-8")
+    return _stamp(path, age_days=age_days)
 
 
 def _cutoff(now: datetime | None = None) -> datetime:
@@ -288,3 +306,182 @@ def test_invalid_older_than_is_exit_2(tmp_path: Path, value: str) -> None:
     assert result.exit_code == 2, f"{value!r} exited {result.exit_code}: {result.output}"
     for key in ("old_bundle", "old_run"):
         assert made[key].is_dir(), f"{value!r} was refused but still deleted something"
+
+
+# --- unresolved runs: what a purge would take the undo of (GC-P16c follow-up) ----------------
+
+
+def test_journal_suffix_matches_the_journal_owner() -> None:
+    """The undo-journal check must spell the file name as the naming rule's owner does.
+
+    Same non-cycle argument as `test_bucket_names_match_the_root_layout_owner`: the rule is
+    `migrate_apply`'s (`JOURNAL_SUFFIX`) and `migrate_apply` imports `migrate_bundle`, so the
+    spelling is repeated and pinned equal instead of imported. The failure mode this guards
+    is the worst one available to a warning: a rename on the owner's side alone would make
+    every run dir look FINISHED, and every other test in this file would stay green.
+    """
+    from gateclerk import migrate_apply, migrate_bundle
+
+    assert migrate_bundle._JOURNAL_SUFFIX == migrate_apply.JOURNAL_SUFFIX
+    # Spelled-out side first: SIM300 reads a computed right-hand side as the Yoda form.
+    assert f".undo.{migrate_apply.JOURNAL_SUFFIX}" == migrate_bundle._UNDO_SUFFIX
+
+
+def test_a_run_with_no_undo_journal_is_unresolved(tmp_path: Path) -> None:
+    """`<phase>.jsonl` without `<phase>.undo.jsonl` is a write nothing has rolled back.
+
+    The phase here is spelled `apply` and is deliberately NOT one of `migrate_apply.PHASES`:
+    the check is mechanical about the naming rule rather than a list of phases someone
+    decided may lack an undo journal, and pinning it with a name outside that list is what
+    keeps the list from creeping back in.
+    """
+    root = tmp_path / "gateclerk"
+    half = _run(root, "run-half-done", journals=("apply.jsonl",), age_days=OLD_DAYS)
+
+    report = clean_artifacts(root, older_than=_cutoff())
+
+    assert report.runs == (half,), "it is still an artifact the purge lists"
+    assert report.unresolved_runs == (half,)
+    assert report.count == 1, "naming the loss must not change what is being deleted"
+
+
+def test_a_run_whose_undo_journal_exists_is_not_unresolved(tmp_path: Path) -> None:
+    """The same directory with BOTH files is a rolled-back run — purging it loses nothing."""
+    root = tmp_path / "gateclerk"
+    done = _run(root, "run-done", journals=("apply.jsonl", "apply.undo.jsonl"), age_days=OLD_DAYS)
+
+    report = clean_artifacts(root, older_than=_cutoff())
+
+    assert report.runs == (done,)
+    assert report.unresolved_runs == ()
+
+
+def test_any_phase_missing_its_undo_journal_makes_the_run_unresolved(tmp_path: Path) -> None:
+    """The rule is per journal, not "the first file decides".
+
+    One paired phase and one unpaired phase is exactly the shape of a run that stopped
+    between phases, which is the case the warning is for.
+    """
+    root = tmp_path / "gateclerk"
+    stalled = _run(
+        root,
+        "run-stalled",
+        journals=("cards.jsonl", "cards.undo.jsonl", "faces.jsonl"),
+        age_days=OLD_DAYS,
+    )
+
+    report = clean_artifacts(root, older_than=_cutoff())
+
+    assert report.unresolved_runs == (stalled,)
+
+
+def test_an_undo_journal_alone_is_not_an_unfinished_run(tmp_path: Path) -> None:
+    """An undo journal is the answer to a journal, not evidence of a write of its own."""
+    root = tmp_path / "gateclerk"
+    odd = _run(root, "run-odd", journals=("apply.undo.jsonl",), age_days=OLD_DAYS)
+
+    report = clean_artifacts(root, older_than=_cutoff())
+
+    assert report.runs == (odd,)
+    assert report.unresolved_runs == ()
+
+
+def test_an_unfinished_run_that_is_not_aged_is_not_named(tmp_path: Path) -> None:
+    """`unresolved_runs` is a view of what the purge LISTS, not a watchdog over every run.
+
+    A run in flight has no undo journal yet. Naming it would be wrong twice — it is not
+    being deleted, and it is not unfinished.
+    """
+    root = tmp_path / "gateclerk"
+    live = _run(root, "run-live", journals=("apply.jsonl",), age_days=0)
+
+    report = clean_artifacts(root, older_than=_cutoff(), apply=True)
+
+    assert report.runs == ()
+    assert report.unresolved_runs == ()
+    assert live.is_dir()
+
+
+def test_the_apply_report_still_names_what_it_destroyed(tmp_path: Path) -> None:
+    """The check runs BEFORE the delete, so an `--apply` pass is not an all-clear.
+
+    Asked afterwards it would glob a directory it had just removed and report every run as
+    resolved — the silent all-clear, in the one pass where the loss actually happened.
+    """
+    root = tmp_path / "gateclerk"
+    half = _run(root, "run-half-done", journals=("apply.jsonl",), age_days=OLD_DAYS)
+
+    report = clean_artifacts(root, older_than=_cutoff(), apply=True)
+
+    assert not half.exists()
+    assert report.unresolved_runs == (half,), "the destroyed run must still be named"
+
+
+def test_unresolved_runs_are_still_deleted_and_exit_stays_0(tmp_path: Path) -> None:
+    """The warning is not a gate: `--apply` deletes it and the exit code does not move.
+
+    The card refuses a refusal, a new flag and a new exit code. A later change that turns
+    this line into a block passes every other test here and fails this one.
+    """
+    root = tmp_path / "gateclerk"
+    half = _run(root, "run-half-done", journals=("apply.jsonl",), age_days=OLD_DAYS)
+
+    result = runner.invoke(app, ["migrate", "clean", "--bundles-root", str(root), "--apply"])
+
+    assert result.exit_code == 0, result.output
+    assert "deleted 1 artifact(s)" in result.output
+    assert not half.exists(), "a warning that stopped the purge would be a policy, not a report"
+
+
+def test_dry_run_table_names_the_unresolved_run(tmp_path: Path) -> None:
+    """The dry-run report says which dirs hold the only thing `migrate undo` can replay."""
+    root = tmp_path / "gateclerk"
+    half = _run(root, "run-half-done", journals=("apply.jsonl",), age_days=OLD_DAYS)
+
+    result = runner.invoke(app, ["migrate", "clean", "--bundles-root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    (line,) = [ln for ln in result.output.splitlines() if "undo" in ln]
+    assert "1 of those run dirs" in line, line
+    assert str(half) in line, "the line names the directory, not just a count"
+    assert "only thing `migrate undo` can replay" in line, line
+    assert half.is_dir(), "a dry run is still a dry run"
+
+
+def test_dry_run_table_adds_no_warning_when_nothing_is_unresolved(tmp_path: Path) -> None:
+    """The trailing line is conditional, so the ordinary case stays the ordinary report."""
+    root = tmp_path / "gateclerk"
+    _layout(root)
+
+    result = runner.invoke(app, ["migrate", "clean", "--bundles-root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "would delete 2 artifact(s)" in result.output
+    assert "warning" not in result.output
+
+
+def test_json_payload_carries_the_unresolved_key(tmp_path: Path) -> None:
+    """The same fact in the machine-readable report, as a list of the same paths."""
+    root = tmp_path / "gateclerk"
+    half = _run(root, "run-half-done", journals=("apply.jsonl",), age_days=OLD_DAYS)
+    _run(root, "run-done", journals=("faces.jsonl", "faces.undo.jsonl"), age_days=OLD_DAYS)
+
+    result = runner.invoke(app, ["migrate", "clean", "--bundles-root", str(root), "-o", "json"])
+
+    assert result.exit_code == 0, result.output
+    (payload,) = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert payload["unresolved_runs"] == [str(half)]
+    assert payload["count"] == 2
+    assert len(payload["runs"]) == 2, "the key is a subset of runs, not a third bucket"
+
+
+def test_json_payload_carries_the_key_when_nothing_is_unresolved(tmp_path: Path) -> None:
+    """The key is part of the schema, not a conditional field a consumer has to guess at."""
+    root = tmp_path / "gateclerk"
+    _layout(root)
+
+    result = runner.invoke(app, ["migrate", "clean", "--bundles-root", str(root), "-o", "json"])
+
+    assert result.exit_code == 0, result.output
+    (payload,) = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert payload["unresolved_runs"] == []

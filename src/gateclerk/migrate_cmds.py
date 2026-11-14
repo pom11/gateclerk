@@ -552,6 +552,11 @@ def migrate_clean(
     ``runs/`` — and one is not: ``probes/`` stays put, because the probe cache is what lets
     ``diff`` and ``apply`` read at all (§3), not a copy of anyone's enrollment.
 
+    A run dir whose phase journal has no matching ``<phase>.undo.jsonl`` is named as
+    unresolved, because that journal is the only thing ``migrate undo`` can replay and
+    deleting it ends the chance to roll the run back — a purge that ages one out is a
+    decision, not housekeeping. The report says which ones; it does not refuse them.
+
     The default is the report. Nothing is removed until the operator has read it and passed
     ``--apply``, which is the same review gate ``apply`` runs on (§4). Exit: 0 (an empty
     inventory is a healthy site, not a broken one), 2 for an unreadable ``--older-than``.
@@ -576,12 +581,25 @@ def migrate_clean(
         "apply": report.apply,
         "bundles": [str(p) for p in report.bundles],
         "runs": [str(p) for p in report.runs],
+        "unresolved_runs": [str(p) for p in report.unresolved_runs],
         "count": report.count,
     }
     if fmt is OutputFormat.TABLE:
         typer.echo(f"{'deleted' if report.apply else 'would delete'} {report.count} artifact(s)")
         for path in (*report.bundles, *report.runs):
             typer.echo(str(path))
+        if report.unresolved_runs:
+            # One line, naming the count AND the dirs, and stating the loss rather than
+            # the rule: the paths are already listed above, and a reader who skipped them
+            # is exactly the reader this line is for. It is the same fact in both output
+            # formats — the JSON carries it as a key, this carries it as a sentence.
+            typer.echo(
+                f"warning: {len(report.unresolved_runs)} of those run dirs "
+                f"({', '.join(str(p) for p in report.unresolved_runs)}) hold a phase "
+                "journal with no matching undo journal — that journal is the only thing "
+                "`migrate undo` can replay, so this purge takes away the chance to undo "
+                "the run. Deleting them is a decision, not housekeeping."
+            )
         return
     render([payload], fmt=fmt.value)
 
