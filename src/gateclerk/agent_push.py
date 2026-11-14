@@ -128,7 +128,9 @@ DEFAULT_PUSH_BACKOFF_CAP_S = DEFAULT_BUSY_BACKOFF_CAP
 
 #: Rows one `drain` will attempt. A drain is one tick of the agent loop; an unbounded
 #: drain of a week-old backlog would run past the next poll (and past the nonce budget).
-#: The rest of the backlog is still queued, due, on the next tick.
+#: The rest of the backlog is still queued, due, on the next tick. The limit bounds a
+#: PASS, not a request: every row inside it still gets its own POST, and `GC-07` in the
+#: 2026-11-13 audit records why a pass is deliberately not one multi-line POST.
 DEFAULT_PUSH_BATCH_LIMIT = 200
 
 #: The synthetic error class for "the ingest answered a non-2xx status" (§2b wants an
@@ -493,8 +495,12 @@ def drain(
 
     Each row is its own transaction and its own transport call, so one poison row cannot
     wedge the rows behind it (the spec's "keep retrying the queue" only means something
-    if a failure is not allowed to stop the drain). Success DELETEs the queue row and any
-    dead-letter row for the same key — the store keeps the event either way.
+    if a failure is not allowed to stop the drain). One call per row is also what keeps the
+    ACK unit per row: the ingest answers a multi-line body with ONE status for the whole
+    body and a 200 that carries only aggregate counts, so a batched send would make every
+    row in the pass inherit the failure of its worst row (`GC-07`, decided 2026-11-14; the
+    receiver-side shape is in `HttpsIngestTransport`'s docstring). Success DELETEs the queue
+    row and any dead-letter row for the same key — the store keeps the event either way.
 
     What a failure COSTS depends on what the failure was: a permanent payload rejection
     (`PERMANENT_REJECT_STATUSES` — 400, 422) dead-letters on the FIRST failure because a line
@@ -1092,6 +1098,24 @@ class HttpsIngestTransport:
     drain already treats any exception as one failed row. Deliberately NOT wrapped into
     a private exception class: the class name (`ConnectError` vs `ReadTimeout`) is the
     operator's diagnostic, and §2b's error-class column reads it verbatim.
+
+    ONE POST PER ROW IS A DECIDED SHAPE, not an oversight (audit 2026-11-13 `GC-07`, decided
+    2026-11-14). The ingest does accept a multi-line JSONL body — `functions/main.py` caps
+    one at 5000 lines and its own comment notes this drain's 200-row cap — but it answers
+    such a body with a SINGLE status for the whole body: one unparseable line is a `400` for
+    all of it (`functions/main.py:7965`), one device serial unknown to this site is a `422`
+    for all of it (`functions/main.py:8078`), a Business Central failure is a `502` for all
+    of it (`functions/main.py:8062,8118`), and the `200` carries only aggregate counts
+    (`accepted`/`inserted`/`replayed`/`skipped`/`upserted`) — never which line it refused.
+    Because `PERMANENT_REJECT_STATUSES` dead-letters a `400`/`422` on the FIRST failure, one
+    unregistered terminal would then dead-letter a whole pass (up to
+    `DEFAULT_PUSH_BATCH_LIMIT` rows, which the CLI can only list and remove — replay has no
+    verb), a worse failure than the one the batching idea answered. So the row is the ack
+    unit and the retry unit here, and the ledger + `prune_pushed_events` + the non-punch
+    report all key on per-event ids. The roster is this design's own precedent for batching
+    INSIDE one record instead: `device_users_line` puts every user of the site in ONE line
+    and sends ONE POST. Making the transport batch would need a per-line verdict in the
+    receiver's `200` body first — a contract decision in that repository, not in this one.
 
     The token lives only in `_token: Secret` — the holder whose repr/str are `***`.
     `repr(self)` prints the Secret wrapper, never a value; the label names the SOURCE
