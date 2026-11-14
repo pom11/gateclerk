@@ -101,6 +101,7 @@ Every read command accepts `-o table` (default human view) or `-o json` / `-o js
 | `gateclerk sink list\|add\|remove\|test` | Inspect, edit, or probe per-site delivery sinks (`https`, `csv`, `jsonl`) and the `mnotify` alert route |
 | `gateclerk export config` | Export sanitized site/device inventory to CSV or JSONL (allowlist columns, ref names only, `dropped_keys` audit) |
 | `gateclerk export scans` | Stream stored scans from the local SQLite database to CSV or JSONL (`--redact` strips personal identifiers) |
+| `gateclerk export non-punches` | Read-only CSV or JSONL list of the fingerprints of scans already pushed to the ingest that were not granted punches (one `fingerprint` column, no personal data; the store is never written) |
 | `gateclerk service install\|uninstall\|logs` | Render `launchd` plist (macOS) or `systemd` unit (Linux) and print load/unload/log commands (never auto-loads) |
 | `gateclerk agent run \| ack \| deadletter list\|remove` | Run the poll+drain loop, clear a 401 device park after fixing credentials, or inspect/remove dead-letter rows |
 | `gateclerk migrate probe\|export\|diff\|apply\|undo` | Terminal-to-terminal user/card/face enrollment migration pipeline |

@@ -125,6 +125,7 @@ EXPECTED_LEAVES: set[str] = {
     "doctor",
     "events",
     "export config",
+    "export non-punches",
     "export scans",
     "init",
     "migrate apply",
@@ -174,10 +175,10 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 38 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
-    # `users import` / `users template`; +1 for GC-P15 follow-up 2's `agent probe list`;
-    # +1 for GC-P16c's `migrate clean`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 38
+    # 39 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
+    # `users import` / `users template`; +1 for GC-P15 follow-up 2's `agent probe list`; +1
+    # for GC-P16c's `migrate clean`; +1 for GC-P20's `export non-punches`.
+    assert len(leaves) == len(EXPECTED_LEAVES) == 39
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
@@ -247,6 +248,9 @@ READ_ONLY_LEAVES: tuple[tuple[str, ...], ...] = (
     # GC-P15 follow-up 2: `agent probe list` reads `probe_audit` and writes nothing, so it
     # belongs to the read half the sweep covers (and its help must not advertise a write).
     ("agent", "probe", "list"),
+    # GC-P20: `export non-punches` is read-only by construction (the store is opened
+    # `mode=ro`), so its help has no business naming a write verb.
+    ("export", "non-punches"),
     ("demo", "device", "urls"),
 )
 

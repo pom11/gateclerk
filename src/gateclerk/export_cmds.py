@@ -1,4 +1,5 @@
-"""The `gateclerk export` group: inventory and scan exports (EXPORT-CONFIG / EXPORT-SCANS).
+"""The `gateclerk export` group: inventory, scan and non-punch-fingerprint exports
+(EXPORT-CONFIG / EXPORT-SCANS / GC-P20).
 
 One-way import law (`tests/test_cli_structure.py`): `gateclerk.cli` imports this module and
 calls `export_cmds.register(app)`; this module imports `gateclerk.cli_shared` and
@@ -211,6 +212,38 @@ def export_scans(
         )
     except (ConfigError, TimestampInputError, EventBoundsError) as exc:
         raise _fail(err_fmt, exc) from exc
+
+    if stderr_msg:
+        sys.stderr.write(stderr_msg + "\n")
+
+
+@export_app.command("non-punches")
+def export_non_punches(
+    config: ExportConfigFileOpt = cfg.DEFAULT_SITES_FILE,
+    site: ExportSiteOpt = None,
+    state_root: ExportStateRootOpt = None,
+    fmt: ExportFormatOpt = "csv",
+    output: ExportOutputOpt = None,
+) -> None:
+    """Read-only fingerprint list of pushed events that were not granted punches.
+
+    The repair input BC-P30 needs: which scans this site's poller already handed to BC that
+    were never granted punches, so they can be marked ignored and the timesheets recalculated.
+    One `fingerprint` column and nothing else — no employee number, name, card number or raw
+    payload — so the file is safe to hand across the boundary. The list comes from the local
+    store and the poller's own ledger; the store, the ledger and BC are never written.
+    """
+    effective_fmt, effective_output, err_fmt = _resolve_fmt_and_output(fmt, output)
+    try:
+        _count, stderr_msg = export_cli.export_non_punch_fingerprints(
+            config_path=config,
+            site=site,
+            state_root=state_root,
+            fmt=effective_fmt,
+            output_path=effective_output,
+        )
+    except ConfigError as exc:
+        raise _config_exit(err_fmt, str(exc)) from exc
 
     if stderr_msg:
         sys.stderr.write(stderr_msg + "\n")

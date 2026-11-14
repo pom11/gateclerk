@@ -74,3 +74,48 @@ Fixed allowlist order:
 `page_delay_ms`, `cadence_s`, `overlap_s`, `push_dead_letter_after_s`,
 `device_cred_keychain_service`, `device_cred_env_var`, `device_cred_ref`,
 `push_target`, `ingest_token_keychain_service`, `ingest_token_env_var`, `sinks`.
+
+---
+
+## 3. `gateclerk export non-punches` (`NON_PUNCH_EXPORT_COLUMNS` — 1 column)
+
+The fingerprints of the scans this site's poller already handed to the ingest that were **not**
+granted punches — a repair input for the ingest, not a second record of attendance. Which
+fingerprints appear is decided by exactly two inputs: the poller's own push ledger and the
+punch rule, negated.
+
+- **The one column:** `fingerprint`, holding `events.fingerprint_hash` **verbatim**. It is the
+  ingest's dedupe key, so it is deliberately not hashed a second time — a second hash would
+  join to nothing on the receiving side. Same value, byte for byte, or the join it exists for
+  breaks.
+- **Only what was pushed:** an event is considered only if the poller recorded it as sent in its
+  own `push-ledger.jsonl` (the ledger file beside the store), read through
+  `PushLedger.sent_event_ids` across every endpoint and sink; a `gone` line counts as pushed
+  exactly as a `sent` line does. An event the ledger does not name is not in the report — it is
+  not known to have left the building.
+- **A missing ledger is an empty report, not an error:** zero rows, a note on `stderr`, exit `0`.
+  Nothing is known to be pushed, and guessing is not this command's job.
+- **What is excluded:** a granted punch candidate — `major = 5`, `outcome = 'granted'`,
+  `unknown_code = 0`, a non-empty `employee_no`, and a `verify_mode` that is not one of the
+  non-authentication modes. Every arm must hold for a row to count as a punch.
+- **What is included:** denied, informational, unknown-code, unattributed (empty `employee_no`)
+  and non-auth-verify-mode rows. A row whose verdict columns are `NULL` is included as well:
+  `NULL` is not provably a punch, so it belongs on the list.
+- **Deduplication:** `DISTINCT` — one line per fingerprint, ordered by fingerprint. The same
+  scan read twice on two serial numbers produces one line.
+- **Identity-free by design:** no employee number, name, card number or raw payload appears
+  anywhere in the output, so the file is safe to hand across the boundary. There is
+  deliberately no `--employee` filter: the report names scans, never people.
+- **Read-only:** the store is opened SQLite read-only (`mode=ro`), so writing it is impossible
+  rather than merely unintended; the ledger is never written and the ingest is never contacted.
+  A missing store or an unusable `--format` exits `2`, like the other exports.
+- **Output:** on an interactive TTY, `--output <path>` (`-o <path>`) is required (the same rule
+  as the other exports — a repair input meant for another system belongs in a file, and this
+  command never invents a path). Piping stdout is fine. `--format jsonl` writes one
+  `{"fingerprint": "..."}` object per line.
+
+### Column order (`NON_PUNCH_EXPORT_COLUMNS` — 1 column)
+
+| # | Column | Source / Meaning |
+|---|--------|------------------|
+| 1 | `fingerprint` | `events.fingerprint_hash` verbatim — the ingest's dedupe key |
