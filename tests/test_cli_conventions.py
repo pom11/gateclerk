@@ -109,6 +109,7 @@ EXPECTED_LEAVES: set[str] = {
     "agent ack",
     "agent deadletter list",
     "agent deadletter remove",
+    "agent deadletter replay",
     "agent probe list",
     "agent run",
     "creds explain",
@@ -175,10 +176,12 @@ def test_every_leaf_command_declares_output_json() -> None:
     leaves = _leaves()
     names = {" ".join(p) for p in leaves}
     assert names == EXPECTED_LEAVES, f"surface changed: {names ^ EXPECTED_LEAVES}"
-    # 39 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
+    # 40 = 33 after SERVICE-CMD, plus CLI-DOCTOR's `doctor`; +2 for USERS-IMPORT-XLSX's
     # `users import` / `users template`; +1 for GC-P15 follow-up 2's `agent probe list`; +1
-    # for GC-P16c's `migrate clean`; +1 for GC-P20's `export non-punches`.
-    assert len(leaves) == len(EXPECTED_LEAVES) == 39
+    # for GC-P16c's `migrate clean`; +1 for GC-P20's `export non-punches`; +1 for the GC-07
+    # follow-up's `agent deadletter replay` (the write verb that makes a dead letter
+    # recoverable without hand-editing SQLite).
+    assert len(leaves) == len(EXPECTED_LEAVES) == 40
     exempt = {p for p in names if p in NO_OUTPUT_FLAG_LEAVES}
     assert exempt == set(NO_OUTPUT_FLAG_LEAVES), (
         f"exemption list is stale: {exempt ^ set(NO_OUTPUT_FLAG_LEAVES)}"
@@ -230,8 +233,10 @@ def test_demo_device_urls_json_is_pii_safe() -> None:
 #: later card is swept too without editing that file (whose argv list is itself a pin).
 #:
 #: Deliberately EXCLUDED: the write-class commands (`agent deadletter remove`,
-#: `sink add|remove`, `migrate apply|undo`) — their help must say what they do, and a sweep
-#: that forced them to hide it would be worse than no sweep.
+#: `agent deadletter replay`, `sink add|remove`, `migrate apply|undo`) — their help must say
+#: what they do, and a sweep that forced them to hide it would be worse than no sweep.
+#: `replay` is excluded on the same judgement as `remove`: it re-queues a row (a write to
+#: `push_queue`), and its help says so in the words an operator needs.
 READ_ONLY_LEAVES: tuple[tuple[str, ...], ...] = (
     ("device", "info"),
     ("device", "time"),

@@ -58,6 +58,14 @@ shadow a command and a typo still exits 2.
    no object to remove: what it may touch (two directories under the private root, and
    never `probes/`) is the whole safety property, and that is stated in the command, not in
    a vocabulary word.
+   `agent deadletter replay` (GC-07 follow-up) is the same exception in a shorter form: it is
+   the third act of §2b's dead-letter triage — `list` finds a row, `replay` re-queues it,
+   `remove` gives up on it — and `replay` is §2b's own word for the act: that section says
+   "Replay = re-push existing rows; UPSERT makes it safe", and the function the command routes
+   to is `agent_push.replay_dead_letter`. It is deliberately NOT a row in the table above: it
+   creates no record, so it is not `add`, and the group already owns `remove`. Listing it there
+   would advertise a generic verb that `cli_conventions.VERBS` does not declare — the
+   disagreement this page's own header says makes the page the bug.
 
 `remove` is canonical over `delete` for a reason beyond taste: this connector must
 never grow a write surface, and that rule is enforced by a test that forbids the word

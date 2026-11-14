@@ -317,6 +317,81 @@ def deadletter_remove(
     render([{"id": id_, "removed": True}], fmt=output.value, columns=("id", "removed"))
 
 
+@deadletter_app.command("replay")
+def deadletter_replay(
+    id_: Annotated[int, typer.Argument(help="dead_letter row id (from `agent deadletter list`).")],
+    site: AgentSiteOpt,
+    config: AgentConfigOpt = None,
+    state_root: AgentStateRootOpt = None,
+    endpoint: Annotated[
+        str | None,
+        typer.Option(
+            "--endpoint",
+            help="Ref to replay INTO. Omit for the ref this row failed against (§2b).",
+        ),
+    ] = None,
+    output: OutputOpt = OutputFormat.TABLE,
+) -> None:
+    """Re-queue ONE dead-letter row for another push — the recovery path after an outage.
+
+    This is the write half of dead-letter triage: `list` finds the row, `remove` gives up on
+    it, `replay` sends it again. Without it a dead-lettered punch has no operator route back
+    into the queue except editing SQLite by hand, and GC-P08 made rows reachable here on the
+    FIRST refusal (the ingest answers a bad row with 400/422, and there is no second try).
+
+    SAFE TO REPEAT. The queue keys on (event_id, sink_name), so replaying the same row twice
+    leaves ONE queued row, not two, and re-running a command you lost the terminal on cannot
+    double-send a punch. The retry state carries over rather than resetting: attempts continue
+    and the outage clock keeps running from the row's own `first_attempt_at`, so replaying
+    into an ingest that is still down dead-letters again promptly instead of buying the row a
+    fresh 24 hours.
+
+    The dead-letter row STAYS until a push of that key succeeds — an unaccepted replay is not
+    evidence to discard a payload by, and the payload is the only copy of that punch. Reach
+    for `remove` only for a row you have decided never to send.
+
+    `--endpoint` is for the one thing the row cannot answer for itself: the ingest moved, so
+    the ref recorded in the row is no longer where the data goes. It is checked exactly like a
+    configured push target (§3 — an https or owner-authorized stub ref, never invented), so a
+    ref that is not one exits 2 and nothing is queued.
+
+    EXIT 2 when no dead-letter row has that id: a typo is not a healthy site, and nothing was
+    queued. Same code for a state dir with no store — that agent has never run here.
+    """
+    from gateclerk import agent_cli, agent_push
+
+    target = _agent_site(site, config, output=output)
+    db_path = agent_cli.resolve_db_path(target, state_root)
+    if not Path(db_path).exists():
+        # The `ack` precedent: a missing store is an answer, not a traceback (sqlite opening
+        # a directory would be neither). No store = this site's agent never ran = no row.
+        raise _config_exit(
+            output,
+            f"no store at {db_path} for site {target.name!r}: nothing to replay "
+            "(has `gateclerk agent run` ever run for this site?)",
+        )
+    try:
+        conn = agent_cli.connect(db_path)
+    except (ConfigError, OSError) as exc:
+        raise _config_exit(output, str(exc)) from exc
+    try:
+        # The reader's own clock, so a replay's stamps land in the same time universe as the
+        # `agent run` that will drain it (and a test can pin them without a wall clock).
+        queued = agent_push.replay_dead_letter(conn, id_, endpoint=endpoint, now=agent_cli._now())
+    except agent_push.DeadLetterMissingError as exc:
+        # The store's own words are the answer; the command the operator can actually type is
+        # appended, because the library's message names a library accessor, not a CLI.
+        raise _config_exit(
+            output,
+            f"{exc} List this site's rows with `gateclerk agent deadletter list "
+            f"--site {target.name}`.",
+        ) from exc
+    except agent_push.PushTargetError as exc:
+        # A refused `--endpoint` is bad input from this command line, not a pusher fault.
+        raise _config_exit(output, str(exc)) from exc
+    render([{"id": id_, "queued": queued}], fmt=output.value, columns=("id", "queued"))
+
+
 @probe_app.command("list")
 def probe_list(
     site: AgentSiteOpt,

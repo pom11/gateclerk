@@ -842,7 +842,7 @@ def replay_dead_letter(
     if row is None:
         raise DeadLetterMissingError(
             f"no dead_letter row with id {dead_letter_id}: nothing to replay. List them "
-            "with `dead_letter_rows` (P2-07's `gateclerk dead-letter list`)."
+            "with `dead_letter_rows` (P2-07's operator verb `gateclerk agent deadletter list`)."
         )
     target = row["endpoint"] if endpoint is None else endpoint
     sink = row["sink_name"] if sink_name is None else sink_name

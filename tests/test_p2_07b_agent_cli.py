@@ -38,7 +38,7 @@ scanned for both).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -914,6 +914,179 @@ def test_deadletter_delete_needs_the_explicit_id_and_removes_exactly_one_row(
     )
     assert code2 == 0, out2
     assert agent_push.dead_letter_depth(h.conn()) == 0
+
+
+# --- DoD (3b): `deadletter replay` — the write half of the triage (GC-07 follow-up) ----------
+#
+# `replay_dead_letter` has been library-only since P2-04 shipped it, and GC-P08 made rows
+# land here on the FIRST ingest refusal (400/422, no second try). These tests pin the CLI
+# route, not the function: the function's own behaviour stays pinned in
+# `tests/test_p2_04_pusher.py`. What is at issue here is what the OPERATOR can lose.
+
+
+def test_deadletter_replay_requeues_the_row_and_a_second_replay_adds_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§2b's "Replay = re-push existing rows; UPSERT makes it safe", from the CLI side.
+
+    Three things an operator can actually lose, so three things the store is read for rather
+    than the printed line: the payload must be the SAME line the outage kept, the dead-letter
+    row must survive until the ingest ACCEPTS the replay, and typing the command twice must
+    not queue the punch twice (the UPSERT is what makes a re-run safe rather than dangerous).
+    """
+    device = seeded_device()
+    device.add_events(*punch_events(T0, -300))
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None)
+    dead_id = h.seed_dead_letter()
+
+    code, out = h.cli(
+        ["deadletter", "replay", str(dead_id), "--site", SITE, "--state-root", str(h.state_root)]
+    )
+    assert code == 0, out
+    conn = h.conn()
+    queued = conn.execute("SELECT * FROM push_queue").fetchall()
+    assert len(queued) == 1, f"one dead row in, one queued row out: {len(queued)}"
+    dead = conn.execute("SELECT * FROM dead_letter WHERE id = ?", (dead_id,)).fetchone()
+    assert dead is not None, (
+        "a replay the ingest has not accepted is not evidence to discard the payload by"
+    )
+    row = queued[0]
+    assert row["payload"] == dead["payload"], "the same JSONL line the outage kept"
+    assert row["endpoint"] == DEAD_TARGET, "the default target is the ref the row failed against"
+    # The stamp comes from the AGENT's clock, not from the wall: `agent_cli._now` is the same
+    # freeze seam `agent run` threads, so a replayed row and the run that drains it are in one
+    # time universe — which is what lets an ops smoke test reason about `next_attempt_at`.
+    assert row["enqueued_at"] == h.now.astimezone(UTC).isoformat(timespec="seconds"), (
+        f"the queue was stamped by a clock this test did not set: {row['enqueued_at']}"
+    )
+    # The retry state carries over rather than resetting: a replay into an ingest that is
+    # still down must dead-letter again promptly, not buy the row a fresh 24 hours.
+    assert row["attempts"] == dead["attempts"], "a replay buys no new retry budget"
+    assert row["first_failed_at"] == dead["first_attempt_at"], (
+        "the outage clock runs from the ORIGINAL failure"
+    )
+    first_queue_id = row["id"]
+    conn.close()
+
+    # The operator lost the terminal and typed the same command again — the case §2b's
+    # "UPSERT makes it safe" is about, and the one a plain INSERT would get wrong.
+    code2, _ = h.cli(
+        ["deadletter", "replay", str(dead_id), "--site", SITE, "--state-root", str(h.state_root)]
+    )
+    assert code2 == 0
+    conn2 = h.conn()
+    again = [r["id"] for r in conn2.execute("SELECT id FROM push_queue").fetchall()]
+    conn2.close()
+    assert again == [first_queue_id], (
+        "the queue keys on (event_id, sink_name): one buffer, one send — never a double punch"
+    )
+
+
+def test_deadletter_replay_exits_2_for_an_id_that_is_not_a_dead_letter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo'd id is bad input (exit 2), and nothing moves — a typo is not a healthy site.
+
+    `deadletter list` on a site with no dead letters is a healthy answer and exits 0. This
+    command NAMES a row, so a row that is not there is a different thing, and the exit code is
+    where the two stop looking identical to a cron wrapper.
+    """
+    device = seeded_device()
+    device.add_events(*punch_events(T0, -300))
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None)
+    dead_id = h.seed_dead_letter()
+
+    code, out = h.cli(
+        ["deadletter", "replay", "99999", "--site", SITE, "--state-root", str(h.state_root)]
+    )
+    assert code == CONFIG_ERROR_EXIT
+    assert "99999" in out, "the message names the id the operator typed, not a stack frame"
+    conn = h.conn()
+    assert agent_push.queue_depth(conn) == 0, "a refused replay must queue nothing"
+    assert agent_push.dead_letter_depth(conn) == 1, "the row the operator MEANT is untouched"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM push_queue WHERE event_id = (SELECT event_id FROM dead_letter "
+            "WHERE id = ?)",
+            (dead_id,),
+        ).fetchone()[0]
+        == 0
+    )
+    conn.close()
+
+
+def test_deadletter_replay_exits_2_when_the_agent_has_never_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `ack` precedent: a state dir with no store gets a reason, not a sqlite traceback.
+
+    Same exit-2 class as a typo'd id, different sentence: "this site's agent has never run" is
+    a different thing to act on than "check the id you typed".
+    """
+    device = seeded_device()
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None)
+
+    code, out = h.cli(
+        ["deadletter", "replay", "1", "--site", SITE, "--state-root", str(tmp_path / "never-run")]
+    )
+    assert code == CONFIG_ERROR_EXIT
+    assert "no store at" in out, out
+
+
+def test_deadletter_replay_can_target_a_moved_ingest_and_refuses_an_invented_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--endpoint` is for the ingest that MOVED; §3's ref rule still applies to it.
+
+    Without the override a row dead-lettered against the old ref can only ever go back to the
+    old ref, so an endpoint change strands every row the outage wrote. With it, the ref is
+    still the pusher's guard's to judge: an `ftp://` ref exits 2 and leaves the queue exactly
+    as it was — the operator's own typo must not rewrite a queued row's target.
+    """
+    device = seeded_device()
+    device.add_events(*punch_events(T0, -300))
+    h = AgentHarness(tmp_path, device, monkeypatch, push_target=None)
+    dead_id = h.seed_dead_letter()
+    moved = "https://moved.example/ingest/lines.jsonl"
+
+    code, out = h.cli(
+        [
+            "deadletter",
+            "replay",
+            str(dead_id),
+            "--endpoint",
+            moved,
+            "--site",
+            SITE,
+            "--state-root",
+            str(h.state_root),
+        ]
+    )
+    assert code == 0, out
+    conn = h.conn()
+    row = conn.execute("SELECT endpoint FROM push_queue").fetchone()
+    assert row is not None and row["endpoint"] == moved, "the replay goes to the ref named"
+
+    code2, out2 = h.cli(
+        [
+            "deadletter",
+            "replay",
+            str(dead_id),
+            "--endpoint",
+            "ftp://nowhere/ingest",
+            "--site",
+            SITE,
+            "--state-root",
+            str(h.state_root),
+        ]
+    )
+    assert code2 == CONFIG_ERROR_EXIT
+    assert "ftp://" in out2, "the refusal names the ref it refused"
+    still = conn.execute("SELECT endpoint FROM push_queue").fetchall()
+    conn.close()
+    assert [r["endpoint"] for r in still] == [moved], (
+        "a refused replay rewrote nothing: the queued row still targets the moved ingest"
+    )
 
 
 def test_push_ledger_lands_in_the_state_root_and_carries_no_payload(
