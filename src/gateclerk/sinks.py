@@ -416,8 +416,7 @@ def _build_https(table: Mapping[str, Any], site: str) -> tuple[str, Mapping[str,
         allowed = " or ".join(SINK_URL_SCHEMES)
         raise ConfigError(
             f"site {site!r} sink {table.get('name')!r}: url {url!r} has an unacceptable "
-            f"scheme: a sink url must start with {allowed} (never a default endpoint — "
-            "docs/P2-SITE-AGENT.md §3)"
+            f"scheme: a sink url must start with {allowed} — never a default endpoint"
         )
     sink = str(table.get("name", "?"))
     return url, {

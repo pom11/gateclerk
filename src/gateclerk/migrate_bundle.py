@@ -1,7 +1,7 @@
 """The E1 enrollment bundle: normalization, content hashes, writer, reader (card E1-01).
 
 This module is the SINGLE home of the record-normalization and content-hash rules
-(design docs/ENROLLMENT-MIGRATION.md §2). Diff (E1-02) and read-back verify (E1-04/05)
+(design docs/internal/ENROLLMENT-MIGRATION.md §2). Diff (E1-02) and read-back verify (E1-04/05)
 import `normalize_record` / `content_hash` from here — they must never re-express them,
 because the whole diff/verify contract rests on the source side and the target side
 computing byte-identical hashes with the *same* function. Two implementations that can
@@ -60,6 +60,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import stat
 import string
 from collections.abc import Iterable, Mapping, Sequence
@@ -83,6 +84,7 @@ __all__ = [
     "VOLATILE_URL_FIELDS",
     "BundleData",
     "BundleManifest",
+    "CleanReport",
     "FaceTemplate",
     "FacesIndex",
     "FingerprintIndex",
@@ -1089,3 +1091,169 @@ def _verify_one_b64(
             "bundle was edited or truncated after export; refusing to diff, verify "
             "or restore from it"
         )
+
+
+# --- TTL purge (GC-14 / GC-P16c) -------------------------------------------------------------
+
+#: The two buckets a TTL purge may touch, spelled as the private root lays them out
+#: (``<root>/bundles`` and ``<root>/runs``, §2/§5a). ``migrate_apply`` owns these names
+#: (``BUNDLES_DIR_NAME`` / ``RUNS_DIR_NAME``) and imports this module, so importing them
+#: back here would be a cycle; ``tests/test_gc_p16c_migrate_clean.py`` pins the two
+#: spellings equal, which is what stops them drifting apart silently.
+#:
+#: ``PROBES_DIR_NAME`` is deliberately NOT here. The probe cache is the gate that lets a
+#: later command read at all (§3), not a copy of someone's biometrics, and a purge that
+#: aged it out would silently turn a working site into one that refuses to diff.
+_BUNDLES_BUCKET = "bundles"
+_RUNS_BUCKET = "runs"
+
+#: The journal naming, for the one question ``clean`` asks of a run dir (below). The
+#: naming rule is ``migrate_apply``'s (``JOURNAL_SUFFIX``, at its §5a comment: a run dir
+#: holds ``<phase>.jsonl`` and ``<phase>.undo.jsonl``), and for the same reason as the two
+#: bucket names above it is spelled here rather than imported — ``migrate_apply`` imports
+#: this module. ``tests/test_gc_p16c_migrate_clean.py`` pins the two spellings equal: a
+#: rename on the owner's side alone would make every run dir look finished, which is a
+#: silent all-clear from the one warning this section exists to give.
+_JOURNAL_SUFFIX = "jsonl"
+
+#: ``<phase>.undo.jsonl`` — the second half of that naming rule.
+_UNDO_SUFFIX = f".undo.{_JOURNAL_SUFFIX}"
+
+
+def _run_is_unresolved(run_dir: Path) -> bool:
+    """True when a run dir holds a phase journal that has no matching undo journal.
+
+    That asymmetry is the only thing ``clean`` can see about whether a migration finished.
+    ``<run-dir>/<phase>.jsonl`` is the sole input ``migrate undo --journal`` can replay
+    (§5a: "undo removes only what a journal proved this run added"), and the undo journal
+    is the record that the replay already happened — so a dir with the first and not the
+    second is a run whose write is still standing and whose only rollback evidence is
+    sitting in the directory this purge is about to delete.
+
+    Deliberately mechanical rather than phase-aware. It asks about *any* ``<phase>.jsonl``,
+    not about the phases in ``migrate_apply.PHASES``, for two reasons: a run dir is written
+    one phase at a time, so a name this module has never heard of is evidence of a write,
+    not a reason to look away; and guessing which phases may legitimately lack an undo
+    journal (``users`` undo is report-only, §5b.1) would quietly narrow the warning to the
+    phases someone remembered to list. A false alarm here costs one line of output; the
+    false all-clear costs the operator's only undo.
+
+    A dir that cannot be listed is reported as resolved rather than aborting the pass —
+    the same reason ``clean_artifacts`` skips an entry whose ``stat()`` fails. This
+    function never decides what gets deleted; it only annotates the decision.
+    """
+    try:
+        journals = sorted(run_dir.glob(f"*.{_JOURNAL_SUFFIX}"))
+    except OSError:
+        return False
+    for journal in journals:
+        if journal.name.endswith(_UNDO_SUFFIX):
+            continue  # an undo journal is the answer to a journal, not a write itself
+        if not (journal.parent / f"{journal.stem}{_UNDO_SUFFIX}").is_file():
+            return True
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class CleanReport:
+    """What one ``migrate clean`` pass found, and — with ``apply`` — what it removed.
+
+    The buckets stay separate rather than one flat tuple because an operator reviews them
+    differently: a bundle is the rollback source a restore reads, a run journal is §5a's
+    evidence of a write. ``apply`` travels with the report so a dry run can never be
+    re-read later as a delete log it was not.
+
+    ``unresolved_runs`` is a subset of ``runs``, not a third bucket: the same directories,
+    seen from the other side. It names the runs that look unfinished (see
+    ``_run_is_unresolved``) — every one of them is still in ``runs`` and is still deleted
+    by ``apply`` exactly as before. Nothing here refuses or gates; it says what is lost.
+    """
+
+    root: Path
+    older_than: datetime
+    apply: bool
+    bundles: tuple[Path, ...] = ()
+    runs: tuple[Path, ...] = ()
+    unresolved_runs: tuple[Path, ...] = ()
+
+    @property
+    def count(self) -> int:
+        return len(self.bundles) + len(self.runs)
+
+
+def clean_artifacts(
+    root: Path,
+    *,
+    older_than: datetime,
+    apply: bool = False,
+    now: datetime | None = None,
+) -> CleanReport:
+    """List (and with ``apply``, delete) bundle/run dirs older than the cutoff.
+
+    ``probes/`` is never touched: the 7-day probe cache is a read gate, not a PII
+    artifact. A path is old when its directory mtime is before ``older_than``.
+
+    The scope is the whole safety story, so it is spelled out:
+
+    * exactly two directories are walked — ``<root>/bundles`` and ``<root>/runs``. Nothing
+      else under ``root`` is even opened, and nothing outside ``root`` can be reached:
+      every deleted path is a child of one of those two by construction;
+    * only DIRECTORIES are candidates, so a stray file (a writer's leftover ``*.partial``
+      sibling) is reported by neither and deleted by neither;
+    * the comparison is strict: a path stamped exactly AT the cutoff is kept, because
+      "older than 7 days" does not include "exactly 7 days";
+    * a ``stat()`` that fails skips the entry instead of aborting the pass — a directory
+      another process is mid-way removing is not a reason to lose the whole report.
+
+    A listed run dir is also asked whether it looks unfinished, and the ones that do come
+    back in ``unresolved_runs`` — a subset of ``runs``, never a third bucket and never a
+    refusal. See ``_run_is_unresolved`` for what the question is and why answering it
+    changes nothing about what gets deleted.
+
+    ``now`` is the caller's INJECTED clock (the repo's clock rule: no timestamp in this
+    feature is read from the wall here). It has one job: a cutoff ahead of it would make
+    every artifact on disk "older" than the cutoff, so a purge whose cutoff is in the
+    future is refused rather than run. It is optional because the report is also useful
+    to a caller that has already reasoned about the cutoff.
+    """
+    root = Path(root)
+    if now is not None and older_than > now:
+        raise ValueError(
+            f"older_than {older_than.isoformat()} is ahead of now "
+            f"({now.isoformat()}): every artifact would count as older than it — a "
+            "purge whose cutoff is in the future is refused, not run"
+        )
+
+    chosen_bundles: list[Path] = []
+    chosen_runs: list[Path] = []
+    for base, bucket in (
+        (root / _BUNDLES_BUCKET, chosen_bundles),
+        (root / _RUNS_BUCKET, chosen_runs),
+    ):
+        if not base.is_dir():
+            continue
+        for child in sorted(base.iterdir()):
+            if not child.is_dir():
+                continue
+            try:
+                mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=UTC)
+            except OSError:
+                continue
+            if mtime < older_than:
+                bucket.append(child)
+    # BEFORE the delete, not after: an `apply` pass that asked afterwards would glob a
+    # directory it had just removed and report every run as resolved. The report is the
+    # record of what was destroyed, and after `--apply` this line is the only place that
+    # record survives.
+    unresolved = tuple(path for path in chosen_runs if _run_is_unresolved(path))
+    if apply:
+        for path in (*chosen_bundles, *chosen_runs):
+            shutil.rmtree(path)
+    return CleanReport(
+        root=root,
+        older_than=older_than,
+        apply=apply,
+        bundles=tuple(chosen_bundles),
+        runs=tuple(chosen_runs),
+        unresolved_runs=unresolved,
+    )

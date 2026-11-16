@@ -1,6 +1,6 @@
 """The diff engine (card E1-02): classification + report, NO device writes.
 
-Design docs/ENROLLMENT-MIGRATION.md v4 §4 (freshness contract), §1a (door fields),
+Design docs/internal/ENROLLMENT-MIGRATION.md v4 §4 (freshness contract), §1a (door fields),
 §9 (UNKNOWN-not-zero biometrics), + the orchestrator scope note on card t_0fd87e2f.
 The default mode of `apply` IS this diff, so the module's one absolute rule is the
 §0 rule inverted: nothing here may ever *cause* a write — the plan says "would write
@@ -247,7 +247,7 @@ def employee_hash(employee_no: str, *, prefix_len: int = 12) -> str:
 # faces -> migrate_write -> migrate_diff (both already committed edges), so diff is
 # the lowest module both consumers already load — defining the vocabulary HERE keeps
 # the DAG acyclic (faces -> diff would close faces -> write -> diff -> faces if diff
-# reached back into faces). The site-B capture (docs/OBSERVED-site-B.md "Face WRITE
+# reached back into faces). The site-B capture (docs/internal/OBSERVED-site-B.md "Face WRITE
 # capture") recorded each firmware's face-template family marker: site-A (V3.2.30)
 # writes `FR500005`, site-B (V4.13.0) writes `FR702706`, and B rejects A's family
 # with the captured `badJsonContent`/`errorMsg:faceURL` pair. These three symbols are

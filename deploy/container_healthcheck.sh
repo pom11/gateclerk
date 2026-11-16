@@ -9,6 +9,9 @@
 # GATECLERK_HEALTH_FILE     snapshot path (compose sets it per site)
 # GATECLERK_HEALTH_MAX_AGE_S  oldest acceptable snapshot age; default 900 s = 3 x the
 #                             default 300 s cadence (config.DEFAULT_CADENCE_S)
+#
+# A snapshot whose devices are ALL parked is unhealthy even at status "degraded": such a
+# site is polling nothing, so the container must fail closed rather than look attached.
 set -eu
 
 snapshot="${GATECLERK_HEALTH_FILE:-/var/lib/gateclerk/site-a/health/agent.json}"
@@ -36,6 +39,15 @@ if age > max_age:
 status = snapshot.get("status")
 if status not in ("ok", "degraded"):
     print(f"unhealthy: health snapshot {path} has status {status!r}")
+    sys.exit(1)
+
+# "degraded" is deliverable while at least one terminal still polls: a single parked
+# device is exactly what degraded means. When EVERY device sits on an open circuit the
+# site moves no events at all, so the container must not report healthy (R7 fail closed).
+# An empty device list is the agent's own "not polled yet" state — no all-parked claim.
+devices = snapshot.get("devices") or []
+if devices and all(bool(d.get("circuit_open")) for d in devices):
+    print(f"unhealthy: every device is parked ({len(devices)} device(s))")
     sys.exit(1)
 
 print(f"healthy: snapshot age {age:.0f}s, status={status}, site={snapshot.get('site')}")

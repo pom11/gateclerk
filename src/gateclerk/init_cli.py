@@ -212,7 +212,7 @@ def push_target_problem(url: str) -> str | None:
     if not url.startswith(cfg.PUSH_TARGET_SCHEMES):
         return (
             f"push url {url!r} has an unacceptable scheme: it must start with {allowed} "
-            "(never a default endpoint — docs/P2-SITE-AGENT.md §3)"
+            "— never a default endpoint"
         )
     return None
 
@@ -424,7 +424,7 @@ def plan_site(
         if not sink_url:
             raise InitError(
                 "an https sink needs the ingest URL. There is no default endpoint to fall "
-                "back on (docs/P2-SITE-AGENT.md §3), so this is a refusal, not a guess."
+                "back on, so this is a refusal, not a guess."
             )
         problem = push_target_problem(sink_url)
         if problem is not None:

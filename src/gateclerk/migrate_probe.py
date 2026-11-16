@@ -1,6 +1,6 @@
 """Capability probe (card E1-03): what THIS device can actually do, recorded not assumed.
 
-docs/ENROLLMENT-MIGRATION.md v4 §3 makes this matrix the gate for every export AND
+docs/internal/ENROLLMENT-MIGRATION.md v4 §3 makes this matrix the gate for every export AND
 apply of the E1 migration feature: identity, a per-endpoint availability matrix,
 counts, the templateNo evidence set, the face/FP situation, and the clock-skew
 evidence the apply gate (§5 step 1a) consumes. §0.7 decides how errors are treated:
@@ -24,7 +24,7 @@ Three rules make this module trustworthy rather than convenient:
 * **Budget respect (§0.5).** Exactly one request per probed surface, and an error
   response is NEVER retried (the transport already treats notSupport/badContent as
   terminal; the probe adds no retry of its own — pinned against FakeDevice's
-  per-path authorized-request counter, tests/test_e1_03_migrate_probe.py). A 401
+  per-path authorized-request counter, tests/test_migrate_probe.py). A 401
   ABORTS the whole probe: a credential problem is not a per-surface fact, and
   knocking again is exactly the lockout accounting §0.5 forbids. Settled axes are
   not re-probed (policy reaffirmed in OBSERVED.md): the faceURL photo-bytes question
@@ -54,7 +54,7 @@ future-dated probe is refused, never tolerated.
 
 Nothing here opens a socket: `probe_device` receives an `IsapiClient` (p1-03), which
 every test satisfies with `tests/fakedevice.py` seeded to bench A's discovered truth
-(docs/OBSERVED.md "E1 enrollment-read probes").
+(docs/internal/OBSERVED.md "E1 enrollment-read probes").
 """
 
 from __future__ import annotations
@@ -402,8 +402,8 @@ def probe_device(
     except IsapiAuthError as exc:
         raise ProbeAbortedError(
             f"capability probe aborted before any surface was read: the device "
-            f"refused our credentials ({exc}); not retrying — lockout accounting "
-            "(docs/ENROLLMENT-MIGRATION.md §0.5)"
+            f"refused our credentials ({exc}); not retrying — a refused credential counts "
+            "toward the device's lockout accounting"
         ) from exc
     except GateClerkError as exc:
         raise ProbeAbortedError(

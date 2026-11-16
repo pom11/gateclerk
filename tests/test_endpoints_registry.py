@@ -1,4 +1,4 @@
-"""The read-only guarantee, enforced by CI rather than by a comment (docs/DESIGN.md).
+"""The read-only guarantee, enforced by CI rather than by a comment (docs/internal/DESIGN.md).
 
 If someone adds a mutating endpoint to the registry, these tests fail — which is the
 whole point of the registry existing.
@@ -49,7 +49,7 @@ def test_exactly_the_advertised_search_post_endpoints() -> None:
     stateless search-shaped body; none mutates device state (OBSERVED.md VERIFIED for
     the count probe: it returns `{totalNum}` for a window and nothing else).
 
-    Five more by card E1-03 (capability probe; docs/ENROLLMENT-MIGRATION.md §1/§3),
+    Five more by card E1-03 (capability probe; docs/internal/ENROLLMENT-MIGRATION.md §1/§3),
     each justified at its REGISTRY entry: four plain stateless searches
     (CardInfo/Search, UserInfoDetail/Search, FingerPrint/Search, FDSearch — the last
     FLAT-dialect, the device truth of OBSERVED.md 2026-10-21) plus
@@ -142,9 +142,9 @@ def test_registry_is_exactly_the_documented_surface() -> None:
         # invariant wording that had to name it: the call table already documented this POST,
         # and OBSERVED.md VERIFIED it. Advisory display only — never a loop bound.
         ("acs_event_total_num", "POST", "/ISAPI/AccessControl/AcsEventTotalNum"),
-        # --- Added by card E1-03 (capability probe, docs/ENROLLMENT-MIGRATION.md §1/§3).
+        # --- Added by card E1-03 (capability probe, docs/internal/ENROLLMENT-MIGRATION.md §1/§3).
         # Every path below is justified at its registry entry AND at the live bench-A
-        # read of docs/OBSERVED.md ("E1 enrollment-read probes", 2026-10-21). Note what
+        # read of docs/internal/OBSERVED.md ("E1 enrollment-read probes", 2026-10-21). Note what
         # is deliberately ABSENT: `UserInfo/SetUp` and `FingerPrintDownload` — the two
         # WRITE verbs — are not callable from this package at all; only their caps
         # DOCUMENTS (GET, 404 on A) are registered, so the probe can record that the
@@ -177,7 +177,7 @@ def test_registry_is_exactly_the_documented_surface() -> None:
         ("plan_template", "GET", "/ISAPI/AccessControl/PlanTemplate1"),
     }, (
         "the callable surface changed. If this is a NEW read endpoint: update the set here "
-        "and docs/DESIGN.md's endpoint table together. If it is a WRITE: stop — this repo "
+        "and docs/internal/DESIGN.md's endpoint table together. If it is a WRITE: stop — this repo "
         "is read-only against the device (DESIGN.md 'Constraints / invariants')."
     )
 
@@ -210,7 +210,7 @@ def test_the_write_verbs_themselves_are_not_registered() -> None:
     """The §5.0 merge gate, expressed as a registry fact (card E1-03).
 
     The design says no write verb is callable until its exact endpoint+shape is
-    CONFIRMED by the orchestrator's bench-A capture (docs/ENROLLMENT-MIGRATION.md
+    CONFIRMED by the orchestrator's bench-A capture (docs/internal/ENROLLMENT-MIGRATION.md
     §5 step 0), and E1-04's fixtures gate that. Until then the write paths must not
     exist in ANY form the client could reach — not as a POST, not as a same-named
     GET (a write registered as GET is precisely the case §0's registry comment says

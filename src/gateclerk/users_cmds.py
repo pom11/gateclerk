@@ -224,8 +224,7 @@ def users_import(
         str | None,
         typer.Option(
             "--results",
-            help="Per-row audit CSV, the only output with full card numbers (default: next "
-            "to the workbook).",
+            help="Per-row audit CSV, with masked card numbers (default: next to the workbook).",
         ),
     ] = None,
 ) -> None:
@@ -234,8 +233,8 @@ def users_import(
     The device is read first (caps, then the full user and card rosters), every row is
     classified as add-user / add-card / skip-present / skip-update-needed / refuse, and
     ``--apply`` performs only the planned writes through the same journal and read-back
-    seams as ``migrate apply``. Card numbers are masked in the plan; the audit CSV keeps
-    the full values for the operator.
+    seams as ``migrate apply``. Card numbers are masked in the plan and in the audit
+    CSV; the full value stays in the workbook and in the device.
     """
     from gateclerk.users_import import (
         DialectRefusedError,

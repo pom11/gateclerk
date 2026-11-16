@@ -1,11 +1,11 @@
 # Vendored vendor catalogs (root of trust for event-code provenance)
 
 These two files are the authority `gateclerk.event_codes` and
-`docs/references/acs-event-codes.md` §3 are checked against. They are vendored so the
+`docs/internal/references/acs-event-codes.md` §3 are checked against. They are vendored so the
 provenance guard in `tests/test_event_codes.py` runs offline (CI has no device and no
 network) and so a later upstream edit cannot silently rename a code under us.
 
-Fetched 2026-10-16 from the URLs recorded in `docs/references/acs-event-codes.md`
+Fetched 2026-10-16 from the URLs recorded in `docs/internal/references/acs-event-codes.md`
 "Sources". Nothing here is hand-transcribed: `scripts/gen_code_reference.py` builds the
 doc tables from these files.
 

@@ -2,7 +2,7 @@
 <!--
   gateclerk-agent.plist  EXAMPLE ONLY, NOT A PRODUCT.
 
-  Owner decision, docs/P2-SITE-AGENT.md section 2d: agents run on Linux (see
+  Owner decision, docs/internal/P2-SITE-AGENT.md section 2d: agents run on Linux (see
   gateclerk-agent@.service, the supported deploy target) or Windows (deploy/README.md).
   macOS is the DEVELOPERS' box, so this file exists only so a developer who wants a long
   running agent on a laptop gets the SAME seams the Linux unit gets: the same site

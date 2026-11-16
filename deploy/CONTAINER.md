@@ -47,11 +47,11 @@ future C-extension dependency can be compiled there only, never in `runtime`.
 The image installs gateclerk with its `excel` extra, so `gateclerk users import` works in
 it. See `docs/USERS-IMPORT.md`.
 
-The state directories for the documented sites (`site-a` and `site-b`) are created in the
-image. Docker gives an empty named volume the ownership of its image mount point; without
-that directory, Docker makes the mount point root-owned and uid 10001 cannot write. Add a
-new site at build time with, for example,
-`--build-arg GATECLERK_SITES="site-a site-b site-c"`.
+The state directories for the documented sites (`site-a`, `site-b` and `site-c`) are created
+in the image. Docker gives an empty named volume the ownership of its image mount point;
+without that directory, Docker makes the mount point root-owned and uid 10001 cannot write.
+A new site is added to that set at build time with, for example,
+`--build-arg GATECLERK_SITES="site-a site-b site-c site-d"`.
 
 ## What the image guarantees
 
@@ -139,6 +139,15 @@ credential format:
 
 ## Run
 
+`deploy/gateclerk.env` and `deploy/mnotify.toml` are **operator files, not repo files**: they
+carry site endpoints and tokens, so neither is tracked — only the `*.example` templates beside
+them are, and `git clone` will not produce the real ones. `.gitignore` ignores both real paths and
+not the templates, so filling them in cannot leak into a commit through `git add -A`; it ignores
+`deploy/mnotify-secrets/` (with any per-site variant or symlink beside it) for the same reason,
+since compose.yaml orders that directory "never committed" and binds it read-only at
+`/run/secrets/mnotify`. The block below creates both from those templates; `deploy/compose.yaml`
+then binds `./mnotify.toml` read-only at `/etc/mnotify/config.toml`. Fill both in before starting.
+
 ```
 cp deploy/gateclerk.env.example deploy/gateclerk.env
 cp deploy/mnotify.toml.example deploy/mnotify.toml
@@ -195,7 +204,10 @@ image is the alerts target because production wants both on the same machine.
 - the file is missing or unreadable (the agent has not completed a pass yet), or
 - its mtime is older than `GATECLERK_HEALTH_MAX_AGE_S` (default `900`, i.e. three default
   `300`-second polls), or
-- its `status` is not `ok` or `degraded`.
+- its `status` is not `ok` or `degraded`, or
+- it lists devices and every one of them has `circuit_open` set — a site whose every
+  terminal is parked on a 401 lockout delivers nothing, so the container fails closed
+  even though the snapshot itself still reads `degraded`.
 
 The age check is deliberate: a live process with a stale snapshot means the poll loop is
 not completing passes. Compose sets `GATECLERK_HEALTH_FILE` per service because the path

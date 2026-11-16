@@ -1,4 +1,4 @@
-"""Regenerate the §3.1/§3.2 provenance tables in docs/references/acs-event-codes.md.
+"""Regenerate the §3.1/§3.2 provenance tables in docs/internal/references/acs-event-codes.md.
 
 The tables are GENERATED from the vendored catalogs
 (tests/fixtures/vendor/*.json) plus gateclerk.event_codes.EVENT_CODE_TABLE so that the

@@ -1,7 +1,7 @@
 """Card p2-01: the P2 sites.toml schema — explicit `iana_tz` REQUIRED, refs-only creds,
 every P2 key defined up front (this card owns `config.py` + `sites.toml.example` for P2).
 
-BINDING: docs/P2-SITE-AGENT.md §2a/§2b/§2c/§2d (SIGNED OFF 2026-10-19) + DESIGN.md
+BINDING: docs/internal/P2-SITE-AGENT.md §2a/§2b/§2c/§2d (SIGNED OFF 2026-10-19) + DESIGN.md
 "Credential plumbing". Decisions pinned by the card, implemented and pinned here:
 
 * **Enforcement scoping**: the validator REFUSES a block without an explicit `iana_tz`

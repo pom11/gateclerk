@@ -9,7 +9,7 @@ brief calls the highest-yield Hikvision gotcha (gotchas §1.4) — and the hands
 would prove nothing. Here, a wrong `uri=`, a wrong realm, or a stale nonce produces the
 same 401 the device produces, and the tests see it.
 
-The challenge mirrors the real transcript (docs/OBSERVED.md + the masked fixture
+The challenge mirrors the real transcript (docs/internal/OBSERVED.md + the masked fixture
 `digest_challenge_401.txt`): qop="auth", realm `DS-39DED0D1`, `Server: webs`, and the
 lowercase `stale="false"` spelling this firmware sends (Hikvision's own guide shows
 uppercase elsewhere — the client must not care; neither httpx nor requests reads
@@ -33,7 +33,7 @@ Scenarios are installed per test:
   the three shapes `RETIRE_STALE_TRUE` / `RETIRE_STALE_FALSE` / `RETIRE_ENVELOPE_ONLY`,
   issuing a fresh nonce each time. Unlike `expire_after` it fires again every N uses,
   because the live symptom is a deterministic 401 at the ~190th request of a walk
-  (docs/OBSERVED.md "Digest nonce use-cap") — a one-shot rotation cannot reproduce a
+  (docs/internal/OBSERVED.md "Digest nonce use-cap") — a one-shot rotation cannot reproduce a
   walk that dies at request N. Recorded 401 bodies: `tests/fixtures/README.md`.
 * `busy_503()` / `invalid_content()` (module-level) — the two wire shapes the retry
   tests need: the `deviceBusy` family (vendor statusCode 2, HTTP 503) and the
@@ -43,7 +43,7 @@ The event handlers are body-strict, not just auth-strict
 ----------------------------------------------------------------
 A fake more lenient than the device is a false-green machine (the lesson of the
 worktree-editable-import bug, applied to request shapes). The live run of 2026-10-17
-(docs/OBSERVED.md "Event-window startTime form: offset REQUIRED") proved this
+(docs/internal/OBSERVED.md "Event-window startTime form: offset REQUIRED") proved this
 firmware 400s an AcsEvent/AcsEventTotalNum body whose `startTime`/`endTime` is
 naive: `statusCode=6`, `subStatusCode=badJsonContent`, `errorMsg=startTime` (the
 recorded shape: `error_naive_start_time.json`). The P2-10 canary's first real tick
@@ -59,7 +59,7 @@ The event store FILTERS by ARITHMETIC (p1-05c — the anti-false-green core)
 `add_events(...)` installs stored events and puts the fake in *filtering mode* for
 the two event POSTs: instead of replaying a canned page queue, it computes which
 stored events fall in the requested window the way the DEVICE does —
-docs/OBSERVED.md "Window offsets are ARITHMETIC for the device" (A/B 2026-10-17:
+docs/internal/OBSERVED.md "Window offsets are ARITHMETIC for the device" (A/B 2026-10-17:
 the SAME window digits answered `NO MATCH`/0 labeled `+03:00` and OK/20 labeled
 `+02:00`, dense day 2026-05-21). The fake parses the bound's label, converts the
 bound to an instant, re-anchors it on ITS OWN claimed clock (`claimed_offset_min`,
@@ -70,6 +70,26 @@ That is load-bearing, not flavour: the pre-p1-05c fake only required an offset's
 owner measured live could not be reproduced offline at all. A presence-only fake
 is exactly the lenience this card removes. The naive-400 above stays armed in
 filtering mode too — presence still gates the request before arithmetic runs.
+
+The event store can ALSO honour `major` — opt-in, DEFAULT OFF (card t_22999a8f)
+------------------------------------------------------------------------------------
+`device.honour_event_major_filter = True` models the other arm of OBSERVED.md's
+"Server-side filter truth": a terminal that DOES honour the filter it advertised. The
+event-log census proves it for bench A (`major=0` 10,199 events, `major=3` 10,169,
+`major=5` 30 over the SAME ring — a silently-ignored filter would answer 10,199 three
+times), while `AcsEventCond.employeeNo` on that same box was silently ignored. Per
+endpoint, never inferred across routes.
+
+The default stays filter-blind on purpose: it is the safe model for a box nobody has
+probed, and the pipeline re-filters client-side anyway, so a walk that trusted a server
+filter it never verified must fail here rather than pass. Turning the knob on is what
+makes the quiet-tick scenario expressible at all — "the narrow `major=5` poll sees
+nothing while the box keeps emitting `major=3` heartbeats" — so the arm lives in the
+shared fake instead of in a per-test transport wrapper that the next card copy-pastes
+and silently breaks (a copied fake that stopped filtering turns a real green into a
+false one). `event_major_hidden` counts the IN-WINDOW rows the filter swallowed, and a
+test that needs the quiet branch asserts it non-zero: an arm that stopped filtering then
+fails its own premise instead of passing off a different code path.
 """
 
 from __future__ import annotations
@@ -154,7 +174,7 @@ _EVENT_COND_KEYS = {
 
 # --- nonce-retirement shapes (card t_a3521d8a) --------------------------------------
 #
-# The live symptom (docs/OBSERVED.md "Digest nonce use-cap", owner run 2026-10-17):
+# The live symptom (docs/internal/OBSERVED.md "Digest nonce use-cap", owner run 2026-10-17):
 # a long backfill walks ~190 requests with the CORRECT password and then dies on a
 # 401 — deterministic count, device stays unlocked. That reads as the device retiring
 # the digest nonce after N uses. We never captured the 401 itself, so the mechanism is
@@ -324,6 +344,42 @@ def _store_serial(event: dict) -> int:
     return serial if isinstance(serial, int) and not isinstance(serial, bool) else -1
 
 
+def _requested_major(cond: dict) -> int:
+    """The `major` a posted event cond asks for, normalised to the fake's own vocabulary.
+
+    `major: 0` (or an absent `major`) is the ISAPI "EVERY major" ask — the loop's own
+    `include_noise` walk and GC-P15's wider reset probe both send it — and it must never
+    narrow anything. Only a positive int narrows. Anything else on the wire is not a
+    device shape (`AcsEventCond.major` @opt is 0,1,2,3,5), so it raises rather than
+    silently degrading to "every major": the knob is opt-in, so this path only runs for a
+    test that asked for the honouring arm, and a fake that quietly stopped filtering is
+    the false green this whole file exists to prevent.
+    """
+    value = cond.get("major")
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AssertionError(
+            f"store-mode fake got major={value!r} in the request cond: `major` is an int "
+            "code (0 = every major), so a non-int here is a broken test, not a device shape"
+        )
+    return value
+
+
+def _event_major(event: dict) -> int | None:
+    """The row's `major` code, or None when the row does not name one.
+
+    A row with no `major` is admitted ONLY by an "every major" ask: a device that honours
+    the filter cannot be shown to return it, and the fake never guesses an answer the
+    probes did not record — the same posture as `_store_wall`, which returns None for an
+    unparseable stamp rather than inventing a time.
+    """
+    value = event.get("major")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def parse_digest_header(value: str) -> dict[str, str]:
     """Authorization: Digest k="v", ... -> dict (quoted and bare values both)."""
     if not value.lower().startswith("digest "):
@@ -387,7 +443,7 @@ class Served:
     digest: dict[str, str] = field(default_factory=dict)
 
 
-# --- E1 enrollment-read surfaces (card E1-03; truth = docs/OBSERVED.md "E1 enrollment-
+# --- E1 enrollment-read surfaces (card E1-03; truth = docs/internal/OBSERVED.md "E1 enrollment-
 #     read probes", bench A rounds 11-18, 2026-10-21) ------------------------------------
 #
 # These routes enforce the request dialects the DEVICE enforces — a fake more lenient
@@ -751,7 +807,7 @@ def _enrollment_user_records() -> list[dict]:
 
 
 def _a_user(no: str, *, local_ui: bool, num_of_fp: int = 0, **extra: object) -> dict:
-    """One bench-A-shaped UserInfo record (docs/OBSERVED.md + user_search_page1.json).
+    """One bench-A-shaped UserInfo record (docs/internal/OBSERVED.md + user_search_page1.json).
 
     The fixture file is the shape truth; the two additions below are what masking
     removed and the probes confirmed the DEVICE still sends:
@@ -808,7 +864,7 @@ A_CORPUS_USERS: list[dict] = [
     ),
     _a_user("4", local_ui=False),
 ]
-#: A had ZERO cards (docs/PROGRESS.md E1 note): the empty-card corpus is device
+#: A had ZERO cards (docs/internal/PROGRESS.md E1 note): the empty-card corpus is device
 #: truth, and the fake must answer NO MATCH + missing `CardInfo` key for it.
 A_CORPUS_CARDS: list[dict] = []
 
@@ -950,7 +1006,7 @@ class FakeDevice:
         # --- the repeatable nonce use-cap (card t_a3521d8a) -------------------------
         #: when set to N, every nonce is accepted for exactly N authorized responses
         #: and then retired — again and again, for as long as the session runs. This
-        #: is the shape the live 401 at request ~190 needs (docs/OBSERVED.md "Digest
+        #: is the shape the live 401 at request ~190 needs (docs/internal/OBSERVED.md "Digest
         #: nonce use-cap"): `expire_after` cannot reproduce a walk that dies at N.
         self.retire_after: int | None = None
         #: which of RETIRE_SHAPES the rejection answers with (see the block above
@@ -979,9 +1035,25 @@ class FakeDevice:
         #: None = classic queue-replay mode (every pre-p1-05c test rides this).
         #: A list once `add_events` runs: the fake then FILTERS it per request.
         self._event_store: list[dict] | None = None
+        #: OPT-IN arm for the server-side `major` filter — see the module docstring's
+        #: "The event store FILTERS by ARITHMETIC" section for why the default is OFF.
+        #: False (the default, and what every existing test rides): the store answers the
+        #: WINDOW only and ignores the requested `major`, so a filter-blind client cannot
+        #: pass by trusting the server. True models a terminal that HONOURS the filter it
+        #: advertised (the arm OBSERVED.md's census proves for bench A: `major=0` ->
+        #: 10,199 events, `major=3` -> 10,169, `major=5` -> 30 — an ignored filter would
+        #: answer 10,199 three times), which is the only way to express "no punches in the
+        #: window, but the box is still emitting `major=3` heartbeats". `major: 0` is the
+        #: "every major" ask and narrows nothing. `minor` is never simulated either way.
+        self.honour_event_major_filter = False
+        #: In-window rows the honouring arm swallowed, summed over the session —
+        #: the self-check the caller asserts non-zero. A fake that silently stopped
+        #: filtering would leave this at 0, and the test that believed it was watching a
+        #: quiet poll would fail its own premise instead of passing on it.
+        self.event_major_hidden = 0
         self.served: list[Served] = []
         self.challenges = 0
-        #: --- E1-03 request budget counters (docs/ENROLLMENT-MIGRATION.md §0.5) ------
+        #: --- E1-03 request budget counters (docs/internal/ENROLLMENT-MIGRATION.md §0.5) ------
         #: EVERY request the fake received (before auth, including raw-queue hits), and
         #: the same per path+method; plus the count of requests whose credentials the
         #: box ACCEPTED. The probe's "exactly one request per probed surface, never
@@ -1068,7 +1140,7 @@ class FakeDevice:
 
         Nothing to pay — a client that only knows how to answer a challenge has no
         move here except to drop its auth state and re-bootstrap. Recorded (invented,
-        labelled) as `digest_envelope_only_401.txt`; docs/OBSERVED.md leaves this shape
+        labelled) as `digest_envelope_only_401.txt`; docs/internal/OBSERVED.md leaves this shape
         OPEN, which is why the fake can emit it and a test can pin what we do about it.
         """
         return httpx.Response(
@@ -1180,10 +1252,18 @@ class FakeDevice:
         ARITHMETIC"): the label makes the digits an instant; the instant is written
         back onto the device's OWN clock; the event's stored wall digits are compared
         to that shifted window, inclusively. So a `+03:00`-labeled 13:00 bound is,
-        on a +02:00-claiming box, device wall 12:00 — one hour early. `major`/`minor`
-        are NOT simulated server-side: OBSERVED.md's policy is that we never trust a
-        server filter we have not probed and the pipeline re-filters client-side
-        anyway, so the store answers the window and nothing else.
+        on a +02:00-claiming box, device wall 12:00 — one hour early.
+
+        `major` is the opt-in arm (`honour_event_major_filter`, default OFF): with the
+        knob off the store answers the window and nothing else, because OBSERVED.md's
+        policy is that we never trust a server filter we have not probed for THIS box
+        and the pipeline re-filters client-side anyway. With it on, the requested
+        `major` narrows the answer the way bench A's census shows an honouring box does
+        (`major=0` 10,199 / `major=3` 10,169 / `major=5` 30 over the same ring), and
+        `AcsEventTotalNum` counts the SAME narrowed set — that census is literally a
+        per-`major` TotalNum read. `major: 0` is the "every major" ask (the loop's
+        `include_noise` walk sends it) and narrows nothing. `minor` is never simulated:
+        no probe recorded it narrowing anything.
         """
         cond_key = _EVENT_COND_KEYS[request.url.path]
         payload = json.loads(request.content)
@@ -1197,11 +1277,23 @@ class FakeDevice:
         assert self._event_store is not None  # caller checks; keeps the type honest
         # Matched rows keep their wall digits (the filter proved them parseable); the
         # device returns a window oldest-first, so sort by wall then serial.
-        matched_walls = [
-            (w, e)
-            for e in self._event_store
-            if (w := _store_wall(e)) is not None and start <= w <= end
-        ]
+        wanted_major = _requested_major(cond) if self.honour_event_major_filter else 0
+        # The `major` predicate is conjunctive with the window, so applying it inside the
+        # same pass is the same answer an honouring device returns — and it lets `hidden`
+        # count exactly the rows that WERE in the window and were swallowed by the
+        # filter, which is the number a caller must assert non-zero.
+        hidden = 0
+        matched_walls = []
+        for event in self._event_store:
+            wall = _store_wall(event)
+            if wall is None or not (start <= wall <= end):
+                continue
+            if wanted_major and _event_major(event) != wanted_major:
+                hidden += 1
+                continue
+            matched_walls.append((wall, event))
+        if hidden:
+            self.event_major_hidden += hidden
         matched_walls.sort(key=lambda we: (we[0], _store_serial(we[1])))
         matched = [e for _, e in matched_walls]
         if request.url.path.startswith("/ISAPI/AccessControl/AcsEventTotalNum"):
@@ -1292,7 +1384,7 @@ class FakeDevice:
     ) -> None:
         """Install the E1-01 enrollment corpus (windowed store for both searches).
 
-        The default corpus is bench A's recorded shape (docs/ENROLLMENT-MIGRATION.md
+        The default corpus is bench A's recorded shape (docs/internal/ENROLLMENT-MIGRATION.md
         §1: 4 users — one with `numOfFP=1` (the fingerprint A cannot migrate), 0 cards
         — plus a `password` field the export must strip). Names are masked the way the
         recorded fixtures are (`User E<n>`), so this file stays hygiene-clean.
@@ -1538,7 +1630,7 @@ class FakeDevice:
                     "(E1-01 rule: unknown or un-armed enrollment POSTs are hard "
                     "failures, not empty answers); a capture-backed fixture route "
                     "(reset_json/add) or seed_enrollment() is the only way this path "
-                    "may be answered — see docs/ENROLLMENT-MIGRATION.md §9 "
+                    "may be answered — see docs/internal/ENROLLMENT-MIGRATION.md §9 "
                     "capture-before-fake"
                 )
         return None

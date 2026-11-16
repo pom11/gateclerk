@@ -14,12 +14,12 @@ Content-Type: application/xml
 INVENTED-BUT-LABELLED — NOT A DEVICE CAPTURE. (card t_a3521d8a)
 Shape (a) of the three candidate answers to "the device retired my digest nonce":
 the RFC-correct one. `stale="true"` plus a fresh nonce is what an RFC 2617 server
-sends when the nonce aged out; the live 401 at request ~190 (docs/OBSERVED.md
+sends when the nonce aged out; the live 401 at request ~190 (docs/internal/OBSERVED.md
 "Digest nonce use-cap") was NEVER captured, so this is a modelled shape, authored to
 match the recorded `digest_challenge_401.txt` header style (qop, realm, lowercase
 stale, `Server: webs`, the same userCheck body). The values are the fake's own
 (MASKED-NONCE-RET1 is what tests/fakedevice.py `_retire_nonce` mints).
 Served by: FakeDevice(retire_shape=RETIRE_STALE_TRUE).
-Client outcome (probe, docs/FINDINGS-t_a3521d8a.md F1): httpx.DigestAuth re-pays any
+Client outcome (probe, docs/internal/FINDINGS-t_a3521d8a.md F1): httpx.DigestAuth re-pays any
 Digest challenge and never reads `stale`, so this shape is survived inside httpx —
 one extra request, walk continues, circuit stays closed.

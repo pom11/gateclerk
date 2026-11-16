@@ -1,8 +1,8 @@
 """Card P2-03: the scheduler loop — 5 min cadence / 5 min overlap, ONE long-lived client.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2a (DECIDED 2026-10-19: 5 min / 5 min, one
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2a (DECIDED 2026-10-19: 5 min / 5 min, one
 long-lived `IsapiClient` per device across cycles so digest state amortizes against the
-~190-request nonce use-cap) + §1 seams 2/3/7/9. Device truth: docs/OBSERVED.md. The
+~190-request nonce use-cap) + §1 seams 2/3/7/9. Device truth: docs/internal/OBSERVED.md. The
 loop reuses P1 (paging's `iter_event_windows` cursor rules, pipeline's assembly +
 capability discovery + claimed-offset read, transport's digest/circuit machinery) and
 P2-02's store (`store_events` / `advance_checkpoint` / `read_checkpoint`); it owns only
@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -113,24 +114,77 @@ class FakeMonotonic:
 
 
 def device_event(serial: int, wall: str) -> dict[str, Any]:
-    """One stored event stamped site-a-style: ITS wall digits + ITS claimed +02:00."""
+    """One stored event stamped site-a-style: ITS wall digits + ITS claimed +02:00.
+
+    The fields are the RECORDED page's granted pass (`events_major5_page1.json`: minor 75,
+    `employeeNoString`, `currentVerifyMode: cardOrFaceOrFp`), not a bare code. GC-P01 makes
+    `queue_new_events` carry only punch candidates, and an event a working site polls IS a
+    pass; a fake stamped `minor: 0` with no verify mode classifies as `unknown_code`, so it
+    is stored and — correctly — never queued, which would leave every queue/drain assertion
+    here reasoning about data the classifier refuses to call a punch.
+    """
     return {
         "serialNo": serial,
         "employeeNoString": "1",
         "name": "User E1",
         "major": 5,
-        "minor": 0,
+        "minor": 75,
         "time": f"{wall}+02:00",
+        "cardType": 1,
+        "cardReaderNo": 1,
+        "doorNo": 1,
+        "type": 0,
+        "userType": "normal",
+        "currentVerifyMode": "cardOrFaceOrFp",
+        "mask": "no",
     }
 
 
+def system_time_body_at(moment: datetime) -> str:
+    """The recorded `System/time` body with its wall digits at `moment`, claimed stamp kept.
+
+    THE DEVICE CLOCK, DERIVED — not frozen. The recorded body carries a 2026-10-15 probe
+    snapshot (`localTime 2026-10-15T16:39:32+02:00`). Served verbatim to a run whose injected
+    clock is `T0` — or `T0` plus days, which the ring-floor cases do — the fake is a terminal
+    whose RTC sits days off the agent's. Nothing read that reading until GC-P04 wired the tick's
+    `Skew` into P2-05's warning channel, at which point every such test woke up holding a
+    `clock_skew` warning it never claimed to be about. A real RTC keeps counting, so the honest
+    fixture DERIVES the reading from the scenario clock; `e2e_harness._fresh_wall` already does
+    exactly this for the goldens, for the same stated reason ("no golden ages; skew measures the
+    clock, not fixture rot from a 2026-10-15 probe snapshot").
+
+    Only the digits move. The `<localTime>` *suffix* — the +02:00 stamp OBSERVED.md proves is
+    wrong inside +03:00 summer — survives verbatim, because that stamp, not the reading, is what
+    defines this scenario and what every window-label assertion here depends on.
+    """
+    text = (RECORDED / "system_time.xml").read_text()
+    wall = moment.astimezone(ZoneInfo(SITE_TZ)).strftime("%Y-%m-%dT%H:%M:%S")
+    stamped, hits = re.subn(
+        r"<localTime>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}([^<]*)</localTime>",
+        lambda m: f"<localTime>{wall}{m.group(1)}</localTime>",
+        text,
+        count=1,
+    )
+    assert hits == 1, (
+        "the recorded System/time body lost its <localTime> element: the seam below would "
+        "stamp nothing and every clock-sensitive test here would silently stop testing"
+    )
+    return stamped
+
+
 def seeded_device(**over: Any) -> FakeDevice:
-    """A FakeDevice answering the loop's bootstrap GETs with the RECORDED site-a bodies."""
+    """A FakeDevice answering the loop's bootstrap GETs with the RECORDED site-a bodies.
+
+    Its RTC is derived from the scenario clock (`T0`) by `system_time_body_at`, so a default
+    seeded box is a device whose clock is RIGHT — which is what every scheduler/agent test
+    here assumes unless it is specifically about a skewed clock (then: `reset` the
+    `System/time` route to your own body, the way GC-P04's skew tests do).
+    """
     device = FakeDevice(password=PASSWORD)
     device.claimed_offset_min = over.pop("claimed", DEVICE_CLAIM_MIN)
     assert not over, f"unknown seed knobs: {sorted(over)}"
     device.xml_ok("GET", DEVICE_INFO_PATH, (RECORDED / "device_info.xml").read_text())
-    device.xml_ok("GET", SYSTEM_TIME_PATH, (RECORDED / "system_time.xml").read_text())
+    device.xml_ok("GET", SYSTEM_TIME_PATH, system_time_body_at(T0))
     device.add(
         "GET",
         ACS_CAPS_PATH,

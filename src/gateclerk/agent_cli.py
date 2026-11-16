@@ -56,6 +56,8 @@ the transport's `Secret` and never in this module, a report, or a log line.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import random
@@ -79,7 +81,7 @@ from gateclerk.agent_alert import (
 from gateclerk.agent_db import connect
 from gateclerk.agent_health import AgentHealthCollector, snapshot_to_json
 from gateclerk.agent_loop import DeviceLoop, TickResult, build_device_loop
-from gateclerk.agent_store import check_db_watermark
+from gateclerk.agent_store import check_db_watermark, prune_pushed_events
 from gateclerk.config import (
     PUSH_TARGET_SCHEMES,
     ConfigError,
@@ -89,22 +91,29 @@ from gateclerk.config import (
     credential_ref,
     resolve_credentials,
 )
+from gateclerk.event_codes import NON_AUTH_VERIFY_MODES
 from gateclerk.isapi_transport import IsapiClient
 from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
 
 __all__ = [
+    "AGENT_PIDFILE_NAME",
+    "DEFAULT_LOCAL_RETENTION_DAYS",
     "HEALTH_DIR_NAME",
     "HEALTH_FILE_NAME",
     "PARK_DIR_NAME",
+    "POLLER_LOCK_SUFFIX",
     "PUSH_LEDGER_FILE_NAME",
+    "PollerAlreadyRunning",
     "PushLedger",
     "SiteAgent",
     "SiteRunReport",
     "SiteTickReport",
+    "acquire_poller_lock",
     "build_site_agent",
     "discard_dead_letter",
     "flag_rung_password",
     "queue_new_events",
+    "release_poller_lock",
     "resolve_db_path",
     "resolve_state_root",
 ]
@@ -115,6 +124,15 @@ PARK_DIR_NAME = "park"
 #: The §2e health snapshot dir under the state dir (the socat reader's file).
 HEALTH_DIR_NAME = "health"
 HEALTH_FILE_NAME = "agent.json"
+#: GC-P10's lock-file suffix under the state dir: `gateclerk-<site>.lock`, one lock per
+#: site — the on-disk statement of the deployment law "one site, one process, one store".
+POLLER_LOCK_SUFFIX = ".lock"
+#: GC-P11's pidfile under the state dir — the file `gateclerk status` reads for its agent
+#: line (`status_cli.PIDFILE_NAME`, same literal; the tests in
+#: tests/test_gc_p11_status_writers.py pin the two paths together, because `agent_cli` must
+#: not grow an import edge onto the status screen that reads it). Per site, never global:
+#: one site can be running while its neighbour is not.
+AGENT_PIDFILE_NAME = "agent.pid"
 #: systemd exposes `LoadCredential=<name>:<path>` as this env var pointing at a dir of files.
 CREDENTIALS_DIRECTORY_ENV = "CREDENTIALS_DIRECTORY"
 
@@ -144,6 +162,16 @@ def _now() -> datetime:
 
 #: The poller's own record of what it has already pushed (see `PushLedger`).
 PUSH_LEDGER_FILE_NAME = "push-ledger.jsonl"
+
+#: GC-P16a: how long a row the poller has PROVEN delivered may still sit in the local
+#: store. BC (Table 70607) has held the permanent copy since the push landed, so every
+#: day past this window the agent keeps a row is a day of un-governed PII (`name`,
+#: `employee_no`, `raw`) on a box in a corridor. 14 days is the diagnostic window the
+#: card fixes — long enough to answer "what did the terminal show last week" from the
+#: store and the exported bundle, short enough that a stolen SD card is not a year of
+#: punches. Deliberately a constant, not a config key (GC-P16a CHANGE 4): an operator who
+#: needs another window changes this one number and the test that pins it.
+DEFAULT_LOCAL_RETENTION_DAYS = 14
 
 
 class PushLedger:
@@ -198,6 +226,25 @@ class PushLedger:
         # default blew up on the first legacy-line lookup (found by tests/test_p2_07b).
         out |= self._known.get((endpoint, None), set())
         return out
+
+    def sent_event_ids(self) -> set[int]:
+        """Every event this poller has recorded as `sent` or `gone`, across all sinks.
+
+        GC-P16a's side of the retention contract: the prune needs one fact — "has this
+        event left the building?" — and this is the only accessor that answers it for
+        EVERY (endpoint, sink) at once, where `known()` answers it for one pair. The
+        union is deliberately the widest set the poller has proof for, and `gone`
+        (the owner discarded it, so it will never be pushed) counts exactly as `sent`
+        does.
+
+        Ids and nothing else on purpose. The ledger line also carries the endpoint and
+        the sink name, and the store behind those ids carries the payload: the caller
+        deletes by id, so this is where the accessor stops. `agent_store.prune_pushed_events`
+        returns a count for the same reason — retention code must not become a second
+        route for PII to leave the store.
+        """
+        known = self._known if self._known is not None else self._load()
+        return {event_id for ids in known.values() for event_id in ids}
 
     def _bucket(self, endpoint: str, sink_name: str) -> set[int]:
         known = self._known if self._known is not None else self._load()
@@ -319,6 +366,36 @@ def discard_dead_letter(
     return True
 
 
+#: Placeholders for `_PUNCH_CANDIDATE_SQL`'s verify-mode arm — one `?` per mode, so the
+#: list is bound as parameters and typed exactly once (in `event_codes`).
+_VERIFY_MODE_PLACEHOLDERS = ", ".join("?" for _ in sorted(NON_AUTH_VERIFY_MODES))
+
+#: The punch rule as SQL (GC-P01 / E22) — `event_codes._punch_decision` read against the
+#: flattened columns `agent_db` gives every stored record. This is the ONLY place the queue
+#: decides what a punch is, and every arm has a twin in the classifier:
+#:
+#: * `major = 5` — the authentication major (`PUNCH_MAJOR`); everything else (the major-3
+#:   heartbeat, alarms) is noise a timesheet must never see.
+#: * `outcome = 'granted'` + `unknown_code = 0` — the curated table's verdict. Together with
+#:   `major = 5` these also cover `AUTH_PASS_MINORS` *by construction*: that set is derived
+#:   from the same table as exactly its granted major-5 codes, so an unknown or non-pass
+#:   minor can never be granted. Repeating the minor list here would be a second rule that
+#:   can drift; `tests/test_gc_p01_grant_filter.py` fails if the derivation ever stops
+#:   holding.
+#: * `employee_no` — an unattributed pass cannot enter a timesheet.
+#: * `verify_mode` — a door-state record carries `invalid`/NULL: nobody authenticated. The
+#:   comparison mirrors `_verify_is_auth_mode` (strip + lowercase, then membership), and an
+#:   unseen mode stays a REAL mode — the list is what the classifier itself rejects.
+_PUNCH_CANDIDATE_SQL = (
+    "e.major = 5"
+    " AND e.outcome = 'granted'"
+    " AND e.unknown_code = 0"
+    " AND e.employee_no IS NOT NULL AND e.employee_no <> ''"
+    " AND e.verify_mode IS NOT NULL"
+    f" AND lower(trim(e.verify_mode)) NOT IN ({_VERIFY_MODE_PLACEHOLDERS})"
+)
+
+
 def queue_new_events(
     conn: Any,
     *,
@@ -328,13 +405,23 @@ def queue_new_events(
     ledger: PushLedger | None = None,
     sink_name: str = IMPLICIT_SINK_NAME,
 ) -> tuple[int, ...]:
-    """Queue every stored event that has no send buffer for this sink; return queue ids.
+    """Queue every stored *punch candidate* that has no send buffer for this sink.
 
     The missing link between P2-02's store and P2-04's drain (module docstring). It lives
     here rather than in `agent_push` because it is not a push rule — the pusher stays exactly
     as shipped. `limit` bounds one pass (P2-04's batch cap): a first-ever pass over a
     year-old store must not build an unbounded queue in one transaction; the rest is still
     there, due, on the next pass.
+
+    WHAT IT QUEUES, AND WHY THE RULE IS IN THE QUERY (GC-P01 / E22)
+    A site's `events` table deliberately holds EVERYTHING the device reported — a refused
+    card, a door-state record, a code the curated table cannot name — because GC-P20's
+    diagnostics read them there. Only a granted authentication pass by a known employee is a
+    punch, and a queued row becomes a real attendance line in BC Table 70607. So this query,
+    not the store, is the gate: a denied, informational, unknown-code or unattributed event
+    stays in `events` and is never queued for ANY sink. The store keeps it; the queue refuses
+    it. The predicate is `_PUNCH_CANDIDATE_SQL` and it is the classifier's rule
+    (`event_codes._punch_decision`), which the recorded-fixture equivalence test pins.
 
     `sink_name` (SINKS-WIRING) is which sink this pass is queueing FOR: every exclusion is
     per (event, sink), because an event the ingest has already accepted still has to reach
@@ -365,9 +452,15 @@ def queue_new_events(
     # re-queueing would re-push a punch the legacy target already took. A newly configured sink
     # has genuinely never seen the event, so excluding it there would be silent loss, not
     # dedupe. The gate is a BOUND 0/1 — the query text stays a literal.
+    # The f-string below is not an injection surface: the only interpolated text is the
+    # module-level `_PUNCH_CANDIDATE_SQL`, built once at import from the frozen
+    # `NON_AUTH_VERIFY_MODES`, and the modes themselves travel as bound parameters — no
+    # caller-supplied value ever reaches the query text. S608 reads the statement's text and
+    # cannot see that, so it is silenced on the CLOSING line of the string (the only line in
+    # the statement where a comment cannot land inside the SQL).
     legacy_wild = 1 if sink_name == IMPLICIT_SINK_NAME else 0
     rows = conn.execute(
-        """
+        f"""
         SELECT e.id AS id
           FROM events AS e
          WHERE NOT EXISTS (
@@ -381,9 +474,10 @@ def queue_new_events(
            AND NOT EXISTS (
                  SELECT 1 FROM temp.agent_push_ledger AS l
                   WHERE l.event_id = e.id)
+           AND {_PUNCH_CANDIDATE_SQL}
          ORDER BY e.id
          LIMIT ?
-        """,
+        """,  # noqa: S608 - static query text + one import-time constant; modes bind as params
         (
             endpoint,
             sink_name,
@@ -391,6 +485,7 @@ def queue_new_events(
             endpoint,
             sink_name,
             legacy_wild,
+            *sorted(NON_AUTH_VERIFY_MODES),
             max(1, int(limit)),
         ),
     ).fetchall()
@@ -615,6 +710,22 @@ class SiteAgent:
         #: that is what distinguishes an outage from a quiet door.
         self._last_ok_at: dict[str, datetime] = self._last_ok_from_health()
         self._cycle_started = time.monotonic()
+        #: GC-P16a: the instant of the last retention pass, in THIS process. The prune is a
+        #: full-table statement, so the cadence that fits it is a day, not the 5-minute
+        #: tick (288 of them a day would buy no extra retention). Deliberately in memory and
+        #: not on disk: a restart re-prunes once, which is the harmless direction — keeping
+        #: PII one day longer than promised is the failure this card exists to remove, and
+        #: nothing is lost by running the statement twice.
+        self._last_prune_at: datetime | None = None
+        #: GC-P10's flock handle (see `acquire_poller_lock`): None until `run()` takes it.
+        #: `run()` releases in its `finally`; `close()` covers a caller that built the
+        #: agent and never ran it.
+        self._poller_lock: Any = None
+        #: GC-P11's pidfile (`<state root>/agent.pid`): None until `run()` writes it. The
+        #: agent line of `gateclerk status` reads exactly this file, so its whole life is
+        #: the lock's: written inside the lock's `try`, cleared by `close()` only if the
+        #: content still names us.
+        self._pidfile: Path | None = None
 
     # --- one pass -------------------------------------------------------------------------
 
@@ -645,6 +756,16 @@ class SiteAgent:
             report.absorb(result)
             key = loop.device_serial or PENDING_SERIAL
             self._last_tick[key] = result
+            # GC-P04: the clock channel, fed by the reading GC-P03 already refreshes. Both
+            # surfaces get the SAME Skew object — the policy's one-warning-per-episode rule
+            # (§2c) and the collector's §2e gauge — and this sits ahead of the ok/fail split
+            # on purpose: a terminal can be reachable enough to answer System/time and still
+            # fail the event walk, and an RTC an hour off corrupts R1's payroll scan either
+            # way. Neither observer raises; neither writes to the device.
+            if result.clock_skew is not None:
+                report.alerts.extend(self.policy.observe_skew(result.clock_skew))
+                if self.collector is not None:
+                    self.collector.observe_skew(key, result.clock_skew)
             if self.collector is not None:
                 self.collector.observe_tick(result, device_serial=key, client=loop.client)
             # The nonce-recovery total is the transport's OWN counter (an info line, never an
@@ -693,6 +814,39 @@ class SiteAgent:
         # that knows both forms.
         if self.sinks:
             self._push(moment, report)
+        # GC-P16a: local retention, once a day. BC (Table 70607) owns the permanent
+        # record, so a row the push pass has just PROVEN delivered (`PushLedger`) and
+        # that has aged out of the diagnostic window is a local PII copy with no reason
+        # to live. The statement itself refuses anything unpushed, queued or
+        # dead-lettered — this is only the cadence and the window.
+        #
+        # The window is computed in UTC because the column it filters is UTC
+        # (`tz.py:334` writes `astimezone(UTC).isoformat()`), and the delete compares
+        # them as TEXT: an un-normalised `+02:00` cutoff would be a lexical comparison
+        # two or three hours off, silently aging every row by the site's offset.
+        #
+        # The policy travels with the call. This is the product's only sanctioned delete
+        # from `events`, and `check_stall` reads `MIN(serial_no)` on every ok tick of this
+        # long-lived unit, so the object that has to be able to tell this rise apart from
+        # lost history is this one: the store function notes the floor it left behind on
+        # the policy whose connection it deleted from (GC-P16a follow-up, t_8953101a).
+        #
+        # `_last_prune_at` is set BEFORE the call, so a failing statement (a write lock
+        # held by a CLI `deadletter delete`, say: `connect()` sets no busy_timeout)
+        # cannot retry-loop for the rest of the day. It DOES still propagate out of the
+        # tick, exactly as the card specifies — the fleet's policy for a housekeeping
+        # failure is not this card's to invent, and it is carded as a follow-up.
+        if self.ledger is not None and (
+            self._last_prune_at is None or (moment - self._last_prune_at) >= timedelta(days=1)
+        ):
+            self._last_prune_at = moment
+            cutoff = (moment - timedelta(days=DEFAULT_LOCAL_RETENTION_DAYS)).astimezone(UTC)
+            prune_pushed_events(
+                self.conn,
+                event_ids=self.ledger.sent_event_ids(),
+                before_utc=cutoff.isoformat(),
+                policy=self.policy,
+            )
         report.parked = self.parked_keys()
         self._write_health()
         return report.build(moment)
@@ -711,26 +865,47 @@ class SiteAgent:
         this only reuses it — and the injected sleep keeps the whole loop testable in
         milliseconds.
         """
+        # GC-P10: the site lock is taken BEFORE the first tick — a second poller must be
+        # refused before it presents credentials to the device (one digest nonce budget,
+        # one 401 lockout). Sitting above the inner try is deliberate: a refusal is not a
+        # crash and must not print the abort line for a run that never ticked.
+        if self._poller_lock is None:
+            self._poller_lock = acquire_poller_lock(Path(self._db_path).parent, self.site.name)
         reports: list[SiteTickReport] = []
         sleep = self._sleep if self._sleep is not None else time.sleep
         ticks = 0
         try:
-            while max_ticks is None or ticks < max_ticks:
-                self._cycle_started = time.monotonic()
-                reports.append(self.tick())
-                ticks += 1
-                if once or (max_ticks is not None and ticks >= max_ticks):
-                    break
-                sleep(self._cycle_delay())
-        except BaseException:
-            # A raise here is a BUG, not a device failure (`tick()` absorbs those). The
-            # counters go out before the traceback so journald keeps them, and
-            # `Restart=always` brings the process back.
-            _abort_line(
-                f"agent run aborted site={self.site.name} after {ticks} tick(s); "
-                f"counters={self.policy.counters}"
-            )
-            raise
+            # GC-P11: `gateclerk status` reads `<state root>/agent.pid` for its agent line,
+            # and until now nothing wrote it. Inside the lock's try is the whole contract:
+            # a process that lost the lock never writes (the write above this try is
+            # unreachable for it), and the state dir already exists because the lock file
+            # was just created in it. `Path.write_text` is not atomic, but a one-line pid
+            # is read with `.strip()` by a reader that treats a torn read as "unreadable —
+            # agent state unknown" (status_cli's WARN branch), never as a false alive.
+            self._pidfile = Path(self._db_path).parent / AGENT_PIDFILE_NAME
+            self._pidfile.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            try:
+                while max_ticks is None or ticks < max_ticks:
+                    self._cycle_started = time.monotonic()
+                    reports.append(self.tick())
+                    ticks += 1
+                    if once or (max_ticks is not None and ticks >= max_ticks):
+                        break
+                    sleep(self._cycle_delay())
+            except BaseException:
+                # A raise here is a BUG, not a device failure (`tick()` absorbs those). The
+                # counters go out before the traceback so journald keeps them, and
+                # `Restart=always` brings the process back.
+                _abort_line(
+                    f"agent run aborted site={self.site.name} after {ticks} tick(s); "
+                    f"counters={self.policy.counters}"
+                )
+                raise
+        finally:
+            # Runs after that `except` re-raises: the lock goes back even on a bug trace,
+            # so the process `Restart=always` starts next can take it (R7's restart path).
+            release_poller_lock(self._poller_lock)
+            self._poller_lock = None
         return SiteRunReport(
             site=self.site.name,
             db_path=self._db_path,
@@ -780,7 +955,24 @@ class SiteAgent:
         The mnotify sink is drained for its own bounded time so `--once` and a SIGTERM
         both give an accepted page a chance to finish; a still-running page only warns
         (the local evidence line was already written before it was queued).
+
+        The GC-P10 poller lock is released first if it is still held — the normal case
+        is a no-op (`run()`'s `finally` already dropped it and stored None); what this
+        covers is a caller that built the agent and closed it without ever running it.
+        The GC-P11 pidfile goes in the same breath, under the same twice-safe pattern, and
+        only when it still names THIS process.
         """
+        release_poller_lock(self._poller_lock)
+        self._poller_lock = None
+        # GC-P11: the pidfile is `gateclerk status`' agent line, so a stale one is a lie on
+        # the operator's screen — but deleting a file we no longer own is a worse lie (a
+        # poller that started after our last tick would silently lose its evidence). The
+        # content check is the guard; a missing or unreadable file is already nothing to do.
+        if self._pidfile is not None:
+            with contextlib.suppress(OSError):
+                if self._pidfile.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    self._pidfile.unlink()
+            self._pidfile = None
         close_sink = getattr(getattr(self.policy, "sink", None), "close", None)
         if callable(close_sink):
             close_sink()
@@ -1172,6 +1364,60 @@ def resolve_state_root(site: SiteConfig, state_root: Path | str | None) -> Path:
     return Path(resolve_db_path(site, state_root)).parent
 
 
+class PollerAlreadyRunning(ConfigError):  # noqa: N818 — name fixed by the GC-P10 card
+    """Another process already owns this site's poll loop (one site, one poller)."""
+
+
+def acquire_poller_lock(state_root: Path | str, site: str) -> Any:
+    """Hold an exclusive non-blocking flock for the life of the agent process.
+
+    GC-P10's enforcement of the deployment law: two `agent run` processes on one site
+    burn the terminal's ~190-use digest nonce budget together and can trip the 401
+    lockout, so the second starter must be refused BEFORE it presents credentials — a
+    lockout is worse than a refused start (R7). The lock lives in the state root because
+    that is the site's one writable directory (unit `ReadWritePaths`), and `flock` is
+    the right primitive: the kernel drops it when the holder's fd closes, so a killed,
+    crashed or rebooted poller never leaves a stale file to clean up. The PID written
+    after the lock is won names the owner for the operator (`cat` the file, then `ps`).
+
+    Returns the open handle — the lock is only held while the fd stays open, so the
+    CALLER must keep the return value alive (that is why `SiteAgent` stores it). Raises
+    `PollerAlreadyRunning` (a `ConfigError`, exit 2 via `cli_shared._fail`) naming the
+    lock path when the flock is already held.
+    """
+    path = Path(state_root) / f"gateclerk-{site}{POLLER_LOCK_SUFFIX}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise PollerAlreadyRunning(
+            f"another agent already polls site {site!r} (lock {path}); "
+            "stop it before starting a second poller"
+        ) from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def release_poller_lock(handle: Any) -> None:
+    """Release the lock and close the file; safe to call twice.
+
+    "Twice-safe" is the `None` check, which is also why every caller sets its stored
+    handle back to `None` after releasing: `run()`'s `finally` and `close()` both
+    release, and the second of the two must be a no-op, not a write to a closed fd.
+    """
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 # --- the composition (no socket opens, no credential values kept) ----------------------------
 
 
@@ -1247,8 +1493,8 @@ def build_site_agent(
     ):
         raise ConfigError(
             f"push_target {site.push_target!r} has no transport: this repo serves "
-            "`stub://` and `https://` only and never invents an endpoint "
-            "(docs/P2-SITE-AGENT.md §3). Unset push_target, or aim it at one of those."
+            "`stub://` and `https://` only and never invents an endpoint. "
+            "Unset push_target, or aim it at one of those."
         )
     db_path = resolve_db_path(site, state_root)
     root = Path(db_path).parent

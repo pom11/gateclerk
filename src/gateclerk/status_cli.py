@@ -15,7 +15,7 @@ The three laws this module exists to hold
    statement `sink_cmds._sink_store` makes), never against the ingest (no probe, no
    POST), never against the device (the device line is CACHE-ONLY — see `_device_section`).
    A status screen that hammers a door controller is how health checks become incidents
-   (docs/P2-SITE-AGENT.md §2e made the same argument about /healthz).
+   (docs/internal/P2-SITE-AGENT.md §2e made the same argument about /healthz).
 
 2. THE DB IS THE STATE. Every number is read from a table or a file the agent already
    writes: per-sink pending/dead-letter counts from `push_queue`/`dead_letter` via

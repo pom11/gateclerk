@@ -508,7 +508,7 @@ def read_target_faces(
     The third element is the REPORT-ONLY device-wide set of readable template
     families (``FR\\d{6}`` markers) across every PRESENT row this walk saw — the
     "target's native magic where the target has ≥1 face" the capture recorded
-    (V4.13.0 -> FR702706, docs/OBSERVED-site-B.md). It rides the ``modelData`` decode
+    (V4.13.0 -> FR702706, docs/internal/OBSERVED-site-B.md). It rides the ``modelData`` decode
     ``read_face_row`` already performs for the hash (``template_magic`` reads at most
     8 of those bytes — transport, never a parse, §2), costs zero extra requests, and
     feeds ONLY the report-only ``facePortability`` note. Empty on a failed read (and

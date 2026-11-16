@@ -1,6 +1,6 @@
 """Card E1-11: the faces phase must know the DEVICE WALL we captured on site-B.
 
-Why this file exists (the sanctioned capture, 2026-10-23, docs/OBSERVED-site-B.md
+Why this file exists (the sanctioned capture, 2026-10-23, docs/internal/OBSERVED-site-B.md
 "Face WRITE capture"): applying our exported face templates to site-B (V4.13.0)
 answered HTTP 400 with::
 
@@ -318,7 +318,13 @@ def test_the_captured_wall_rejects_classifies_aborts_and_never_retries(
     message = str(raised.value)
     assert "re-enroll" in message, "the abort must name the human next step"
     assert "generation mismatch" in message
-    assert "OBSERVED-site-B.md" in message, "the abort must cite the capture"
+    # The abort cites the capture by SECTION, not by path. This string is printed inside a
+    # container/wheel that has no `docs/` tree to open, so a path there is a dead end by
+    # construction — `tests/test_doc_citations.py` pins that no printed string names one.
+    # The invariant is unchanged (the abort must point at the capture that proved this
+    # wall); only its carrier moved, from a filename no shipped reader can resolve to the
+    # section title that a developer can grep out of the probe record.
+    assert "Face WRITE capture" in message, "the abort must cite the capture"
     assert raised.value.result.aborted is True
     # NO retry: the device saw exactly ONE FDSetUp for a refusal it will repeat (§0.6).
     assert box.setup_attempts == [FOREIGN_B64]

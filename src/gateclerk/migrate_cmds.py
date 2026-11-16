@@ -1,12 +1,18 @@
-"""The `gateclerk migrate` group: `probe`, `export`, `diff`, `apply`, `undo` (CLI-SEAM-MOVE).
+"""The `gateclerk migrate` group: `probe`, `export`, `diff`, `apply`, `undo` (CLI-SEAM-MOVE),
+plus GC-P16c's `clean` (GC-14's retention verb: report first, delete only with `--apply`).
 
 One-way import law (`tests/test_cli_structure.py`): `gateclerk.cli` imports this module and
 calls `migrate_cmds.register(app)`; this module imports `gateclerk.cli_shared`, never
 `gateclerk.cli`.
+
+The law the group's help text states in its own words — `apply` writes only with `--apply`,
+`undo` removes only what a journal proved this run added — is
+`docs/internal/ENROLLMENT-MIGRATION.md` §5a/§7.
 """
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -48,9 +54,10 @@ __all__ = [
 migrate_app = typer.Typer(
     name="migrate",
     help=(
-        "Enrollment migration (docs/ENROLLMENT-MIGRATION.md): probe, export and diff are "
-        "read-only; `apply` performs writes only with --apply, and `undo` removes only "
-        "what a journal proved this run added (§5a)."
+        "Enrollment migration: probe, export and diff are read-only; `apply` performs "
+        "writes only with --apply, `undo` removes only what a journal proved this run "
+        "added, and `clean` reports what a TTL purge would remove and deletes only with "
+        "--apply."
     ),
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
@@ -522,6 +529,79 @@ def migrate_undo(
     else:
         render([report.as_dict()], fmt=fmt.value)
     raise typer.Exit(code=report.exit_code)
+
+
+@migrate_app.command("clean")
+def migrate_clean(
+    bundles_root: BundleRootOpt = None,
+    older_than: Annotated[
+        str,
+        typer.Option("--older-than", help="Delete artifacts older than this age (e.g. 7d)."),
+    ] = "7d",
+    apply_writes: Annotated[
+        bool,
+        typer.Option("--apply", help="Actually delete. Without it this is a dry run."),
+    ] = False,
+    output: OutputOpt = OutputFormat.TABLE,
+) -> None:
+    """Remove old enrollment bundles and run journals (dry-run by default).
+
+    GC-14's retention answer: after a hardware swap is verified in the receiving system the
+    local rollback copy has no remaining purpose, and a bundle is full names, card numbers
+    and biometric templates sitting on a laptop. Two buckets are in scope — ``bundles/`` and
+    ``runs/`` — and one is not: ``probes/`` stays put, because the probe cache is what lets
+    ``diff`` and ``apply`` read at all (§3), not a copy of anyone's enrollment.
+
+    A run dir whose phase journal has no matching ``<phase>.undo.jsonl`` is named as
+    unresolved, because that journal is the only thing ``migrate undo`` can replay and
+    deleting it ends the chance to roll the run back — a purge that ages one out is a
+    decision, not housekeeping. The report says which ones; it does not refuse them.
+
+    The default is the report. Nothing is removed until the operator has read it and passed
+    ``--apply``, which is the same review gate ``apply`` runs on (§4). Exit: 0 (an empty
+    inventory is a healthy site, not a broken one), 2 for an unreadable ``--older-than``.
+    """
+    from gateclerk import migrate_apply as apply_mod
+    from gateclerk import migrate_bundle as bundle_mod
+
+    fmt = output
+    try:
+        days = int(older_than.strip().rstrip("d"))
+        if days <= 0:
+            raise ValueError("--older-than must be a positive number of days")
+    except ValueError as exc:
+        raise _config_exit(fmt, f"invalid --older-than {older_than!r}: use e.g. 7d") from exc
+    root = apply_mod.bundle_root(bundles_root)
+    now_val = cli_shared._now()
+    cutoff = now_val - timedelta(days=days)
+    report = bundle_mod.clean_artifacts(root, older_than=cutoff, apply=apply_writes, now=now_val)
+    payload = {
+        "root": str(report.root),
+        "older_than": report.older_than.isoformat(),
+        "apply": report.apply,
+        "bundles": [str(p) for p in report.bundles],
+        "runs": [str(p) for p in report.runs],
+        "unresolved_runs": [str(p) for p in report.unresolved_runs],
+        "count": report.count,
+    }
+    if fmt is OutputFormat.TABLE:
+        typer.echo(f"{'deleted' if report.apply else 'would delete'} {report.count} artifact(s)")
+        for path in (*report.bundles, *report.runs):
+            typer.echo(str(path))
+        if report.unresolved_runs:
+            # One line, naming the count AND the dirs, and stating the loss rather than
+            # the rule: the paths are already listed above, and a reader who skipped them
+            # is exactly the reader this line is for. It is the same fact in both output
+            # formats — the JSON carries it as a key, this carries it as a sentence.
+            typer.echo(
+                f"warning: {len(report.unresolved_runs)} of those run dirs "
+                f"({', '.join(str(p) for p in report.unresolved_runs)}) hold a phase "
+                "journal with no matching undo journal — that journal is the only thing "
+                "`migrate undo` can replay, so this purge takes away the chance to undo "
+                "the run. Deleting them is a decision, not housekeeping."
+            )
+        return
+    render([payload], fmt=fmt.value)
 
 
 def register(app: typer.Typer) -> None:

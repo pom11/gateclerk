@@ -51,7 +51,7 @@ it can be observed.
 The first two are used by `tests/test_model.py` (card p1-07); the third by
 `tests/test_e1_10_picid_dialect.py`. If a later live probe shows the device really does
 emit one of these shapes, replace the synthetic file with a masked recording and say so in
-`docs/OBSERVED.md`.
+`docs/internal/OBSERVED.md`.
 
 ## Scenario corpus — `scenarios/` (card p1-09)
 

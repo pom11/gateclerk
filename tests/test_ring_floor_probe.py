@@ -21,15 +21,29 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from fakedevice import FakeDevice
-from test_p2_03_scheduler import EVENT_PATH, T0, device_event, seeded_device
+from test_p2_03_scheduler import (
+    EVENT_PATH,
+    SYSTEM_TIME_PATH,
+    T0,
+    device_event,
+    seeded_device,
+    system_time_body_at,
+)
 from test_p2_07b_agent_cli import AgentHarness, punch_events, wall_digits
 
 
 def _probe_conditions(device: FakeDevice) -> list[dict[str, Any]]:
-    """Every AcsEvent POST body that was the one-page ring-floor probe."""
+    """Every AcsEvent POST body that was the one-page ring-floor probe.
+
+    GC-P15 added a SECOND one-page probe (the quiet-tick reset read), so `maxResults
+    == 1` alone no longer names this one. The discriminator is the direction: the ring
+    floor is the OLDEST retained event (no `timeReverseOrder` key, pinned at line ~140
+    below), the reset probe is the newest (key present and true).
+    """
     out: list[dict[str, Any]] = []
     for served in device.served:
         if served.path != EVENT_PATH or not served.body:
@@ -39,7 +53,11 @@ def _probe_conditions(device: FakeDevice) -> list[dict[str, Any]]:
         except ValueError:  # pragma: no cover - every body this suite sends is JSON
             continue
         cond = body.get("AcsEventCond") if isinstance(body, dict) else None
-        if isinstance(cond, dict) and cond.get("maxResults") == 1:
+        if (
+            isinstance(cond, dict)
+            and cond.get("maxResults") == 1
+            and "timeReverseOrder" not in cond
+        ):
             out.append(cond)
     return out
 
@@ -61,6 +79,28 @@ def _alerts_during(h: AgentHarness, alerts: list[Any]) -> Any:
         raise
 
 
+def _advance_clock(h: AgentHarness, device: FakeDevice, delta: timedelta) -> None:
+    """Move the frozen clock AND the fake's RTC with it — one clock, like a real terminal.
+
+    `h.now` is the agent's clock; the fake answers `System/time` from a body stamped when the
+    device was seeded. A real RTC keeps counting, so jumping the agent's clock by hours or days
+    and leaving the device's behind would hand GC-P04's newly-wired clock channel an
+    artifact-skew to page `clock_skew` on — noise inside the exact-alert assertions these cases
+    pin, and physically false: nothing in these scenarios switched the terminal off for a week.
+    Both clocks therefore move together, in the one place. (`reset`, not `xml_ok`/`add`: the
+    route must be REPLACED, or the stale stamp keeps answering — GC-P03's pitfall.)
+    """
+    h.now += delta
+    h.monotonic.advance(delta.total_seconds())
+    device.reset(
+        "GET",
+        SYSTEM_TIME_PATH,
+        httpx.Response(
+            200, text=system_time_body_at(h.now), headers={"Content-Type": "application/xml"}
+        ),
+    )
+
+
 def test_outage_past_the_ring_pages_before_the_checkpoint_advance_hides_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -79,8 +119,7 @@ def test_outage_past_the_ring_pages_before_the_checkpoint_advance_hides_it(
 
     # Eight days down: the ring has recycled. Only events from the new stream survive
     # on the device (the old rows are gone, not merely unread).
-    h.now += timedelta(days=8)
-    h.monotonic.advance(8 * 86400)
+    _advance_clock(h, device, timedelta(days=8))
     device._event_store = []
     device.add_events(
         device_event(9000, wall_digits(h.now - timedelta(minutes=2))),
@@ -111,8 +150,7 @@ def test_outage_past_the_ring_pages_before_the_checkpoint_advance_hides_it(
         assert "timeReverseOrder" not in probes[0], "oldest-first is the default"
 
         # The next ok tick is not the first after the gap: no second probe, no page.
-        h.now += timedelta(seconds=300)
-        h.monotonic.advance(300)
+        _advance_clock(h, device, timedelta(seconds=300))
         later = agent.tick()
         assert later.ticks_ok == 1 and later.alerts == ()
         assert len(_probe_conditions(device)) == 1
@@ -134,8 +172,7 @@ def test_short_restart_does_not_probe(tmp_path: Path, monkeypatch: pytest.Monkey
     finally:
         first_agent.close()
 
-    h.now += timedelta(hours=1)
-    h.monotonic.advance(3600)
+    _advance_clock(h, device, timedelta(hours=1))
     alerts: list[Any] = []
     agent, report = _alerts_during(h, alerts)
     try:
@@ -157,8 +194,7 @@ def test_quiet_week_of_successful_polls_sends_no_extra_request_and_no_page(
     try:
         assert agent.tick().ticks_ok == 1
         for _ in range(14):  # 7 days, a poll every 12 hours, every one successful
-            h.now += timedelta(hours=12)
-            h.monotonic.advance(12 * 3600)
+            _advance_clock(h, device, timedelta(hours=12))
             report = agent.tick()
             assert report.ticks_ok == 1, report
         assert _probe_conditions(device) == [], "successful polls never spend the probe"
@@ -184,8 +220,7 @@ def test_a_punch_arriving_between_walk_and_probe_cannot_page(
 
     # The gap is old enough to be worth a probe, but the device has NOT evicted
     # anything: the next device-wide serial after the checkpoint is 201.
-    h.now += timedelta(hours=25)
-    h.monotonic.advance(25 * 3600)
+    _advance_clock(h, device, timedelta(hours=25))
     device._event_store = []
 
     alerts: list[Any] = []

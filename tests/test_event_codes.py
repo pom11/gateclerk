@@ -266,7 +266,7 @@ def test_employee_no_string_beats_the_int_form() -> None:
 
 
 def test_minor_38_is_fingerprint_not_card() -> None:
-    """docs/references/acs-event-codes.md §3: a circulating table mislabels 38 as card
+    """docs/internal/references/acs-event-codes.md §3: a circulating table mislabels 38 as card
     success. The curated table follows the vendor hex table; card pass is minor 1."""
     assert name_for(5, 38) == "FINGERPRINT_PASS"
     assert name_for(5, 1) == "CARD_PASS"
@@ -357,7 +357,7 @@ def test_classification_is_serialisable_for_downstream_storage() -> None:
 # The card's premise is "no guessed codes". These tests make that a machine-checked
 # property instead of a docstring promise: every shipped row must carry catalog
 # provenance (`src`), must appear in the generated §3.1 table of
-# docs/references/acs-event-codes.md, and that table must agree with the vendored
+# docs/internal/references/acs-event-codes.md, and that table must agree with the vendored
 # catalogs under tests/fixtures/vendor/. A row no catalog names cannot survive: it has
 # no src and no doc row, and an unnamed code behaves correctly anyway
 # (info + unknown_code + kept).
@@ -427,7 +427,9 @@ def test_every_table_row_is_reproduced_in_the_reference_doc() -> None:
     doc_rows = reference_doc_rows()
     assert doc_rows, "the generated §3.1 table must exist in the reference doc"
     missing = [k for k in EVENT_CODE_TABLE if k not in doc_rows]
-    assert not missing, f"rows missing from docs/references/acs-event-codes.md §3.1: {missing}"
+    assert not missing, (
+        f"rows missing from docs/internal/references/acs-event-codes.md §3.1: {missing}"
+    )
     for (major, minor), info in EVENT_CODE_TABLE.items():
         row = doc_rows[(major, minor)]
         assert row["gateclerk_name"] == info.name, (major, minor)
@@ -657,7 +659,7 @@ def test_generated_block_is_byte_identical_to_the_generator_output() -> None:
     block = mod.build_block()
     text = REFERENCE_DOC.read_text(encoding="utf-8")
     assert block in text, (
-        "the generated block in docs/references/acs-event-codes.md has drifted from "
+        "the generated block in docs/internal/references/acs-event-codes.md has drifted from "
         "`uv run python scripts/gen_code_reference.py --write` — re-run the generator"
     )
 

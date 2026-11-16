@@ -1,6 +1,6 @@
 """The P2 site agent's outbound pusher: sqlite send buffer, backoff, dead-letter.
 
-Card P2-04 (docs/P2-SITE-AGENT.md §2b + §2c + §3, SIGNED OFF 2026-10-19). Three pieces,
+Card P2-04 (docs/internal/P2-SITE-AGENT.md §2b + §2c + §3, SIGNED OFF 2026-10-19). Three pieces,
 all of them the spec's, none invented:
 
 **The queue is a buffer, not a second store.** `push_queue` rows point at stored events
@@ -128,7 +128,9 @@ DEFAULT_PUSH_BACKOFF_CAP_S = DEFAULT_BUSY_BACKOFF_CAP
 
 #: Rows one `drain` will attempt. A drain is one tick of the agent loop; an unbounded
 #: drain of a week-old backlog would run past the next poll (and past the nonce budget).
-#: The rest of the backlog is still queued, due, on the next tick.
+#: The rest of the backlog is still queued, due, on the next tick. The limit bounds a
+#: PASS, not a request: every row inside it still gets its own POST, and `GC-07` in the
+#: 2026-11-13 audit records why a pass is deliberately not one multi-line POST.
 DEFAULT_PUSH_BATCH_LIMIT = 200
 
 #: The synthetic error class for "the ingest answered a non-2xx status" (§2b wants an
@@ -297,7 +299,7 @@ def _check_endpoint(endpoint: str, *, what: str) -> None:
         allowed = " or ".join(SINK_REF_SCHEMES)
         raise PushTargetError(
             f"{what} {endpoint!r} has an unacceptable scheme: a push target must start "
-            f"with {allowed} (docs/P2-SITE-AGENT.md §3 — never invented, never defaulted)"
+            f"with {allowed} — never invented, never defaulted"
         )
 
 
@@ -493,8 +495,19 @@ def drain(
 
     Each row is its own transaction and its own transport call, so one poison row cannot
     wedge the rows behind it (the spec's "keep retrying the queue" only means something
-    if a failure is not allowed to stop the drain). Success DELETEs the queue row and any
-    dead-letter row for the same key — the store keeps the event either way.
+    if a failure is not allowed to stop the drain). One call per row is also what keeps the
+    ACK unit per row: the ingest answers a multi-line body with ONE status for the whole
+    body and a 200 that carries only aggregate counts, so a batched send would make every
+    row in the pass inherit the failure of its worst row (`GC-07`, decided 2026-11-14; the
+    receiver-side shape is in `HttpsIngestTransport`'s docstring). Success DELETEs the queue
+    row and any dead-letter row for the same key — the store keeps the event either way.
+
+    What a failure COSTS depends on what the failure was: a permanent payload rejection
+    (`PERMANENT_REJECT_STATUSES` — 400, 422) dead-letters on the FIRST failure because a line
+    the ingest will never accept is not an outage and re-sending it for a day only spends the
+    site's request budget; a transient one (a 5xx, a raised network error) keeps the 24 h bound
+    and the jitter ladder; and 401/403 keep retrying, because those are credential problems
+    that `HttpsIngestTransport`'s token re-read can heal without a restart.
 
     `row_meta` (SINKS-WIRING) is the queue's side of the file sinks' contract: a transport
     that declares `renders_rows = True` is handed the row's own facts (`event_id`,
@@ -537,7 +550,11 @@ def drain(
         # a write) is what lets the failure and its reschedule land in ONE transaction.
         first_failed_at = row["first_failed_at"] or stamp
         elapsed = (now - _parse(first_failed_at)).total_seconds()
-        if elapsed >= dead_letter_after_s:
+        permanent = (
+            isinstance(outcome, HttpStatusRejectedError)
+            and outcome.status in PERMANENT_REJECT_STATUSES
+        )
+        if elapsed >= dead_letter_after_s or permanent:
             _move_to_dead_letter(
                 conn,
                 row,
@@ -599,6 +616,13 @@ class HttpStatusRejectedError(Exception):
     def __init__(self, status: int, *args: object) -> None:
         super().__init__(f"the ingest answered {status}", *args)
         self.status = status
+
+
+#: Statuses that say the payload itself will never be accepted. Retrying them for
+#: 24 h only burns the site's request budget; the owner must fix or discard the row.
+#: 401/403 are deliberately NOT here: those are token/config problems that a re-read
+#: can fix (see the token refresh in `HttpsIngestTransport.__call__`).
+PERMANENT_REJECT_STATUSES: frozenset[int] = frozenset({400, 422})
 
 
 def _send_row(
@@ -818,7 +842,7 @@ def replay_dead_letter(
     if row is None:
         raise DeadLetterMissingError(
             f"no dead_letter row with id {dead_letter_id}: nothing to replay. List them "
-            "with `dead_letter_rows` (P2-07's `gateclerk dead-letter list`)."
+            "with `dead_letter_rows` (P2-07's operator verb `gateclerk agent deadletter list`)."
         )
     target = row["endpoint"] if endpoint is None else endpoint
     sink = row["sink_name"] if sink_name is None else sink_name
@@ -998,12 +1022,10 @@ def dead_letter_rows(
 #: validator (`HTTPS://` in a config is a mistake worth a loud error).
 INGEST_SCHEME = "https://"
 
-#: The env rung mirrors the function's OWN variable name (`_GATECLERK_INGEST_SECRET_PREFIX`
-#: in functions/main.py): one name per site works in the agent's environment and in the
-#: Cloud Run runtime, so an operator sets exactly one thing per site either way. The
-#: spelling lives in `gateclerk.credentials` (the resolver owns the ref names and the inverse
-#: ref -> env-var mapping) and is imported by name above, so `agent_push.INGEST_TOKEN_ENV_PREFIX`
-#: and the resolver's are the same object rather than two strings that happen to match.
+#: The env rung is the AGENT's own contract: `GATECLERK_INGEST_TOKEN_<SITE>`.
+#: The Cloud Run receiver reads its own Secret Manager/env names, which
+#: are legacy-prefixed and deliberately not spelled here (see the private plan).
+#: The two processes are configured separately; neither name has to match.
 
 #: The keychain service holding one site's ingest token. The account is the site (the
 #: device credential's account is the host — different item, different purpose, both
@@ -1034,8 +1056,12 @@ class IngestTokenUnavailableError(PushError):
 def ingest_token_env_var(site: str) -> str:
     """The env variable naming one site's ingest token: `GATECLERK_INGEST_TOKEN_<SITE>`.
 
-    Site names are uppercased for the lookup because the function uppercases site codes
-    before comparing (`GATECLERK_SITES` / `GATECLERK_INGEST_TOKEN_SITE-A` on both ends).
+    That spelling is the AGENT's own contract (`GATECLERK_INGEST_TOKEN_SITE-A` for
+    `site-a`). The Cloud Run receiver reads its own site-list env var and its own
+    legacy-prefixed token names from its own secret store (deliberately not spelled here;
+    see the private plan); the two ends are configured independently and neither name has
+    to match. Site names are uppercased for the lookup because the receiver uppercases
+    site codes before comparing.
     """
     return f"{INGEST_TOKEN_ENV_PREFIX}{site.strip().upper()}"
 
@@ -1073,6 +1099,24 @@ class HttpsIngestTransport:
     a private exception class: the class name (`ConnectError` vs `ReadTimeout`) is the
     operator's diagnostic, and §2b's error-class column reads it verbatim.
 
+    ONE POST PER ROW IS A DECIDED SHAPE, not an oversight (audit 2026-11-13 `GC-07`, decided
+    2026-11-14). The ingest does accept a multi-line JSONL body — `functions/main.py` caps
+    one at 5000 lines and its own comment notes this drain's 200-row cap — but it answers
+    such a body with a SINGLE status for the whole body: one unparseable line is a `400` for
+    all of it (`functions/main.py:7965`), one device serial unknown to this site is a `422`
+    for all of it (`functions/main.py:8078`), a Business Central failure is a `502` for all
+    of it (`functions/main.py:8062,8118`), and the `200` carries only aggregate counts
+    (`accepted`/`inserted`/`replayed`/`skipped`/`upserted`) — never which line it refused.
+    Because `PERMANENT_REJECT_STATUSES` dead-letters a `400`/`422` on the FIRST failure, one
+    unregistered terminal would then dead-letter a whole pass (up to
+    `DEFAULT_PUSH_BATCH_LIMIT` rows, which the CLI can only list and remove — replay has no
+    verb), a worse failure than the one the batching idea answered. So the row is the ack
+    unit and the retry unit here, and the ledger + `prune_pushed_events` + the non-punch
+    report all key on per-event ids. The roster is this design's own precedent for batching
+    INSIDE one record instead: `device_users_line` puts every user of the site in ONE line
+    and sends ONE POST. Making the transport batch would need a per-line verdict in the
+    receiver's `200` body first — a contract decision in that repository, not in this one.
+
     The token lives only in `_token: Secret` — the holder whose repr/str are `***`.
     `repr(self)` prints the Secret wrapper, never a value; the label names the SOURCE
     (`keychain:gateclerk-ingest-site-a`, `env:GATECLERK_INGEST_TOKEN_SITE-A`, `flag`) so an
@@ -1091,6 +1135,8 @@ class HttpsIngestTransport:
         "_keychain",
         "_owns_client",
         "_token",
+        "_token_env",
+        "_token_keychain",
         "confirm_site",
         "site",
         "timeout",
@@ -1104,6 +1150,8 @@ class HttpsIngestTransport:
         token: str | Secret | None = None,
         env: Mapping[str, str] | None = None,
         keychain: Any = None,
+        token_env: str | None = None,
+        token_keychain: str | None = None,
         client: Any = None,
         confirm_site: bool = True,
         connect_timeout_s: float = DEFAULT_INGEST_CONNECT_TIMEOUT_S,
@@ -1119,6 +1167,12 @@ class HttpsIngestTransport:
         self.confirm_site = bool(confirm_site)
         self._env = env
         self._keychain = keychain
+        #: Token REF OVERRIDEs (names, never values) for a caller that authenticates as the
+        #: site but reads its bearer from somewhere else — the sink layer's `token_env` /
+        #: `token_keychain`. None keeps the site's own refs. Stored unresolved on purpose:
+        #: a REF costs nothing at construction, where a READ can raise (see `_resolve_token`).
+        self._token_env = token_env
+        self._token_keychain = token_keychain
         self._explicit = (
             Secret(token, label=f"flag:{self.site}") if isinstance(token, str) else token
         )
@@ -1168,9 +1222,20 @@ class HttpsIngestTransport:
             content=payload.encode("utf-8"),
             headers=headers,
         )
+        status = int(response.status_code)
+        if status in (401, 403):
+            # The next attempt re-reads the credential ladder (rotated token, wrong site,
+            # credential file just installed). Do not dead-letter: this is an install step.
+            #
+            # The memo in `_resolve_token` exists for a reason — every macOS `security` read
+            # can raise an ACL prompt, so a drain must not re-ask per row. Dropping it ONLY on
+            # an auth rejection keeps that property (a 200 or a 5xx never costs a re-read) and
+            # is the whole recovery: this call still returns the status it got, and the row is
+            # already rescheduled, so the SAME row is not re-sent inside this drain pass.
+            self._token = None
         # The response body is NOT folded into any exception or log: a server message
         # is uncontrolled text, and §2b's error class needs only the status.
-        return int(response.status_code)
+        return status
 
     def close(self) -> None:
         """Release the socket pool — only for the client this transport built."""
@@ -1226,6 +1291,10 @@ class HttpsIngestTransport:
           error column reads "install step", not "outage";
         * the resolution is cached, because every `security` call can raise a macOS ACL
           prompt and a drain must not re-ask per row.
+
+        `self._token_env` / `self._token_keychain` override WHICH REF each rung reads (the sink
+        layer's job — see `sink_writers.build_https_sink_transport`); the LADDER is unchanged
+        either way, so an override only redirects a rung, it never removes one.
         """
         if self._token is not None:
             return self._token
@@ -1240,8 +1309,8 @@ class HttpsIngestTransport:
                 # would silently route past the patch (a fake that is never called reads as
                 # a pass, which is the worst direction for a credential test to fail in).
                 keychain=self._keychain if self._keychain is not None else KeychainReader(),
-                env_var=ingest_token_env_var(self.site),
-                keychain_service=ingest_keychain_service(self.site),
+                env_var=self._token_env or ingest_token_env_var(self.site),
+                keychain_service=self._token_keychain or ingest_keychain_service(self.site),
             )
         except CredentialUnavailable as exc:
             # The resolver's own text already opens with "no ingest bearer token for site
@@ -1295,6 +1364,8 @@ def https_transport(
     token: str | Secret | None = None,
     env: Mapping[str, str] | None = None,
     keychain: Any = None,
+    token_env: str | None = None,
+    token_keychain: str | None = None,
     client: Any = None,
     confirm_site: bool = True,
     connect_timeout_s: float = DEFAULT_INGEST_CONNECT_TIMEOUT_S,
@@ -1306,12 +1377,19 @@ def https_transport(
     across this repo: a test that reads the real keychain or opens a real socket is not
     a test (conftest's netoff would kill the socket anyway). Production passes nothing
     but the site and gets flag>env>keychain resolution over `gateclerk-ingest-<site>`.
+
+    `token_env` / `token_keychain` redirect the env and platform-store RUNGS to a different
+    REF (names only, never values) while the site stays the authenticated identity — the
+    sink layer's `[[site.sink]]` block uses them so one site may deliver through two
+    sinks with two bearers. Nothing is read here: the ladder runs on the first send.
     """
     return HttpsIngestTransport(
         site,
         token=token,
         env=env,
         keychain=keychain,
+        token_env=token_env,
+        token_keychain=token_keychain,
         client=client,
         confirm_site=confirm_site,
         connect_timeout_s=connect_timeout_s,
@@ -1401,7 +1479,7 @@ def stub_transport(target: str) -> Transport:
         raise PushTargetError(
             f"stub ingest cannot serve {target!r}: a stub target is `stub://<local path>`. "
             "https:// targets need a real transport, and this repo does not invent "
-            "endpoints (docs/P2-SITE-AGENT.md §3)."
+            "endpoints."
         )
     remainder = target[len("stub://") :].strip()
     if not remainder:

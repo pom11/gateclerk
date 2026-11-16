@@ -1,7 +1,7 @@
 """Card P2-02: the sqlite store — (device_serial, serial_no) UPSERT + completed-only checkpoint.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §1 seams 1-3 + §2b (SIGNED OFF 2026-10-19).
-Device truth: docs/OBSERVED.md ("Event log census": serialNo is device-wide monotonic,
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §1 seams 1-3 + §2b (SIGNED OFF 2026-10-19).
+Device truth: docs/internal/OBSERVED.md ("Event log census": serialNo is device-wide monotonic,
 the major=3 noise interleaves with punches — serials 5742..5753 — which is what makes a
 device-wide serial checkpoint sound; paging.py:612-615 hands ChunkResult.max_serial_no
 ONLY for completed chunks).

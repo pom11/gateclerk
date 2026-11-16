@@ -16,12 +16,12 @@ error envelope and **no `WWW-Authenticate` header at all**. Note what is absent 
 challenge means httpx.DigestAuth returns the response untouched (its re-pay is gated
 on the header, `_auth.py:201`), so the client keeps presenting the retired nonce and
 the walk dies: exit 3 at the request where the nonce aged out, with the CORRECT
-password and the device unlocked — exactly docs/OBSERVED.md "Digest nonce use-cap".
+password and the device unlocked — exactly docs/internal/OBSERVED.md "Digest nonce use-cap".
 `lockStatus=unlock` / `unlockTime=0` mirror the owner's post-mortem read of the device
 (unlocked, retryLoginTime=4), which is why recovery is allowed here and never when the
 body says `locked`. Style follows the recorded `error_naive_start_time.json` /
 `digest_challenge_401.txt` envelopes; `authFailed` as a subStatusCode is invented.
 Served by: FakeDevice(retire_shape=RETIRE_ENVELOPE_ONLY).
-Client outcome (probe, docs/FINDINGS-t_a3521d8a.md F1): the pre-fix client died here at
+Client outcome (probe, docs/internal/FINDINGS-t_a3521d8a.md F1): the pre-fix client died here at
 request N+1 and opened the circuit; the fix drops the digest state (nonce AND nc) and
 re-issues the identical request, which re-bootstraps via a normal challenge.

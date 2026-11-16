@@ -1,11 +1,11 @@
 # gateclerk
 
-Hikvision face/card terminals → Business Central timesheets. Details in docs/DESIGN.md.
+Hikvision face/card terminals → Business Central timesheets. Details in docs/internal/DESIGN.md.
 
 **Scope (owner, 2026-10-15): device side only.** P1 PROVEN on the real device
-(2026-10-18, dense-window live pass). P2 signed off 2026-10-19 (docs/P2-SITE-AGENT.md
+(2026-10-18, dense-window live pass). P2 signed off 2026-10-19 (docs/internal/P2-SITE-AGENT.md
 §6 binding). E1 (enrollment migration) opened 2026-10-21 — operator delegated the
-design end-to-end to the orchestrator (docs/ENROLLMENT-MIGRATION.md).
+design end-to-end to the orchestrator (docs/internal/ENROLLMENT-MIGRATION.md).
 
 ## Done
 - [x] **P1** read-only connector + CLI (probe → OBSERVED.md; ISAPI client w/ digest,
@@ -24,7 +24,7 @@ design end-to-end to the orchestrator (docs/ENROLLMENT-MIGRATION.md).
       keychain item** each; read-only §5 probe, then (for writes) explicit OK.
 
 ## Now (E1 — enrollment migration; first WRITE feature; design v2 2026-10-21)
-Board truth: `hermes kanban --board gateclerk list`. Design: docs/ENROLLMENT-MIGRATION.md
+Board truth: `hermes kanban --board gateclerk list`. Design: docs/internal/ENROLLMENT-MIGRATION.md
 (DAG E1-01..07 there). Users+cards port; faces report-only until R1 confirmed BOTH
 ends on bench; fingerprints never portable; PINs never persisted.
 - [ ] E1-01 bundle + export (users/cards, hashes, PII hygiene, fail-closed reads)

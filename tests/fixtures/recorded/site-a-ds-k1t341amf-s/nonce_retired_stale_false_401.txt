@@ -19,7 +19,7 @@ it is credible on this firmware precisely because the recorded
 `digest_challenge_401.txt` shows Hikvision `webs` spelling stale in lowercase and
 always sending the field. Same header/body style as that fixture.
 Served by: FakeDevice(retire_shape=RETIRE_STALE_FALSE).
-Client outcome (probe, docs/FINDINGS-t_a3521d8a.md F1): survived inside httpx —
+Client outcome (probe, docs/internal/FINDINGS-t_a3521d8a.md F1): survived inside httpx —
 `auth_flow` never parses `stale` at all (gotchas §1.5), so it re-pays this challenge
 exactly like the stale="true" one. Pinning the two shapes separately keeps the claim
 "we do not care how the device spells stale" from being an assumption.

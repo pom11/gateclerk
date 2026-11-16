@@ -1,8 +1,8 @@
 """The P2 site agent's event store: (device_serial, serial_epoch, serial_no) UPSERT +
 completed-only checkpoint.
 
-Card P2-02 (docs/P2-SITE-AGENT.md §1 seams 1-3 + §2b, SIGNED OFF 2026-10-19; device
-truth docs/OBSERVED.md). Semantics are pinned by the spec and the box — this module
+Card P2-02 (docs/internal/P2-SITE-AGENT.md §1 seams 1-3 + §2b, SIGNED OFF 2026-10-19; device
+truth docs/internal/OBSERVED.md). Semantics are pinned by the spec and the box — this module
 implements them, it does not invent them:
 
 UPSERT (seam 1). `events` is UNIQUE(device_serial, serial_epoch, serial_no) and every
@@ -38,6 +38,17 @@ Watermark (spec §2b decision (b): keep-everything + watermark alert — alertin
 is P2-05): `db_size_bytes` is the gauge value, `check_db_watermark` says whether it is
 *over* the threshold (strictly; exactly-at is not over).
 
+Retention (GC-P16a): `prune_pushed_events` is the ONE `DELETE FROM events` in the
+product, and it can only reach a row the poller has proof of having delivered (the
+caller passes `PushLedger.sent_event_ids()`) and that has aged past the local window.
+Everything else stays the owner's call, and everything the queue or the dead-letter
+still points at survives. See the function's own docstring for the four guards.
+
+Because that delete raises `MIN(serial_no)`, it also accounts for itself to the
+`AlertPolicy` whose connection it deleted from (`note_pruned`) — P2-05's
+"stored history disappeared" arm reads that same minimum, and a rise nobody accounted
+for must keep paging. A delete made without a policy in hand therefore pages, by design.
+
 Two refusals this module owns, both anti-loss:
 
 * `UnusableRecordError` — a record with `serial_no=None` cannot honour the pinned key:
@@ -63,23 +74,32 @@ from typing import Any
 from gateclerk.model import RECORD_JSON_KEYS, EventRecord, event_keys, to_jsonl
 
 __all__ = [
+    "PROBE_KINDS",
+    "PROBE_KIND_RESET",
     "Checkpoint",
     "CheckpointAdvanced",
     "CheckpointNotCompletedError",
     "CheckpointRegressionError",
     "CheckpointReset",
     "MixedDeviceError",
+    "ProbeWindow",
     "StoreError",
     "StoreResult",
     "UnusableRecordError",
     "WatermarkCheck",
     "advance_checkpoint",
+    "all_probe_windows",
     "check_db_watermark",
     "db_size_bytes",
     "event_jsonl",
     "event_rowid",
+    "probe_age_s",
+    "probe_is_current",
+    "prune_pushed_events",
     "read_checkpoint",
     "read_oldest_serial",
+    "read_probe_window",
+    "record_probe_window",
     "reset_checkpoint",
     "store_events",
 ]
@@ -180,6 +200,21 @@ def _now_iso(now: datetime | None) -> str:
     if moment.tzinfo is None:
         raise ValueError("store timestamps must be tz-aware (payroll data; pyproject DTZ)")
     return moment.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def _from_iso(stamp: str) -> datetime:
+    """Read back a stamp `_now_iso` wrote — the only format this db's clock columns use.
+
+    The counterpart exists because `probe_audit`'s window pair is read by the loop's
+    budget, not just by an operator: parsing it here (instead of at each call site) keeps
+    one reader for one format, and a naive stamp — which nothing here writes — is refused
+    rather than compared against an aware `now` (that comparison would raise TypeError
+    inside a poll tick).
+    """
+    moment = datetime.fromisoformat(stamp)
+    if moment.tzinfo is None:
+        raise ValueError(f"stamp {stamp!r} is naive; every clock column here is UTC ISO")
+    return moment
 
 
 # --- the UPSERT ---------------------------------------------------------------------------
@@ -601,6 +636,226 @@ def read_checkpoint(conn: sqlite3.Connection, device_serial: str) -> Checkpoint 
     )
 
 
+# --- the probe audit trail (GC-P15 follow-up) ----------------------------------------------
+#
+# A quiet tick answers "was the terminal swapped?" with one newest-first AcsEvent page
+# (`agent_loop._probe_newest_serial`) and, before this section, threw the answer away: the
+# only durable trace of a probe was `reset_checkpoint`, which runs only when the probe
+# CONFIRMED a reset. These two functions are the store half of the missing answer — what
+# the probe ASKED (the window) and what it COST (the pages it sent) — written even when the
+# page came back NO MATCH, because "we looked and nothing moved" is exactly the state
+# P2-05's `check_stall` cannot otherwise distinguish from "we never looked".
+#
+# One row per (device, kind): the ring-floor read asks a different question and must never
+# satisfy this probe's budget (see `_PROBE_AUDIT_V8` in agent_db for the schema argument).
+
+#: The quiet-tick reset probe (`agent_loop.RESET_PROBE_INTERVAL_S` / `_probe_newest_serial`).
+PROBE_KIND_RESET = "reset"
+
+#: Every kind `record_probe_window` accepts. A kind nothing reads would fork a second
+#: budget line no operator can see, so a new kind must arrive together with its reader.
+#: The ring-floor read is deliberately NOT one (card t_bde31e68): it has no budget to
+#: remember — its gate, `agent_cli.SiteAgent._last_ok_at`, is already durable across
+#: restarts and moves on the tick that spends the page — and a five-column row carries no
+#: answer to the question that read asks. `tests/test_gc_p15_ring_floor_kind.py` refuses
+#: the name, so it cannot join the set by accident; adding it is a decision, not an edit.
+PROBE_KINDS: frozenset[str] = frozenset({PROBE_KIND_RESET})
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeWindow:
+    """One device's last COMPLETED probe of one kind: what it asked, what it cost.
+
+    The stamps are the stored text (one format, `_now_iso`); `probed_at` is the parsed
+    instant the loop's budget is measured against.
+    """
+
+    device_serial: str
+    kind: str
+    window_from_utc: str
+    window_to_utc: str
+    reads: int
+
+    @property
+    def probed_at(self) -> datetime:
+        """When the probe ran — the upper bound it asked for (`_PROBE_AUDIT_V8`)."""
+        return _from_iso(self.window_to_utc)
+
+
+#: One UPSERT and nothing else: `reset_checkpoint`'s kill-safety argument applies verbatim
+#: here — the systemd unit can die between any two statements, so the row must land whole.
+_PROBE_UPSERT = """
+INSERT INTO probe_audit (
+    device_serial, kind, window_from_utc, window_to_utc, reads
+) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(device_serial, kind) DO UPDATE
+SET window_from_utc = excluded.window_from_utc,
+    window_to_utc = excluded.window_to_utc,
+    reads = excluded.reads
+RETURNING reads
+"""
+
+
+def record_probe_window(
+    conn: sqlite3.Connection,
+    device_serial: str,
+    *,
+    kind: str,
+    window_from: datetime,
+    window_to: datetime,
+    reads: int,
+) -> ProbeWindow:
+    """Record what one COMPLETED probe asked for and what it cost (one UPSERT).
+
+    Both window bounds go through `_now_iso`, so this column pair is the same UTC ISO
+    instant-format as every other clock column here; the caller passes the SAME instants it
+    put on the wire (relabeled for the device inside paging), not a re-derivation.
+
+    Refusals, all before any write, all loud:
+    * an unknown `kind` — a kind nothing reads is a forked budget (see `PROBE_KINDS`);
+    * `window_to < window_from` — an inverted window was never asked for; `chunk_window`
+      refuses to page one, so a row claiming it would be a stamp for a request that could
+      not have been sent (an equal pair is legal: paging yields no chunk and no request);
+    * a negative `reads`, or a naive bound (the db has no naive instants).
+
+    Deliberately NOT recorded: a probe whose read raised. A row here means "a page came
+    back over this window" (empty included); stamping a dead read as one of those would
+    make the failure indistinguishable from the clean answer the row exists to prove, and
+    the loop's own `warn` line is where a dead probe is reported.
+    """
+    if kind not in PROBE_KINDS:
+        raise ValueError(
+            f"unknown probe kind {kind!r}; this db records {sorted(PROBE_KINDS)} — a kind "
+            "nothing reads would keep a budget no operator can see, so add its reader first"
+        )
+    for name, bound in (("window_from", window_from), ("window_to", window_to)):
+        if bound.tzinfo is None:
+            raise ValueError(
+                f"probe {name} must be tz-aware (payroll data; pyproject DTZ) — a naive "
+                "bound has no place in a window the store is asked to remember"
+            )
+    if window_to < window_from:
+        raise ValueError(
+            f"probe window is inverted ({window_from.isoformat()} -> "
+            f"{window_to.isoformat()}): paging refuses to walk one, so no request "
+            "ever asked for it"
+        )
+    if reads < 0:
+        raise ValueError(f"probe reads {reads} is negative — a request count counts up")
+    lower = _now_iso(window_from)
+    upper = _now_iso(window_to)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_PROBE_UPSERT, (device_serial, kind, lower, upper, reads)).fetchone()
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return ProbeWindow(
+        device_serial=device_serial,
+        kind=kind,
+        window_from_utc=lower,
+        window_to_utc=upper,
+        reads=reads,
+    )
+
+
+def read_probe_window(
+    conn: sqlite3.Connection, device_serial: str, *, kind: str
+) -> ProbeWindow | None:
+    """The device's last recorded probe of `kind` (None = it has never completed one).
+
+    READ THE ROW FOR WHAT IT IS: one answer about ITS OWN WINDOW. `window_to_utc` is the
+    instant the read ran and `[window_from_utc, window_to_utc]` the range it covered, so the
+    question this row can answer is "what did the device hold, over that range, as of that
+    instant" — never "has the device been quiet ever since". A consumer that wants
+    the latter must compare `probed_at` with its own clock and treat the row as stale the moment
+    the window it describes ends; reading an old row as an all-time answer would page (or
+    stay silent) on evidence that has expired. P2-05's `check_stall` does not consult this
+    table yet — that wiring and its alert vocabulary are a separate decision.
+
+    That rule as code, for any consumer: `probe_age_s` (age against `window_to_utc`, on the
+    caller's clock) and `probe_is_current` (against the CALLER's bound, never a derived one).
+    The operator-facing read of the whole table is `all_probe_windows`, rendered by
+    `gateclerk agent probe list`.
+    """
+    row = conn.execute(
+        "SELECT device_serial, kind, window_from_utc, window_to_utc, reads"
+        " FROM probe_audit WHERE device_serial = ? AND kind = ?",
+        (device_serial, kind),
+    ).fetchone()
+    return None if row is None else _probe_window_from_row(row)
+
+
+def _probe_window_from_row(row: sqlite3.Row) -> ProbeWindow:
+    """One `probe_audit` row -> `ProbeWindow`, verbatim (the one mapping both reads share)."""
+    return ProbeWindow(
+        device_serial=row["device_serial"],
+        kind=row["kind"],
+        window_from_utc=row["window_from_utc"],
+        window_to_utc=row["window_to_utc"],
+        reads=row["reads"],
+    )
+
+
+def all_probe_windows(conn: sqlite3.Connection) -> tuple[ProbeWindow, ...]:
+    """Every `probe_audit` row, device then kind — the OPERATOR's read of the table.
+
+    This is the read path the "we looked" evidence was missing: `read_probe_window` answers
+    one device+kind for the loop's own budget, and nothing before this function showed a
+    human what the loop last asked any device. It returns rows, not verdicts — the same
+    discipline `dead_letter_rows` follows, so the CLI stays a renderer.
+
+    Ordering is by `(device_serial, kind)`, the primary key: stable, and a device's two
+    kinds can never interleave confusingly. The clause is written out even though the PK
+    index already satisfies it — without an `ORDER BY` sqlite scans the table in rowid order
+    (`EXPLAIN QUERY PLAN`: the autoindex only enters the plan once ordering is asked for),
+    so the guarantee is the clause and not the index; dropping the clause is what
+    `tests/test_gc_p15_ring_floor_kind.py` goes red on. A device with no completed probe
+    simply has no row — see `probe_age_s` for why the ABSENCE of a row is not a fault.
+    """
+    rows = conn.execute(
+        "SELECT device_serial, kind, window_from_utc, window_to_utc, reads"
+        " FROM probe_audit ORDER BY device_serial, kind"
+    ).fetchall()
+    return tuple(_probe_window_from_row(row) for row in rows)
+
+
+def probe_age_s(row: ProbeWindow, *, now: datetime) -> float:
+    """How long ago this probe ran, measured on the CALLER's clock.
+
+    THE ONLY LEGITIMATE AGE OF A ROW. `window_to_utc` is the instant the read ran
+    (`_PROBE_AUDIT_V8`: `until = self._now()` at request time), so the row's freshness is
+    `now - window_to_utc` — never `now - window_from_utc`, which would report a probe that
+    just ran as already an hour old and would read the *width of the window asked for* as
+    though it were elapsed silence.
+
+    Negative is possible and honest: it means the writer's clock is ahead of the reader's
+    (a `doctor` run against a state root the agent wrote), and clamping it to 0 would hide
+    exactly the skew P2-06 reports as its own warning.
+    """
+    return (now - row.probed_at).total_seconds()
+
+
+def probe_is_current(row: ProbeWindow, *, now: datetime, max_age_s: float) -> bool:
+    """Is this row still evidence for a reader that asks "has the loop looked lately"?
+
+    A row is evidence about ITS OWN WINDOW and nothing else, so "current" cannot be derived
+    from the row — a row whose upper bound is one second old proves the device held nothing
+    over `[window_from_utc, window_to_utc]` and says nothing whatever about the second after
+    `window_to_utc`. The bound therefore comes from the CONSUMER (`max_age_s`), and this
+    function refuses to invent one: the reader states how long it is willing to treat a
+    past read as a present fact, and anything older answers only the historical question.
+
+    The boundary is inclusive (exactly `max_age_s` is still current), the opposite posture
+    from `check_db_watermark`'s strictly-above rule, because that one is an over-budget
+    trigger and this one is a reader's expiry. A row reported not-current here must not be
+    read as "quiet ever since" — that is the trap the whole reading rule exists to close.
+    """
+    return probe_age_s(row, now=now) <= max_age_s
+
+
 # --- the disk watermark (gauge; alerting is P2-05) -----------------------------------------
 
 
@@ -626,3 +881,124 @@ def check_db_watermark(path: Path | str, warn_bytes: int) -> WatermarkCheck:
     the boundary is testable without config and alertable without this module.
     """
     return WatermarkCheck(size_bytes=db_size_bytes(path), warn_bytes=warn_bytes)
+
+
+# --- GC-P16a: local retention (BC is the store, the agent is a buffer) ---------------------
+
+
+def prune_pushed_events(
+    conn: sqlite3.Connection,
+    *,
+    event_ids: set[int],
+    before_utc: str,
+    policy: Any | None = None,
+) -> int:
+    """Delete pushed events older than the cutoff; queued/dead-lettered rows survive.
+
+    WHY. Table 70607 owns the permanent payroll record, so an event this poller has
+    already delivered — or the owner has already discarded — is a local copy of PII
+    (`name`, `employee_no`, the `raw` device dict) with no reason to live on forever.
+    This is the only statement in the product that deletes from `events`; the rest of
+    retention (the bundle TTL, the ledger's own growth) is elsewhere, and an owner's
+    hand-made purge is still theirs alone (spec §2b).
+
+    Four rows it can never delete, each guard load-bearing:
+
+    * anything not named in `event_ids`. The caller hands over the poller's own ledger
+      (`PushLedger.sent_event_ids()`), so "we have proof this left the building" is a
+      precondition rather than a hope — an unpushed event is the diagnostic buffer
+      staying useful, and an empty ledger short-circuits before a write transaction
+      opens at all;
+    * anything with no `event_time_utc` or no older than `before_utc`. An unresolved
+      time is not evidence of age (`tz.py`: an unresolvable stamp keeps the row with
+      `event_time_utc = None` and `tz_unresolved`), and the window is a retention
+      promise, not an eager delete;
+    * anything `push_queue` still points at. `ON DELETE RESTRICT` already refuses that
+      delete at the db level; the explicit `NOT EXISTS` says the same thing in the query
+      so the intent survives a future edit of either half;
+    * anything with a `dead_letter` row. That table deliberately has NO foreign key (the
+      record of a punch that never reached the ingest must outlive the event — v4), so
+      here `NOT EXISTS` is the only thing between this statement and an unrecoverable
+      loss. `tests/test_gc_p16a_prune_events.py` pins it with the control that removes
+      the dead-letter row and shows the same event then does go.
+
+    `before_utc` is compared as TEXT, and that is chronological for this column and only
+    for this column: `event_time_utc` is written from `ResolvedTime.utc` (`tz.py:334`,
+    `astimezone(UTC)`), so every stored value is `+00:00` ISO. A caller holding a
+    non-UTC clock must normalise before formatting — the tick hook in `agent_cli` does.
+
+    One transaction per batch, the module's idiom (`store_events` above): staging and
+    delete all apply or none, because these rows cannot be recovered locally — the
+    ledger is the only proof they were ever here.
+
+    Returns the number of rows deleted, and nothing else: no id, name or payload crosses
+    this boundary (P2-06's rule for state surfaces, applied to a return value).
+
+    `policy` — an `agent_alert.AlertPolicy`, duck-typed so this module never imports it —
+    is told, for each device the delete touched, what floor remains. That notification is
+    the only thing that lets ``check_stall`` distinguish this sanctioned housekeeping from
+    history that disappeared on its own (GC-P16a follow-up), and it is deliberately strict:
+    it goes to a policy only when that policy reads THIS connection (it excuses a rise in
+    the store it reads), it carries a serial and an integer and nothing else, and it is sent
+    only after the delete committed. A caller that passes no policy gets the same delete
+    with no attribution — which is exactly the owner's purge shape, and must keep paging.
+    """
+    if not event_ids:
+        return 0
+    # Attribution is only honest about a store the policy actually reads: `check_stall`
+    # answers from `policy.conn`, so a policy wired to another connection must be told
+    # nothing — it would excuse a rise in a store this delete never touched. Duck-typed on
+    # purpose: `agent_alert` reads this module, so this one must not import it.
+    attributed = getattr(policy, "conn", None) is conn
+    floors: dict[str, int | None] = {}
+    ids = sorted(event_ids)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS prune_ids (event_id INTEGER NOT NULL PRIMARY KEY)"
+        )
+        conn.execute("DELETE FROM temp.prune_ids")
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.prune_ids VALUES (?)",
+            ((event_id,) for event_id in ids),
+        )
+        # Whose floor is about to move? Asked BEFORE the delete, because afterwards the
+        # rows that answer it are gone.
+        touched = (
+            [
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT device_serial FROM events"
+                    " WHERE id IN (SELECT event_id FROM temp.prune_ids)"
+                )
+            ]
+            if attributed
+            else []
+        )
+        cur = conn.execute(
+            """
+            DELETE FROM events
+             WHERE id IN (SELECT event_id FROM temp.prune_ids)
+               AND event_time_utc IS NOT NULL
+               AND event_time_utc < ?
+               AND NOT EXISTS (SELECT 1 FROM push_queue AS q WHERE q.event_id = events.id)
+               AND NOT EXISTS (SELECT 1 FROM dead_letter AS d WHERE d.event_id = events.id)
+            """,
+            (before_utc,),
+        )
+        deleted = cur.rowcount
+        # Still inside the transaction: this is the floor THIS delete produced, not one
+        # another writer may have moved before we got to report it.
+        floors = {serial: read_oldest_serial(conn, serial) for serial in touched}
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    # And reported only now: an attribution must describe a delete that actually committed.
+    # `note_pruned` takes a serial and an integer floor (never an id, name or payload) and
+    # never raises, so housekeeping cannot break the alert path. An empty `floors` means
+    # either nothing was touched or no policy was credited, and the loop is a no-op.
+    if deleted and policy is not None:
+        for serial, floor in floors.items():
+            policy.note_pruned(serial, floor)
+    return deleted

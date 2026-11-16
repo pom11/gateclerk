@@ -69,6 +69,11 @@ runner = CliRunner()
 #: The five §7 commands, spelled once so a rename fails every pin here at once.
 COMMANDS = ("probe", "export", "diff", "apply", "undo")
 
+#: GC-P16c's retention verb, kept OUT of `COMMANDS` on purpose: `COMMANDS` is the §7
+#: pipeline in order and is what `test_command_exists_and_help_renders` parametrizes, and
+#: `clean` is not a §7 stage. Folding it in would quietly make the §7 pin claim six stages.
+POST_SEVEN_COMMANDS = ("clean",)
+
 WRITE_PATHS = {
     USER_SETUP_PATH,
     CARD_SETUP_PATH,
@@ -218,12 +223,17 @@ def test_command_exists_and_help_renders(name: str) -> None:
 
 
 def test_group_is_registered_like_device_app() -> None:
-    """`migrate` is a group of the root app with exactly the five §7 commands."""
+    """`migrate` is a group of the root app: exactly the five §7 commands, plus `clean`.
+
+    The set is exact — a seventh verb cannot arrive unannounced — and `clean` lives in its
+    own tuple so the "five §7 commands" wording above and the parametrized help-rendering
+    stay true statements about the pipeline rather than about the group.
+    """
     import typer
 
     root_cmd = typer.main.get_command(cli_mod.app)
     group = root_cmd.commands["migrate"]  # type: ignore[attr-defined]
-    assert sorted(group.commands) == sorted(COMMANDS)
+    assert sorted(group.commands) == sorted([*COMMANDS, *POST_SEVEN_COMMANDS])
 
 
 # --- -o json: stable schema, PII-free (§4) ------------------------------------------------------

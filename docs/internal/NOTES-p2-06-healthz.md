@@ -1,7 +1,7 @@
 # NOTES — P2-06 `/healthz` + metrics (card t_d7c96117)
 
 Design decisions, probe evidence, and the DoD case map for `src/gateclerk/agent_health.py`
-+ `tests/test_p2_06_healthz.py`. Binding spec: docs/P2-SITE-AGENT.md §2e (DECIDED
++ `tests/test_p2_06_healthz.py`. Binding spec: docs/internal/P2-SITE-AGENT.md §2e (DECIDED
 2026-10-19: carry over ALL listed P1 observables; minimal vocabulary; no dashboard).
 
 ## Decisions

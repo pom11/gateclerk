@@ -37,6 +37,12 @@ uv run --frozen gateclerk demo device urls --port 80
 
 - `src/gateclerk/demo_device.py:870-922` — `DemoDevice.start()`, `.stop()`, `.base_url`.
 - `src/gateclerk/demo_device.py:255-285` — synthetic events at `2026-06-15 08:00+02:00`.
+- `src/gateclerk/demo_device.py:42` and `:246-249` — `System/time` answers
+  `localTime 2026-06-15T18:05:00+02:00` (`_DEMO_LOCAL_TIME`) and labels itself +02:00
+  year-round in a `Europe/Bucharest` site on purpose; the `08:00` corpus stamps above are
+  `_DEMO_DAY`, a different constant.
+- `src/gateclerk/tz.py:483-518` — `compute_skew`, a WALL-clock comparison in the site zone.
+- `src/gateclerk/pipeline.py:353-362` — `device_time_reading`, the one `System/time` GET.
 - `src/gateclerk/agent_loop.py` — `DeviceLoop.tick()`; GC-P04 adds `TickResult.clock_skew`.
 - `src/gateclerk/agent_alert.py:570-591` — `observe_skew` / `KIND_CLOCK_SKEW`.
 - `src/gateclerk/agent_alert.py:595-725` — `check_stall` / `KIND_CHECKPOINT_STALL`.
@@ -67,16 +73,38 @@ No product code. Add one proof test and commit its output as evidence.
    - assert one `checkpoint_stall` alert.
 4. Test `test_clock_skew_on_the_demo_device_raises_clock_skew`:
    - start the demo device;
-   - build a `DeviceLoop` with `now` set to `2026-06-15T09:05+02:00` (the demo clock says
-     08:00, so skew is about +3600 s);
+   - read the box's own clock first: one `pipeline.device_time_reading(client)` GET. The
+     demo's `System/time` answers `localTime 2026-06-15T18:05:00+02:00`
+     (`src/gateclerk/demo_device.py:249`, `_DEMO_LOCAL_TIME`), so `reading.naive_local` is
+     `2026-06-15T18:05:00`. The `08:00` digits named elsewhere in this card are the EVENT
+     corpus stamps (`src/gateclerk/demo_device.py:246`, `_DEMO_DAY`) — a different thing
+     from the box's clock, which is what an earlier revision of this step confused;
+   - build a `DeviceLoop` with `now` set to `reading.naive_local - timedelta(hours=1)`
+     re-localised in the site zone (`ZoneInfo(DEFAULT_SITE_TZ)`), so the measured skew is
+     exactly +3600 s by construction of the test rather than a remembered constant;
+   - do NOT hard-code an instant such as `now = 2026-06-15T09:05+02:00`. `tz.compute_skew`
+     (`src/gateclerk/tz.py:483-518`) compares WALL digits placed in the SITE zone, and the
+     site zone is `Europe/Bucharest` = **+03:00 in June**, while the fake labels itself
+     +02:00 year-round (`src/gateclerk/demo_device.py:42`) — the recorded DST bug it
+     reproduces on purpose. Placed in the site zone that instant reads 10:05 against the
+     device's 18:05, so it measures ~28800 s, not ~3600 s;
    - tick once;
-   - assert `result.clock_skew.warn` is true;
+   - assert `result.clock_skew.warn` is true, and assert `warn_seconds == SKEW_WARN_SECONDS`
+     rather than tuning the threshold to make the test pass;
    - call `AlertPolicy.observe_skew(result.clock_skew)` and assert one `clock_skew` alert.
+
+   What actually shipped for this step — the derived-`now` form above — is recorded in the
+   header of `docs/internal/go-live-finish/evidence/GC-P21-alerts.log` and in
+   `tests/test_gc_p21_alerts_proof.py`.
 5. Run the test and save the output:
    ```bash
-   uv run --frozen pytest -q tests/test_gc_p21_alerts_proof.py -vv \
+   uv run --frozen pytest -q tests/test_gc_p21_alerts_proof.py -vv -rA --no-header \
      | tee docs/internal/go-live-finish/evidence/GC-P21-alerts.log
    ```
+   The two flags beyond `-q -vv` are load-bearing: `-rA` prints each passing test's captured
+   stdout (without it the log is three PASSED lines carrying none of the observed values
+   this card asks to be proven), and `--no-header` drops pytest's banner, which names the
+   developer's absolute checkout path.
    The log is the G3 evidence. It contains only synthetic demo values.
 
 What must NOT change:

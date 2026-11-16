@@ -199,9 +199,11 @@ def device_credential_refs(target: DeviceTarget) -> tuple[str, ...]:
 
 #: The ref-name prefixes this repo's naming rules produce, spelled once here (the resolver
 #: owns the names) so the inverse mapping below and the forward helpers cannot drift.
-#: `agent_push` imports `INGEST_TOKEN_ENV_PREFIX` from here rather than repeating it — it
-#: mirrors the ingest function's own variable name, and one spelling is what makes "set the
-#: same env var on the agent and in Cloud Run" true.
+#: `agent_push` imports `INGEST_TOKEN_ENV_PREFIX` from here rather than repeating it. That
+#: name is the AGENT's own contract; the Cloud Run receiver reads its own legacy-prefixed
+#: constant and site-list env var from its own secret store (deliberately not spelled here;
+#: see the private plan). The two ends are configured independently and neither name has
+#: to match.
 DEVICE_REF_PREFIX = "gateclerk-"
 INGEST_REF_PREFIX = f"{DEVICE_REF_PREFIX}ingest-"
 INGEST_TOKEN_ENV_PREFIX = "GATECLERK_INGEST_TOKEN_"  # noqa: S105 — a variable-NAME prefix

@@ -1,7 +1,7 @@
 """The P2 site agent's scheduler loop: 5 min cadence, 5 min overlap, one client.
 
-Card P2-03 (docs/P2-SITE-AGENT.md §2a, DECIDED 2026-10-19; §1 seams 2/3/7/9). Device
-truth: docs/OBSERVED.md. This module *orchestrates* — every hard rule lives in the P1
+Card P2-03 (docs/internal/P2-SITE-AGENT.md §2a, DECIDED 2026-10-19; §1 seams 2/3/7/9). Device
+truth: docs/internal/OBSERVED.md. This module *orchestrates* — every hard rule lives in the P1
 module that owns it and is reused untouched (seam 6, "reuse, do not fork"):
 
 * `paging.iter_event_windows` — the p1-05c walk: chunking, the 0-based cursor, the
@@ -10,10 +10,13 @@ module that owns it and is reused untouched (seam 6, "reuse, do not fork"):
   which is what makes the checkpoint rule below enforceable.
 * `pipeline.event_record_from_device` — the p1-07 assembly contract (27-key record,
   classification verdict, tz provenance verbatim from p1-06).
-* `pipeline.read_device_identity` / `read_capabilities` / `device_window_labels` — the
+* `pipeline.read_device_identity` / `read_capabilities` / `device_time_reading` — the
   once-per-client bootstrap: the serial is half the store key, the caps clamp paging,
   and the device's claimed offset labels every window (seam 7: device-claimed labels
-  or the WARNED site fallback, never silent, never naive).
+  or the WARNED site fallback, never silent, never naive). The claimed offset is the
+  one bootstrap value that is NOT frozen for the life of the client: it is re-read on
+  the bounded `DEVICE_CLAIM_REFRESH_S` cadence (GC-P03, DST), by the single reader
+  `DeviceLoop._refresh_device_claim`.
 * `isapi_transport.IsapiClient` — digest session, busy backoff, the 401 circuit. ONE
   client per device, kept alive across ticks (spec §2a: rebuilding per poll pays an
   extra handshake per cycle and hits the ~190-request nonce use-cap far sooner; OBSERVED.md).
@@ -50,7 +53,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -58,15 +61,18 @@ from gateclerk.agent_db import connect
 from gateclerk.agent_push import Transport as PushTransport
 from gateclerk.agent_push import device_users_line
 from gateclerk.agent_store import (
+    PROBE_KIND_RESET,
     Checkpoint,
     CheckpointRegressionError,
     advance_checkpoint,
     read_checkpoint,
+    read_probe_window,
+    record_probe_window,
     reset_checkpoint,
     store_events,
 )
 from gateclerk.config import DeviceTarget, resolve_credentials
-from gateclerk.exceptions import IsapiError
+from gateclerk.exceptions import IsapiAuthError, IsapiError
 from gateclerk.isapi_transport import IsapiClient
 from gateclerk.paging import (
     DEFAULT_CHUNK,
@@ -78,13 +84,13 @@ from gateclerk.paging import (
 )
 from gateclerk.pipeline import (
     NOISE_MAJOR,
-    device_window_labels,
+    device_time_reading,
     event_record_from_device,
     paging_limits_from_caps,
     read_capabilities,
 )
 from gateclerk.sinks import IMPLICIT_SINK_NAME, SinkSpec
-from gateclerk.tz import TimeResolver, offset_hhmm
+from gateclerk.tz import Skew, TimeResolver, compute_skew, offset_hhmm
 
 __all__ = [
     "DEFAULT_DEVICE_USERS_INTERVAL_S",
@@ -112,6 +118,35 @@ _COLD_START_BACK = "cadence + overlap"
 #: once the newest serial is strictly below the checkpoint. 100 serials is ~100 min
 #: of site-a's 1/min noise stream, well above any overlap or paging jitter.
 RESET_MIN_SERIAL_DROP = 100
+
+# --- GC-P15: the quiet-tick reset probe ----------------------------------------------------
+# The check above lives INSIDE the per-chunk loop, so a tick that reads no records never
+# reaches it: a replaced/factory-reset terminal whose ring was wiped (and whose new
+# generation has produced only `major=3` heartbeats so far) answers the narrow poll's
+# `major=5` request with NO MATCH, the decision is skipped, and the checkpoint sits on a
+# dead generation while the replacement's punches pile up unreachable — the silent loss
+# R1 forbids. The probe re-asks the ONE question that decides it (`what is the newest
+# serial the device still holds?`) over the retained window, newest-first, at most once
+# an hour. `major=0` is deliberate: the narrow poll's filter is exactly what hid the
+# evidence (OBSERVED.md "Server-side filter truth"), and a filter we did not probe is a
+# performance hint, never a promise — the client-side re-filter in `_assemble` stays.
+#: A quiet tick still needs a reset answer, but a wider read costs a request. Once an
+#: hour is enough for a hardware swap; the narrow poll window still runs every tick.
+RESET_PROBE_INTERVAL_S = 60 * 60
+#: The device ring holds roughly a week. A reset older than the ring cannot be proven
+#: from events; `deviceInfo` remains the fallback evidence.
+RESET_PROBE_WINDOW_S = 7 * 24 * 60 * 60
+
+#: GC-P03: how often a RUNNING loop re-reads `GET /ISAPI/System/time`. The card's
+#: tension in one number: the claimed UTC offset is the label every event window goes
+#: out with, and it moves at a DST transition — cached for the life of the process it
+#: shifts the poll window by an hour until someone restarts the unit (the payroll bug
+#: OBSERVED.md's A/B proved). But `/ISAPI/System/time` is still a request, and every
+#: request spends the ~190-use nonce budget (OBSERVED.md "Digest nonce use-cap"), so
+#: the read cannot simply become per-tick either. Fifteen minutes is short enough to
+#: bound a DST error to one poll and long enough that the 5-minute cadence reads the
+#: clock on at most every third tick.
+DEVICE_CLAIM_REFRESH_S = 15 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +200,10 @@ class TickResult:
     #: (paging.py:351) — the §2e `search_termination` observable: P2-06 reports it,
     #: so the loop hands it over instead of the health module re-walking anything.
     termination: str | None = None
+    #: The device wall-clock reading from this tick's System/time refresh, if any.
+    #: P2-05 turns a warning Skew into one clock_skew alert; P2-06 stores the gauge.
+    #: GC-P03 only ever stored it on the loop; this field is what gets it out.
+    clock_skew: Skew | None = None
     #: Set ONLY on the tick that confirmed a serialNo reset and opened the new epoch.
     #: P2-05 turns this into one critical alert naming both serials; later ticks leave
     #: it None, so the incident never pages again.
@@ -320,12 +359,39 @@ class DeviceLoop:
         #: roster's sense (the roster row goes to a companion table, not the punch stream), so
         #: it is a separate seam rather than a value crammed into `_sink_transports`.
         self._sink_writers: dict[str, Any] = dict(sink_writers or {})
-        # Bootstrap state: read once per client, never per tick (spec §2a math).
+        # Bootstrap state: read once per client, never per tick (spec §2a math) — EXCEPT
+        # the claimed offset, which GC-P03 bounds instead of freezing (see
+        # DEVICE_CLAIM_REFRESH_S and _refresh_device_claim).
         self.device_serial: str | None = None
         self._caps: Any = None
         self._claim: int | None = None
         self._claim_note: str | None = None
         self._bootstrapped = False
+        #: Monotonic stamp of the last SUCCESSFUL System/time read (None until one
+        #: lands). It is deliberately not moved by a failed read: the next tick then
+        #: retries rather than stranding the last claim for a whole interval.
+        self._claim_read_at: float | None = None
+        #: The last reading/skew the loop actually got off the wire. GC-P03 only stores
+        #: them; GC-P04 wires the skew into the alert policy and the health gauge.
+        self._last_device_time: Any = None
+        self._last_skew: Skew | None = None
+        # --- GC-P15: the quiet-tick reset probe (module constant above) ----------------------
+        #: Monotonic stamp of the last quiet-tick probe. The budget is the whole point:
+        #: the extra page is one request per hour, never one per quiet tick (every
+        #: request spends the ~190-use nonce budget, OBSERVED.md).
+        #:
+        #: GC-P15 follow-up: this is the CLOCK, not the memory. A fresh process used to
+        #: start with None here, so "at most one page per hour" was really "one page per
+        #: restart" — `agent_store.record_probe_window` now keeps the durable instant, and
+        #: `_seed_reset_probe_budget` spends it once here so the wall clock never gets a
+        #: second vote after that.
+        self._last_reset_probe_at: float | None = None
+        #: The durable budget is read at most once per process (the first quiet tick that
+        #: could spend it), never per tick and never again after a probe has run.
+        self._reset_probe_budget_seeded = False
+        #: The "below the checkpoint but no evidence" line is said ONCE per process, not
+        #: once per probe hour: a permanently glitchy counter is not an hourly alarm.
+        self._reset_probe_refused_warned = False
 
     # --- the tick -----------------------------------------------------------------------
 
@@ -350,10 +416,31 @@ class DeviceLoop:
             )
         since, until = None, None
         before: Checkpoint | None = None
+        # Bound BEFORE the try: a failure in `_ensure_device_state()` (a 401 at bootstrap,
+        # say) reaches the `except` below, and the failed result must then report "no clock
+        # reading" rather than raise NameError on its way out.
+        skew: Skew | None = None
         try:
             self._ensure_device_state()
             if self.device_serial is None:  # pragma: no cover - _ensure raises otherwise
                 raise IsapiError("bootstrap completed without a device serial")
+            # GC-P03: the claimed UTC offset is a CLOCK reading, not a constant. One
+            # System/time GET at bootstrap plus one per DEVICE_CLAIM_REFRESH_S — never
+            # one per tick (§2a's nonce-budget math still holds: at the 5-minute cadence
+            # this is at most one extra cheap GET per three ticks). A DST transition
+            # therefore shifts the window label within one interval instead of for the
+            # life of the unit.
+            if (
+                self._claim_read_at is None
+                or self._monotonic() - self._claim_read_at >= DEVICE_CLAIM_REFRESH_S
+            ):
+                self._refresh_device_claim()
+            # GC-P04: hand the reading up. `_last_skew` is written ONLY by a SUCCESSFUL
+            # System/time read and is never cleared by a failed one, so what the tick reports
+            # is a SAMPLED measurement (up to DEVICE_CLAIM_REFRESH_S old), not a per-tick one —
+            # recomputing it here would put a clock GET in every tick, which §2a's nonce-budget
+            # math is exactly what GC-P03's cadence exists to protect.
+            skew = self._last_skew
             # Capture the checkpoint BEFORE the per-chunk advances below. The ring-floor
             # probe (card t_ed9c7e92) compares the device's oldest retained event with
             # this value: after the walk there is nothing retained above the advanced
@@ -437,6 +524,58 @@ class DeviceLoop:
                     # from 0; agent_store only refuses negatives) — `or` would drop it.
                     checkpoint_serial = advance.checkpoint_serial
                 current = read_checkpoint(self.conn, self.device_serial)
+            # GC-P15: a quiet tick still owes a reset answer. `counts.records == 0` is
+            # precisely the shape that hides a swap — the ring was wiped and the
+            # replacement has produced only heartbeats, so the narrow `major=5` poll came
+            # back NO MATCH and the per-chunk check above never ran. Ask the one deciding
+            # question directly, at most once an hour (the budget lives with the constant,
+            # and since the follow-up card in `probe_audit` — see `_reset_probe_due`).
+            if (
+                current is not None
+                and counts.records == 0
+                and reset is None
+                and self._reset_probe_due()
+            ):
+                self._last_reset_probe_at = self._monotonic()
+                newest, newest_time = self._probe_newest_serial(current)
+                if (
+                    newest is not None
+                    and newest < current.checkpoint_serial
+                    and _is_after_checkpoint(newest_time, current, self.site_tz)
+                ):
+                    # `_reset_evidence` keeps its own refusal semantics here too: a
+                    # changed `deviceInfo` serial is an identity change, not a serialNo
+                    # reset, and it raises out of the tick (checkpoint unmoved) exactly as
+                    # it does in the in-window branch. Only the READ is bend-not-break.
+                    evidence = self._reset_evidence(current, newest)
+                    if evidence is not None:
+                        reset_checkpoint(
+                            self.conn,
+                            self.device_serial,
+                            expected_serial=current.checkpoint_serial,
+                            new_serial=newest,
+                            checkpoint_time=newest_time,
+                            firmware=self._caps.firmware if self._caps is not None else None,
+                            now=self._now(),
+                        )
+                        current = read_checkpoint(self.conn, self.device_serial)
+                        reset = evidence
+                        advanced = True
+                        checkpoint_serial = newest
+                    elif not self._reset_probe_refused_warned:
+                        # A same-firmware drop smaller than the floor is a glitch, not a
+                        # reset: no rewind, and nothing stored (nothing was walked). Said
+                        # once — the hourly probe must not turn one bad counter into a
+                        # permanent alarm stream.
+                        self._reset_probe_refused_warned = True
+                        fresh_firmware = self._caps.firmware if self._caps is not None else None
+                        self._warn(
+                            f"warning: quiet-tick probe saw newest serial {newest} below "
+                            f"checkpoint {current.checkpoint_serial} without reset evidence "
+                            f"(firmware {current.firmware!r} -> {fresh_firmware!r}, drop "
+                            f"below {RESET_MIN_SERIAL_DROP}); treated as a device glitch, "
+                            "checkpoint unmoved"
+                        )
             checkpoint = read_checkpoint(self.conn, self.device_serial)
             return TickResult(
                 device_serial=self.device_serial,
@@ -457,10 +596,11 @@ class DeviceLoop:
                 checkpoint_time_before=(before.checkpoint_time if before else None),
                 advanced=advanced,
                 termination=counts.termination,
+                clock_skew=skew,
                 serial_reset=reset,
             )
         except Exception as exc:
-            return self._failure(exc, since=since, until=until)
+            return self._failure(exc, since=since, until=until, skew=skew)
 
     def probe_ring_floor(self, since_stamp: str) -> int | None:
         """One read-only AcsEvent page: the oldest event of ANY major still retained.
@@ -484,6 +624,30 @@ class DeviceLoop:
         probe is "no evidence this incident", and the failing-poll arm still speaks.
         The caller decides when it is worth asking. A parked/skipped device is never
         asked because only an ok tick offers this callable.
+
+        Deliberately UNRECORDED — `probe_audit` keeps one kind and this read is not it
+        (card t_bde31e68; the decision is pinned by
+        `tests/test_gc_p15_ring_floor_kind.py`, which refuses the name). Both purposes a
+        durable floor could have served were checked against the code and both fail:
+
+        * it is not a budget. The gate that offers this read is
+          `agent_cli.SiteAgent._last_ok_at`, which is seeded across restarts by
+          `_last_ok_from_health` (health-snapshot mtime minus `last_poll_ok_age_s`) and is
+          advanced by the very ok tick that spends the page — so a restart cannot re-spend
+          it. There is no in-process cadence here to persist, unlike
+          `_last_reset_probe_at`, which IS a repeating hourly budget and is exactly why the
+          reset probe earned a row. An unreadable seed reads as "gap unknown" and spends
+          NOTHING, so the failure direction is a missed probe, never a second page;
+        * the row could not answer the question. `agent_store.ProbeWindow` is five columns
+          and carries no result (see `read_probe_window`'s reading rule), so a
+          `ring_floor` row would say "a page came back over this window, empty included"
+          while what this read exists to answer is "did the ring evict events we had not
+          read?". It would look like loss evidence and carry none — the all-time misreading
+          the reading rule exists to close, in a new costume.
+
+        The answer therefore lives only where it is true: compared against the PRE-tick
+        checkpoint the caller captured, on the tick that asked. `check_stall` must keep
+        asking the device; no stored row may stand in for this call.
         """
         if self.device_serial is None or self.conn is None:
             return None
@@ -786,21 +950,69 @@ class DeviceLoop:
         avoid), mapped through p1-07's `user_record_from_device` — which is where the
         device `password` hash is stripped, so the roster leg inherits the redaction
         rather than re-implementing it (seam 6: reuse, do not fork).
+
+        Then the GC-P05 join. `UserInfo/Search` answers `numOfCard` but NOT `cardNo` on
+        the probed firmware (pinned by the recorded capture), so the user walk alone can
+        never fill BC Table 70605's "Card No." column — and `Nelegati` links a card to a
+        person through BC, with this roster as its input. `CardInfo/Search` is the only
+        route that names the number, and each of its rows carries `employeeNo`, so the
+        join is one extra walk grouped by employee.
+
+        It is conditional for the same reason the roster is hourly: every request spends
+        a device nonce against the ~190-use cap (docs/internal/OBSERVED.md). A box where nobody
+        holds a card costs ZERO `CardInfo/Search` requests. The number goes into `raw` as
+        `cardNo` — the key `agent_push._roster_user` already reads — and nothing else is
+        added: the four-key wire shape (`employee_no`, `name`, `cardNo`, `hasFace`) and the
+        password strip stay exactly as they were, and a card number never reaches a log.
         """
         if self._roster is not None:
             return list(self._roster())
-        from gateclerk.paging import PagingLimits, iter_users
+        from gateclerk.paging import PagingLimits, card_info_search, iter_users
         from gateclerk.pipeline import user_record_from_device
 
         limits = self._limits or (
             paging_limits_from_caps(self._caps) if self._caps is not None else PagingLimits()
         )
         reader = _search_reader(self.client, "user_info_search")
-        return [user_record_from_device(raw) for raw in iter_users(reader, limits=limits)]
+        users: list[Any] = [
+            user_record_from_device(raw) for raw in iter_users(reader, limits=limits)
+        ]
+        if any(_card_count(user) > 0 for user in users):
+            cards_reader = _search_reader(self.client, "card_info_search")
+            by_employee: dict[str, list[str]] = {}
+            for card in card_info_search(cards_reader, limits=limits).collect({}):
+                employee = card.get("employeeNo", card.get("employeeNoString"))
+                number = card.get("cardNo")
+                # A missing or blank number is skipped rather than rostered: the device
+                # row names no card, and `str(None)`/`""` must never become a "card
+                # number". `_primary_card` ignores blanks anyway, so dropping them here
+                # also means one malformed row cannot end the walk with an empty-min
+                # ValueError.
+                if employee is None or number is None or not str(number).strip():
+                    continue
+                by_employee.setdefault(str(employee).strip(), []).append(str(number))
+            users = [
+                replace(
+                    user,
+                    raw={**user.raw, "cardNo": _primary_card(by_employee[user.employee_no])},
+                )
+                if by_employee.get(user.employee_no)
+                else user
+                for user in users
+            ]
+        return users
 
     # --- internals ----------------------------------------------------------------------
 
-    def _failure(self, exc: Exception, *, since: Any, until: Any) -> TickResult:
+    def _failure(
+        self, exc: Exception, *, since: Any, until: Any, skew: Skew | None = None
+    ) -> TickResult:
+        """A failed tick, as data (never an exception into the scheduler).
+
+        `skew` is the clock reading the tick had already collected when the failure
+        happened — the walk and the clock read are separate facts, and P2-05/P2-06 still
+        have to see the one it got (GC-P04). It is None when nothing was read yet.
+        """
         checkpoint = read_checkpoint(self.conn, self.device_serial) if self.device_serial else None
         circuit_open = self.client.circuit_open()
         # The transport already opened the circuit on a terminal 401 (lockout
@@ -814,18 +1026,22 @@ class DeviceLoop:
             exception=exc,
             window_label=self._label(),
             checkpoint_serial=checkpoint.checkpoint_serial if checkpoint else None,
+            clock_skew=skew,
         )
 
     def _ensure_device_state(self) -> None:
         """The once-per-client bootstrap: identity, caps, claimed window label.
 
-        `read_capabilities` (pipeline → p1-04 discover) does its OWN deviceInfo read
+        `read_capabilities` (pipeline → p1-04 discover) does ITS OWN deviceInfo read
         for the cache key and carries the serial on the result — so the serial comes
         from there rather than a second `read_device_identity` GET: every request
         counts against the ~190-use nonce cap (spec §2a math). A blank serial is
-        refused (the store key cannot be honoured; pipeline's own rule). The claimed
-        offset is read exactly once per client (device_window_labels' rule: re-reads
-        spend requests against the cap for an answer that does not change).
+        refused (the store key cannot be honoured; pipeline's own rule).
+
+        The claimed offset goes through `_refresh_device_claim`, which is the ONLY
+        reader of the clock in this class — the bootstrap is no longer special, it is
+        simply the first read on the bounded cadence (GC-P03: an offset cached for the
+        life of the process is an hour of wrong windows after a DST transition).
         """
         if self._bootstrapped:
             return
@@ -835,12 +1051,45 @@ class DeviceLoop:
                 "deviceInfo carried no serialNumber — the store key (device_serial, "
                 "serial_no) cannot be honoured; refusing to store records with a blank serial"
             )
-        labels = device_window_labels(self.client)
         self.device_serial = caps.serial
         self._caps = caps
-        self._claim = labels.claimed_offset_min
-        self._claim_note = labels.note
+        self._refresh_device_claim()
         self._bootstrapped = True
+
+    def _refresh_device_claim(self) -> None:
+        """Read the claimed offset (and the wall clock for skew) on a bounded cadence.
+
+        The loop's ONE System/time reader (GC-P03). Three outcomes, deliberately
+        different (OBSERVED.md's three failure classes):
+
+        * a good read moves `_claim` (the label every window goes out with), records the
+          reading and its skew, and stamps the cadence clock;
+        * a device fault that is NOT auth keeps the LAST GOOD claim and records why the
+          read failed — losing the poll because a clock read failed is strictly worse
+          than polling on a claim that may be an hour stale, and the p1-05c fallback
+          (site-labeled, warned) only ever applies when there is no claim at all;
+        * an `IsapiAuthError` RE-RAISES (pipeline `device_window_labels`' own rule): an
+          unauthenticated run must not spend its one cheap read deciding to degrade
+          payroll windows quietly — a wrong credential is a human's call, exit 3.
+
+        A failed read does not move `_claim_read_at`, so the NEXT tick retries instead
+        of waiting out another interval with a stale label.
+        """
+        try:
+            reading, _raw = device_time_reading(self.client)
+        except IsapiAuthError:
+            raise
+        except IsapiError as exc:
+            # A transient read failure keeps the last good claim; the walk still runs.
+            self._claim_note = f"System/time unreadable: {exc}"
+            return
+        self._last_device_time = reading
+        self._last_skew = compute_skew(reading, our_now=self._now(), site_tz=self.site_tz)
+        self._claim = reading.claimed_offset_minutes
+        self._claim_note = (
+            None if self._claim is not None else (reading.note or "no claimed UTC offset")
+        )
+        self._claim_read_at = self._monotonic()
 
     def _reset_evidence(self, checkpoint: Checkpoint, newest: int) -> SerialReset | None:
         """Confirm a serialNo reset from fresh deviceInfo — or return None.
@@ -878,6 +1127,164 @@ class DeviceLoop:
             old_firmware=old_firmware,
             new_firmware=new_firmware,
         )
+
+    def _reset_probe_due(self) -> bool:
+        """Is the quiet tick's one extra page due? (GC-P15's budget, durable memory.)
+
+        Two halves on two deliberately different clocks:
+
+        * the durable row (`agent_store.probe_audit`), read ONCE per process on the first
+          quiet tick that could spend the page and converted into a monotonic deadline. A
+          process that restarts inherits the hour it did not spend instead of starting the
+          hour over — which is the whole point: an operator restarting a sick unit a few
+          times an hour used to buy it a few extra pages an hour (§2a nonce budget);
+        * the monotonic delta, which governs everything after that seed. The wall clock gets
+          exactly one vote and never unlocks a request on its own: a forward NTP correction,
+          an operator's `date -s` or a mislabelled stamp must not be able to buy a page, and
+          a backward one may only ever delay the probe.
+        """
+        if not self._reset_probe_budget_seeded:
+            self._seed_reset_probe_budget()
+        return (
+            self._last_reset_probe_at is None
+            or self._monotonic() - self._last_reset_probe_at >= RESET_PROBE_INTERVAL_S
+        )
+
+    def _seed_reset_probe_budget(self) -> None:
+        """Spend the hour a previous process already spent (once: see `_reset_probe_due`).
+
+        The stored instant is a wall-clock fact and the gate is a monotonic delta, so the
+        seed converts one into the other exactly once: `_last_reset_probe_at = now_mono -
+        elapsed`, the value at which the gate first reopens when the remaining hour is up.
+        A stored instant ahead of our clock (elapsed < 0) pushes that deadline out and can
+        only ever delay a probe — fail towards silence, never towards a request.
+        """
+        self._reset_probe_budget_seeded = True
+        if self._last_reset_probe_at is not None or self.device_serial is None:
+            return  # an in-memory budget already governs; a row may only fill a blank one
+        try:
+            audit = read_probe_window(self.conn, self.device_serial, kind=PROBE_KIND_RESET)
+            elapsed = None if audit is None else (self._now() - audit.probed_at).total_seconds()
+        except Exception as exc:  # an unreadable budget is the old behaviour: probe now
+            self._warn(
+                f"warning: the stored reset-probe budget could not be read "
+                f"({type(exc).__name__}); probing this quiet tick rather than trusting "
+                "nothing about the last hour"
+            )
+            return
+        if elapsed is None:
+            return  # this device has never completed a probe: the first one is simply due
+        self._last_reset_probe_at = self._monotonic() - elapsed
+
+    def _probe_newest_serial(self, checkpoint: Checkpoint) -> tuple[int | None, str | None]:
+        """One newest-first page over the retained window; no cursor walk (GC-P15).
+
+        The quiet tick's question is a single one — what is the newest serial the device
+        still holds? — and `timeReverseOrder=True` with `maxResults=1` is the one request
+        that answers it (paging honours both; the newest-by-time record is then read by
+        the same helper the in-window check uses, so the two arms cannot disagree). The
+        floor is the checkpoint, never below it: a record older than the checkpoint could
+        not prove a new generation anyway (`_is_after_checkpoint` refuses it) and would
+        only re-serve rows the store already holds. `major=0` is the point of the whole
+        read — the narrow poll's `major=5` filter is exactly what hid the evidence.
+
+        Deliberately bend-not-break on the READ, like `probe_ring_floor`: a probe that
+        dies is "no evidence this hour", never a failed poll — the narrow walk already
+        completed and its truth stands. FAIL CLOSED on the floor too: an instant we
+        cannot place has no place in a request, and widening to the whole week on a
+        stamp the loop has otherwise already parsed would spend the hour's one page on a
+        window that could not be justified. The caller's `_reset_evidence` is NOT
+        wrapped: its identity refusal is a decision, not a transport accident.
+        """
+        lower = self._now() - timedelta(seconds=RESET_PROBE_WINDOW_S)
+        if checkpoint.checkpoint_time:
+            try:
+                lower = max(lower, _parse_stamp(checkpoint.checkpoint_time, site_tz=self.site_tz))
+            except Exception as exc:
+                self._warn(
+                    f"warning: quiet-tick reset probe cannot place checkpoint "
+                    f"{checkpoint.checkpoint_time!r} on the timeline ({type(exc).__name__}); "
+                    "probing nothing this hour, checkpoint "
+                    f"{checkpoint.checkpoint_serial} unmoved"
+                )
+                return None, None
+        limits = self._limits or (
+            paging_limits_from_caps(self._caps) if self._caps is not None else PagingLimits()
+        )
+        upper = self._now()
+        asked = 0
+        reader = _search_reader(self.client)
+
+        def counting_reader(body: Mapping[str, Any]) -> dict[str, Any]:
+            # "What did this cost" is answered by the requests actually sent, not by a
+            # constant that would still say 1 on the day paging stops sending one.
+            nonlocal asked
+            asked += 1
+            return reader(body)
+
+        try:
+            for chunk in iter_event_windows(
+                counting_reader,
+                since=lower,
+                until=upper,
+                chunk=timedelta(seconds=RESET_PROBE_WINDOW_S),
+                site_tz=self.site_tz,
+                device_offset_min=self._claim,
+                limits=limits,
+                page_size=1,
+                max_pages=1,
+                inter_page_delay=self._inter_page_delay,
+                sleep=self._sleep,
+                clock=self._monotonic,
+                major=0,
+                time_reverse_order=True,
+            ):
+                # GC-P15 follow-up: the answer is only useful if it outlives the tick.
+                # ONE call site, on the way out of the READ and before any decision branch:
+                # the chunk with no records — the NO MATCH this follow-up card exists to keep —
+                # leaves exactly the same trace as the chunk that proves a swap, because the
+                # same statement writes both. A read that dies reaches the `except` below and
+                # writes nothing: `record_probe_window` refuses to call a failed read a
+                # completed one. A window the checkpoint collapsed to zero width asks nothing
+                # (`chunk_window` yields no chunk when `since == until`), so it writes nothing
+                # either — the row means "a page was asked for over this window and came back",
+                # and a probe that sent no request cannot claim that.
+                self._record_reset_probe(lower, upper, asked)
+                return _newest_serial_by_time(chunk.records)
+        except Exception as exc:  # the poll's own result stands; a probe is evidence only
+            self._warn(
+                f"warning: quiet-tick reset probe failed ({type(exc).__name__}); no reset "
+                f"evidence this hour, checkpoint {checkpoint.checkpoint_serial} unmoved"
+            )
+            return None, None
+        # Zero-width window: paging requested nothing, so there is no completed read to audit.
+        return None, None
+
+    def _record_reset_probe(self, window_from: datetime, window_to: datetime, reads: int) -> None:
+        """Persist what this probe asked for and what it cost (`probe_audit`, one row).
+
+        Bend-not-break, on the store side too and for the same reason GC-P15 gives for the
+        read: the narrow poll's truth already stands, and losing the audit row must not turn
+        a quiet tick into a failed one. What is lost is said — a probe that silently stopped
+        recording is the exact failure mode this card exists to close, so an operator hears
+        about it on the same channel as every other probe problem.
+        """
+        if self.device_serial is None:  # pragma: no cover - tick() checks first
+            return
+        try:
+            record_probe_window(
+                self.conn,
+                self.device_serial,
+                kind=PROBE_KIND_RESET,
+                window_from=window_from,
+                window_to=window_to,
+                reads=reads,
+            )
+        except Exception as exc:
+            self._warn(
+                f"warning: quiet-tick probe could not record its window "
+                f"({type(exc).__name__}); the answer stands for this tick and nothing else"
+            )
 
     def _window(self) -> tuple[datetime, datetime]:
         """`[checkpoint_time - overlap_s, now]`, or the cold-start floor (module doc).
@@ -1039,6 +1446,42 @@ class _WalkCounts:
         self.refreshed += refreshed
         self.unchanged += unchanged
         self.termination = chunk.termination  # last completed chunk wins
+
+
+def _primary_card(card_numbers: Sequence[str]) -> str:
+    """The ONE card number a multi-card employee is rostered under.
+
+    Pinned rule (GC-P05 — BC Table 70605's "Card No." column and the `Nelegati` linking
+    workflow key on this one value, so it must be stable across roster runs, not whichever
+    page order the device happened to answer in):
+
+    * a card number that is all digits compares by its NUMERIC value — `"900"` is lower
+      than `"1002"`, which lexicographic order gets backwards and would misattribute a
+      punch to the wrong person;
+    * anything else compares as TEXT, and loses to every numeric card;
+    * the LOWEST value wins when one employee has several cards;
+    * blank entries are ignored, never "lowest".
+    """
+
+    def key(value: str) -> tuple[int, int, str]:
+        text = value.strip()
+        return (0, int(text), text) if text.isdigit() else (1, 0, text)
+
+    return min((c for c in card_numbers if c.strip()), key=key)
+
+
+def _card_count(user: Any) -> int:
+    """`numOfCard` as an int, tolerant of the two spellings sibling firmware uses.
+
+    The probed firmware answers an int; a numeric string is answered by sibling models of
+    the same family, and neither may be read as "has no cards" (a missed join is a blank
+    "Card No." in BC, which is the bug this card fixes). A bool, a negative or anything
+    unreadable counts as 0 — the walk is skipped, which is the conservative direction.
+    """
+    value = user.raw.get("numOfCard")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return int(value) if isinstance(value, str) and value.isdigit() else 0
 
 
 def _search_reader(client: Any, endpoint: str = "acs_event_search") -> Any:

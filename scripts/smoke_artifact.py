@@ -118,12 +118,93 @@ def print_sha256_check_lines(dist_dir: Path, verified: dict[str, Path]) -> None:
         print(f"{digest}  {name}: OK")
 
 
+def _interpreter_runs_gateclerk(candidate: str) -> bool:
+    """True when `candidate` is a Python new enough to run the artifact.
+
+    The smoke must not use the build venv, so a bare `python3` is preferred. But a
+    runner's `python3` can be older than the project floor, and then the artifact dies
+    on `SyntaxError`/`ModuleNotFoundError: tomllib` and the release looks broken when
+    only the probe interpreter was too old.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603
+            [
+                candidate,
+                "-I",
+                "-S",
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _candidate_interpreters() -> list[str]:
+    """Every `python3`/`python` on PATH, in PATH order, de-duplicated.
+
+    `shutil.which` alone returns only the first hit, and inside `uv run` that is the
+    venv's own shim — so the card's `shutil.which("python3")` default quietly keeps the
+    smoke inside the venv it was meant to step outside of. This walks PATH instead.
+    """
+    found: list[str] = []
+    seen: set[Path] = set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        for name in ("python3", "python"):
+            candidate = Path(directory) / name
+            if not candidate.is_file():
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            found.append(str(candidate))
+    return found
+
+
+def _is_build_venv(candidate: str) -> bool:
+    """True for an interpreter living in the venv that built the artifact.
+
+    Symlinks are deliberately NOT resolved: a venv's `bin/python` resolves out to the
+    base CPython, which would hide the very venv this check exists to detect.
+    """
+    return Path(candidate).parent == Path(sys.prefix) / "bin"
+
+
+def default_python_exe() -> str:
+    """Interpreter for the smoke: a bare Python outside the build venv, if one is usable.
+
+    Preferred order is (1) a non-venv Python new enough to run gateclerk, (2) any other
+    usable Python, (3) `sys.executable`. Falling back to the venv is still honest,
+    because every run carries `-I -S`, which keeps site-packages off `sys.path` — the
+    venv cannot lend the artifact a module the archive is missing.
+    """
+    capable = [c for c in _candidate_interpreters() if _interpreter_runs_gateclerk(c)]
+    for pool in ([c for c in capable if not _is_build_venv(c)], capable):
+        if pool:
+            return pool[0]
+    return sys.executable
+
+
 def smoke_artifact(
     artifact: Path,
     *,
-    python_exe: str = sys.executable,
+    python_exe: str | None = None,
 ) -> dict[str, Any]:
-    """Run the end-to-end smoke battery against `artifact` in an isolated temporary HOME."""
+    """Run the end-to-end smoke battery against `artifact` in an isolated temporary HOME.
+
+    Every invocation carries `-I -S`: `-S` skips `site`, so no site-packages directory
+    lands on `sys.path` and any dependency the `.pyz` failed to vendor fails here instead
+    of on a production host (card GC-P13).
+    """
+    if python_exe is None:
+        python_exe = default_python_exe()
     if not artifact.is_file():
         raise RuntimeError(f"artifact not found: {artifact}")
 
@@ -145,7 +226,7 @@ def smoke_artifact(
 
         def _run(*args: str) -> subprocess.CompletedProcess[str]:
             return subprocess.run(  # noqa: S603
-                [python_exe, str(artifact), *args],
+                [python_exe, "-I", "-S", str(artifact), *args],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -219,6 +300,8 @@ db_path = "{state_dir / "gateclerk-demo-site-a.sqlite3"}"
         return {
             "artifact": artifact.name,
             "sha256": sha256_of(artifact),
+            "python": python_exe,
+            "isolated": True,
             "version": ver_proc.stdout.strip(),
             "status_verdict": status_row.get("verdict"),
             "demo_ok": True,

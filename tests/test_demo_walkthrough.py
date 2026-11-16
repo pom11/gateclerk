@@ -10,8 +10,10 @@ request log, the scratch tree) and asserts against them.
 Arms (the CLI arm — the real subprocess under CI's proxy wall — sits at the bottom and
 drives the shipped `demo demo` verb):
 
-* ARM 1 — the loop's evidence: every synthetic event reaches BOTH sinks, the csv carries
-  the frozen `CSV_COLUMNS` header verbatim, the mock saw the frozen contract headers.
+* ARM 1 — the loop's evidence: every punch candidate reaches BOTH sinks and nothing else
+  does (GC-P01: the store keeps all 46 synthetic rows, the sinks take the 24 granted ones),
+  the csv carries the frozen `CSV_COLUMNS` header verbatim, the mock saw the frozen contract
+  headers.
 * ARM 2 — the zero-keychain law: `KeychainReader` may not even be constructed, and no
   process spawn may name `security`, while `openssl` (the cert mint) must be spawned.
 * ARM 3 — the zero-real-config law: `HOME` pointed at a directory of its own; afterwards
@@ -55,6 +57,7 @@ import gateclerk.credentials as creds
 import gateclerk.demo_walkthrough as dw
 import gateclerk.sink_writers as sink_writers
 from gateclerk import demo_device as demo
+from gateclerk.event_codes import classify_event
 from gateclerk.sinks import CSV_COLUMNS
 
 runner = CliRunner()
@@ -62,6 +65,26 @@ runner = CliRunner()
 #: The card's bounded-time budget (60 s), halved so a merely-slow machine still passes
 #: while a run that hangs is still caught. A real run measures ~1 s.
 RUN_BUDGET_S = 30.0
+
+#: The corpus split the walkthrough has to show (GC-P01 / E22). `demo_events()` is a
+#: (75, 75, 21, 22) cycle over 46 rows: the STORE keeps every one of them — a door-state
+#: record is diagnostics, and GC-P20 reads them there — while a SINK may only ever receive
+#: the granted passes, because a delivered row becomes an attendance line downstream. Both
+#: numbers come from the corpus through the classifier itself rather than being typed here,
+#: so the demo demonstrates the rule instead of restating it. The guard pins the pair: if
+#: the corpus shape ever changes, that is a deliberate edit, not a silently-following test.
+DEMO_PUNCH_EVENTS = [event for event in demo.demo_events() if classify_event(event).punch_candidate]
+DEMO_PUNCH_SERIALS = [int(event["serialNo"]) for event in DEMO_PUNCH_EVENTS]
+DEMO_DOOR_SERIALS = [
+    int(event["serialNo"])
+    for event in demo.demo_events()
+    if not classify_event(event).punch_candidate
+]
+DEMO_SINK_ROWS = len(DEMO_PUNCH_SERIALS)
+assert DEMO_SINK_ROWS == 24 and demo.DEMO_EVENT_COUNT == 46, (
+    "the demo corpus changed shape: the store/sink split the walkthrough asserts on is "
+    f"now {demo.DEMO_EVENT_COUNT} stored vs {DEMO_SINK_ROWS} delivered — re-read the card"
+)
 
 
 # --- harness -------------------------------------------------------------------------------------
@@ -172,10 +195,16 @@ def _tree(directory: Path) -> set[str]:
 # --- ARM 1: the loop's evidence -------------------------------------------------------------------
 
 
-def test_demo_delivers_every_synthetic_event_to_both_sinks(
+def test_demo_delivers_every_punch_candidate_to_both_sinks_and_nothing_else(
     scratch_root: Path, socket_allow: None, no_keychain: _KeychainTripwire
 ) -> None:
-    """The card's core claim: the fake device's events reach the csv AND the mock ingest."""
+    """The card's core claim, in its GC-P01 form: every PUNCH reaches both sinks.
+
+    The store and the sink have different rules and the demo shows both: `inserted` is the
+    whole synthetic corpus (a door-state record is diagnostics — GC-P20), while the csv and
+    the mock ingest — the two things that become payroll downstream — hold exactly the
+    granted passes. A door row delivered here would be a punch the device never granted.
+    """
     run = _run_inprocess(scratch_root)
     report = run.report
     want = [int(event["serialNo"]) for event in demo.demo_events()]
@@ -183,25 +212,32 @@ def test_demo_delivers_every_synthetic_event_to_both_sinks(
     assert report.ticks == 3
     assert report.inserted == demo.DEMO_EVENT_COUNT == len(want)
     assert report.checkpoint_serial == want[-1], "the checkpoint is the last synthetic serial"
-    assert report.csv_rows == len(want)
-    assert report.mock_lines == len(want)
+    assert report.csv_rows == DEMO_SINK_ROWS
+    assert report.mock_lines == DEMO_SINK_ROWS
     assert report.batches, "the mock ingest received nothing"
 
-    # Both sinks took every row, none failed, none was dead-lettered.
+    # Both sinks took every punch candidate, none failed, none was dead-lettered.
     for name in (dw.DEMO_CSV_SINK_NAME, dw.DEMO_MOCK_SINK_NAME):
         counts = report.per_sink[name]
-        assert counts["pushed"] == len(want), (name, counts)
+        assert counts["pushed"] == DEMO_SINK_ROWS, (name, counts)
         assert counts["push_failed"] == 0 and counts["dead_lettered"] == 0, (name, counts)
 
-    # The csv holds exactly the synthetic serials, once each, in store order.
+    # The csv holds exactly the punch serials, once each, in store order.
     rows = _csv_rows(report.csv_path)
-    assert [int(row["serial_no"]) for row in rows] == want, "csv rows are the corpus, oldest-first"
+    assert [int(row["serial_no"]) for row in rows] == DEMO_PUNCH_SERIALS, (
+        "csv rows are the punch candidates, oldest-first"
+    )
     assert {row["sink_name"] for row in rows} == {dw.DEMO_CSV_SINK_NAME}
     assert {row["site"] for row in rows} == {dw.DEMO_SITE_NAME}
     assert {row["device_serial"] for row in rows} == {demo.DEMO_SERIAL}
+    # The non-punch rows are STORED and DELIVERED TO NOTHING — the half of E22 an
+    # "everything arrives" assertion could never have caught: `inserted` accounts for all 46
+    # while the csv (above) and the mock (below) hold only the 24 punches.
+    assert report.inserted == DEMO_SINK_ROWS + len(DEMO_DOOR_SERIALS)
+    assert report.mock_lines == DEMO_SINK_ROWS
 
     # The mock leg is the per-row transport contract: one line per batch.
-    assert [batch.lines for batch in report.batches] == [1] * len(want)
+    assert [batch.lines for batch in report.batches] == [1] * DEMO_SINK_ROWS
 
 
 def test_demo_csv_carries_the_frozen_columns_verbatim(
@@ -247,7 +283,7 @@ def test_demo_summary_prints_the_evidence_the_card_asks_for(
     ):
         assert needle in out, f"summary is missing {needle!r}:\n{out}"
     assert str(run.report.csv_path) in out
-    assert f"pushed={demo.DEMO_EVENT_COUNT}" in out
+    assert f"pushed={DEMO_SINK_ROWS}" in out
 
 
 def test_demo_csv_tail_and_report_tail_agree(scratch_root: Path, socket_allow: None) -> None:
@@ -258,7 +294,7 @@ def test_demo_csv_tail_and_report_tail_agree(scratch_root: Path, socket_allow: N
 
 
 def test_demo_repeat_ticks_do_not_redeliver(scratch_root: Path, socket_allow: None) -> None:
-    """The checkpoint law, shown by the demo: 3 ticks still produce 46 rows, not 138.
+    """The checkpoint law, shown by the demo: 3 ticks still produce 24 rows, not 72.
 
     This is the arm that catches a demo whose "walkthrough" quietly re-sends the corpus
     every tick — which would teach a developer that the agent's cursor does not work.
@@ -266,8 +302,8 @@ def test_demo_repeat_ticks_do_not_redeliver(scratch_root: Path, socket_allow: No
     report = _run_inprocess(scratch_root, ticks=3).report
     assert report.inserted == demo.DEMO_EVENT_COUNT
     assert report.unchanged > 0, "later ticks saw nothing unchanged: the cursor is not holding"
-    assert report.csv_rows == demo.DEMO_EVENT_COUNT
-    assert report.mock_lines == demo.DEMO_EVENT_COUNT
+    assert report.csv_rows == DEMO_SINK_ROWS
+    assert report.mock_lines == DEMO_SINK_ROWS
 
 
 def test_report_as_dict_is_json_serialisable(scratch_root: Path, socket_allow: None) -> None:
@@ -276,8 +312,8 @@ def test_report_as_dict_is_json_serialisable(scratch_root: Path, socket_allow: N
     decoded = json.loads(json.dumps(report.as_dict()))
     assert decoded["site"] == dw.DEMO_SITE_NAME
     assert decoded["csv"]["header"] == list(CSV_COLUMNS)
-    assert decoded["csv"]["rows"] == demo.DEMO_EVENT_COUNT
-    assert decoded["sinks"][dw.DEMO_MOCK_SINK_NAME]["pushed"] == demo.DEMO_EVENT_COUNT
+    assert decoded["csv"]["rows"] == DEMO_SINK_ROWS
+    assert decoded["sinks"][dw.DEMO_MOCK_SINK_NAME]["pushed"] == DEMO_SINK_ROWS
 
 
 # --- ARM 2: the zero-keychain law -----------------------------------------------------------------
@@ -310,7 +346,7 @@ def test_demo_still_works_when_the_ambient_password_is_someone_elses(
     monkeypatch.setenv(dw.DEMO_INGEST_ENV, ambient)
     report = _run_inprocess(scratch_root).report
     assert report.inserted == demo.DEMO_EVENT_COUNT
-    assert report.mock_lines == demo.DEMO_EVENT_COUNT
+    assert report.mock_lines == DEMO_SINK_ROWS
     assert os.environ["GATECLERK_PASSWORD"] == ambient
     assert os.environ[dw.DEMO_INGEST_ENV] == ambient
 
@@ -389,7 +425,7 @@ def test_demo_is_deterministic_across_runs(tmp_path: Path, socket_allow: None) -
     second = _run_inprocess(tmp_path / "b").report
 
     assert first.checkpoint_serial == second.checkpoint_serial
-    assert first.csv_rows == second.csv_rows == demo.DEMO_EVENT_COUNT
+    assert first.csv_rows == second.csv_rows == DEMO_SINK_ROWS
     assert len(first.batches) == len(second.batches)
     assert first.per_sink == second.per_sink
     assert _csv_rows(first.csv_path) == _csv_rows(second.csv_path)
@@ -410,7 +446,7 @@ def test_demo_bounded_tick_count_is_honoured(tmp_path: Path, socket_allow: None)
     one = _run_inprocess(tmp_path / "one", ticks=1).report
     assert one.ticks == 1
     assert one.inserted == demo.DEMO_EVENT_COUNT
-    assert one.csv_rows == demo.DEMO_EVENT_COUNT
+    assert one.csv_rows == DEMO_SINK_ROWS
 
 
 def test_demo_device_requests_stay_within_a_bounded_request_budget(
@@ -449,7 +485,7 @@ def test_demo_never_prints_the_bearer_value(scratch_root: Path, socket_allow: No
     assert dw.DEMO_MOCK_TOKEN not in run.output
     assert "Bearer" not in run.output
     arrivals = [line for line in run.lines if line.lstrip().startswith("batch")]
-    assert len(arrivals) == demo.DEMO_EVENT_COUNT
+    assert len(arrivals) == DEMO_SINK_ROWS
     assert all("Authorization=present" in line for line in arrivals)
 
 
@@ -710,10 +746,10 @@ def test_demo_command_runs_end_to_end_and_exits_zero(tmp_path: Path) -> None:
     row = rows[-1]
     assert row["site"] == dw.DEMO_SITE_NAME
     assert row["ticks"] == 3
-    assert row["csv"]["rows"] == demo.DEMO_EVENT_COUNT
+    assert row["csv"]["rows"] == DEMO_SINK_ROWS
     assert row["csv"]["header"] == list(CSV_COLUMNS)
-    assert row["sinks"][dw.DEMO_CSV_SINK_NAME]["pushed"] == demo.DEMO_EVENT_COUNT
-    assert row["sinks"][dw.DEMO_MOCK_SINK_NAME]["pushed"] == demo.DEMO_EVENT_COUNT
+    assert row["sinks"][dw.DEMO_CSV_SINK_NAME]["pushed"] == DEMO_SINK_ROWS
+    assert row["sinks"][dw.DEMO_MOCK_SINK_NAME]["pushed"] == DEMO_SINK_ROWS
     assert dw.DEMO_MOCK_TOKEN not in proc.stdout
 
 

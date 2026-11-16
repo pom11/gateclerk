@@ -1,7 +1,7 @@
 """`tz_offset_mismatch`: does the device's claimed offset disagree with the site zone?
 
-Payroll-critical, and diagnostic-only at the same time (docs/DESIGN.md "Time handling"
-item 2, docs/OBSERVED.md "The time/offset bug"): site-a stamps `+02:00` on a summer wall
+Payroll-critical, and diagnostic-only at the same time (docs/internal/DESIGN.md "Time handling"
+item 2, docs/internal/OBSERVED.md "The time/offset bug"): site-a stamps `+02:00` on a summer wall
 time that Europe/Bucharest holds at +03:00. The flag makes that visible on the record.
 The resolved instants it describes are produced elsewhere and stay untouched — the flag
 is an observation, never a correction.

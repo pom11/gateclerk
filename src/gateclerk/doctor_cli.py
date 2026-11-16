@@ -315,68 +315,107 @@ def default_device_prober(
     return summary, skew.skew_seconds
 
 
+def _write_device_probe(
+    site: cfg.SiteConfig,
+    state_root: Path | str | None,
+    now: datetime,
+    *,
+    ok: bool,
+    detail: str,
+) -> None:
+    """Cache this site's device-probe verdict for `gateclerk status` (GC-P11).
+
+    The reader is `status_cli._device_section`, which reads exactly
+    `status_cli.PROBE_CACHE_PARTS` and refuses to age a result past
+    `DEVICE_PROBE_MAX_AGE_S`; the tests in tests/test_gc_p11_status_writers.py read through
+    that constant, so writer and reader cannot drift apart unnoticed. The path is resolved
+    by `agent_cli.resolve_state_root` — the SAME call the reader makes — which is what makes
+    `doctor --state-root X` and `status --state-root X` talk about one directory.
+
+    `detail` is the row's own redacted text, capped: the cache is operator-visible and by
+    `sink_cli`'s precedent names statuses and exceptions, never a payload or a secret.
+    Atomic (`tmp` + `Path.replace`, the agent's `_write_health` precedent) because a
+    concurrent `status` must never read half a document.
+    """
+    from gateclerk import agent_cli  # the lazy edge `_check_db_section` already uses
+
+    root = agent_cli.resolve_state_root(site, state_root)
+    target = root.joinpath("status", "device-probe.json")
+    payload = {"checked_at": now.isoformat(), "ok": ok, "detail": detail[:160]}
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(target)
+    except OSError:
+        # A state root this process cannot write (the unit's dir, owned by the service
+        # user, with `doctor` run by the operator) must not turn a read-only check into a
+        # traceback: the rows and the exit code ARE doctor's contract, the cache is a bonus
+        # and `status` already has an honest line for its absence ("run: gateclerk doctor").
+        return
+
+
 def _check_device_section(
     site: cfg.SiteConfig,
     *,
     env: Mapping[str, str] | None,
     now: datetime,
     device_prober: Callable[..., tuple[str, float | None]] | None,
+    state_root: Path | str | None = None,
 ) -> DoctorRow:
+    """Probe the device once, report it, and leave the verdict in the status cache.
+
+    Every outcome writes — a pass, a warn, or a failure — because `status` is a screen for
+    what the last check saw, and an operator who just ran the doctor should not be told
+    "unknown — run: gateclerk doctor" (GC-P11). `state_root` defaults to None, which
+    resolves exactly the way the reader resolves it.
+    """
     prober = device_prober or default_device_prober
+
+    def _failed(exit_code: int, detail: str) -> DoctorRow:
+        _write_device_probe(site, state_root, now, ok=False, detail=detail)
+        return DoctorRow(
+            site=site.name, section="device", status="fail", exit_code=exit_code, detail=detail
+        )
+
+    def _reported(status: str, detail: str) -> DoctorRow:
+        # A warn is still a completed probe: the device answered, the skew is the complaint.
+        _write_device_probe(site, state_root, now, ok=True, detail=detail)
+        return DoctorRow(
+            site=site.name, section="device", status=status, exit_code=0, detail=detail
+        )
+
     try:
         summary, skew_s = prober(site, env=env, now=now)
     except CredentialUnavailable as exc:
-        return DoctorRow(
-            site=site.name,
-            section="device",
-            status="fail",
-            exit_code=CONFIG_ERROR_EXIT,
-            detail=f"cannot probe device (credentials unavailable): {redact_b64(str(exc))}",
+        return _failed(
+            CONFIG_ERROR_EXIT,
+            f"cannot probe device (credentials unavailable): {redact_b64(str(exc))}",
         )
     except IsapiAuthError as exc:
-        return DoctorRow(
-            site=site.name,
-            section="device",
-            status="fail",
-            exit_code=AUTH_TERMINAL_EXIT,
-            detail=f"device authentication failed (401 / circuit open): {redact_b64(str(exc))}",
+        return _failed(
+            AUTH_TERMINAL_EXIT,
+            f"device authentication failed (401 / circuit open): {redact_b64(str(exc))}",
         )
     except (IsapiError, GateClerkError, OSError) as exc:
-        return DoctorRow(
-            site=site.name,
-            section="device",
-            status="fail",
-            exit_code=DEVICE_ERROR_EXIT,
-            detail=f"device unreachable or protocol error: {redact_b64(str(exc))}",
+        return _failed(
+            DEVICE_ERROR_EXIT,
+            f"device unreachable or protocol error: {redact_b64(str(exc))}",
         )
 
     if skew_s is None:
-        return DoctorRow(
-            site=site.name,
-            section="device",
-            status="warn",
-            exit_code=0,
-            detail=f"reachable ({summary}); clock skew unavailable",
-        )
+        return _reported("warn", f"reachable ({summary}); clock skew unavailable")
     if abs(skew_s) > SKEW_WARN_SECONDS:
-        return DoctorRow(
-            site=site.name,
-            section="device",
-            status="warn",
-            exit_code=0,
-            detail=(
+        return _reported(
+            "warn",
+            (
                 f"reachable ({summary}); clock skew {skew_s:+.1f}s exceeds "
                 f"{SKEW_WARN_SECONDS:.0f}s (punches depend on device clock)"
             ),
         )
-    return DoctorRow(
-        site=site.name,
-        section="device",
-        status="pass",
-        exit_code=0,
-        detail=(
-            f"reachable ({summary}); clock skew {skew_s:+.1f}s (within {SKEW_WARN_SECONDS:.0f}s)"
-        ),
+    return _reported(
+        "pass",
+        (f"reachable ({summary}); clock skew {skew_s:+.1f}s (within {SKEW_WARN_SECONDS:.0f}s)"),
     )
 
 
@@ -423,20 +462,22 @@ def _check_sinks_section(
             keychain_probe=probe_kc,
             other_paths=others,
         )
-        # If token-refs check failed on keychain/env, also check the Linux credential file
-        # for the ingest ref (`gateclerk-ingest-<site>` or `spec.token_keychain`) before failing.
+        # If the token-ref check failed on keychain/env, also check the Linux credential file
+        # for the ingest ref (`gateclerk-ingest-<site>` or `spec.token_keychain`) before
+        # failing. The name is `sink_cli._check_token_refs`'s (singular) — a plural spelling
+        # here made this fallback unreachable and filed a missing bearer under exit 6.
         sink_failed = False
         for chk in checks:
-            if not chk.ok and chk.check == "token-refs":
+            if not chk.ok and chk.check == "token-ref":
                 ing_ref = spec.token_keychain or credentials.ingest_ref(site.name)
                 file_ok, file_detail = _check_cred_file_ref(ing_ref, env=environ)
                 if file_ok is True and file_detail:
-                    summaries.append(f"{spec.name}:token-refs={file_detail}")
+                    summaries.append(f"{spec.name}:token-ref={file_detail}")
                     continue
             if not chk.ok:
                 sink_failed = True
                 failures.append(f"{spec.name}:{chk.check}: {chk.detail}")
-                if chk.check in ("config", "token-refs", "directory", "path-collision"):
+                if chk.check in ("config", "token-ref", "directory", "path-collision"):
                     exit_code = exit_code or CONFIG_ERROR_EXIT
                 else:
                     exit_code = exit_code or PUSH_FAILURE_EXIT
@@ -615,7 +656,9 @@ def run_doctor(
         rows.append(_check_config_section(site_cfg))
         rows.append(check_credential_ref_metadata(site_cfg, env=env, keychain_probe=keychain_probe))
         rows.append(
-            _check_device_section(site_cfg, env=env, now=moment, device_prober=device_prober)
+            _check_device_section(
+                site_cfg, env=env, now=moment, device_prober=device_prober, state_root=state_root
+            )
         )
         rows.append(
             _check_sinks_section(

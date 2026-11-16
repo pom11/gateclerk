@@ -5,7 +5,7 @@ One walk, one device cursor
 A Hikvision search is *stateful on the device*: `searchID` names a cached cursor,
 and the walk is driven by three fields per request — `searchID`,
 `searchResultPosition`, `maxResults`. Every rule below is a device fact recorded in
-docs/OBSERVED.md (site-a DS-K1T341AMF-S, fw V3.2.30) or docs/DESIGN.md "Paging +
+docs/internal/OBSERVED.md (site-a DS-K1T341AMF-S, fw V3.2.30) or docs/internal/DESIGN.md "Paging +
 checkpoint"; the wording here traces to them, not to Hikvision documentation
 generally. Each rule has a test against `FakeDevice` in tests/test_paging.py.
 
@@ -385,7 +385,7 @@ class PagedSearch:
     /`maxResults`; callers supply only the query conditions.
 
     The three constructor knobs below encode the PER-ENDPOINT dialect split design
-    docs/ENROLLMENT-MIGRATION.md §9 makes load-bearing: the same "helpful" body
+    docs/internal/ENROLLMENT-MIGRATION.md §9 makes load-bearing: the same "helpful" body
     normalization that passes a naive fake dies on the device, so the dialect is a
     named, device-sourced fact per factory, not a guess at call time. Defaults are
     the P1 dialect (`AcsEvent`/`UserInfo/Search`/`CardInfo/Search` — wrapped cond,
@@ -895,7 +895,7 @@ def fd_search(
     """A cursor bound to `POST /ISAPI/Intelligent/FDLib/FDSearch?format=json` (E1-01b).
 
     The face-library walk shares the cursor rules but NOT the dialect — every
-    difference is device-proven (docs/ENROLLMENT-MIGRATION.md §1, OBSERVED.md E1
+    difference is device-proven (docs/internal/ENROLLMENT-MIGRATION.md §1, OBSERVED.md E1
     probe rounds 11-18), which is exactly the §9 dialect split this engine exists
     to make impossible to "helpfully" normalize away:
 

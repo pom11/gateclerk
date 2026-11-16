@@ -34,7 +34,7 @@ and there is no `circuit_open`/parked test in the healthcheck.
 - `deploy/container_healthcheck.sh:30-41` — accepts any `ok`/`degraded` snapshot.
 - `src/gateclerk/agent_health.py:195-206` — each device snapshot carries `circuit_open`
   and `circuit_parked_s`.
-- `tests/test_deploy_templates.py:618-630` — the Dockerfile pin that currently expects
+- `tests/test_deploy_templates.py:621-634` — the Dockerfile pin that currently expects
   `site-a site-b`.
 
 ## CHANGE
@@ -72,7 +72,7 @@ Write `tests/test_gc_p14_container_health.py` first and run:
 uv run --frozen pytest -q tests/test_gc_p14_container_health.py
 ```
 
-Copy `tests/test_deploy_templates.py:618` for the Dockerfile assertion.
+Copy `tests/test_deploy_templates.py:621` for the Dockerfile assertion.
 
 Tests:
 

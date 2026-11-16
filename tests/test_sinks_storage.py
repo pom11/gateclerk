@@ -277,7 +277,11 @@ def test_the_shipped_history_now_ends_at_the_two_per_sink_steps() -> None:
     """A versioned migration means APPENDED entries, never an edited v3: an agent at v4
     must reach v7 through the same code path that took it from v2 to v4."""
     names = [m.name for m in agent_db.MIGRATIONS]
-    assert [m.version for m in agent_db.MIGRATIONS] == [1, 2, 3, 4, 5, 6, 7]
+    # Derived, not a literal list: this file's job is the per-sink steps, and a card that
+    # appends a later entry (v8 `probe_audit`) must not have to edit a test about v5/v6 to
+    # say so. What IS pinned is that the history is contiguous from 1 — the property the
+    # literal was standing in for.
+    assert [m.version for m in agent_db.MIGRATIONS] == list(range(1, len(names) + 1))
     assert names[4] == "push_queue_per_sink" and names[5] == "dead_letter_per_sink"
     for m in agent_db.MIGRATIONS[4:6]:
         assert "DROP TABLE" in m.sql.upper(), (
@@ -292,14 +296,16 @@ def test_upgrade_bumps_the_recorded_version_and_leaves_the_old_history(
 ) -> None:
     conn, _ = upgraded
     rows = list(conn.execute("SELECT version, name FROM schema_migrations ORDER BY version"))
-    assert [r["version"] for r in rows] == [1, 2, 3, 4, 5, 6, 7]
+    # Same reason as the history test above: "the upgrade recorded the shipped history" is
+    # the invariant; `[1..7]` was one hour's worth of it.
+    assert [r["version"] for r in rows] == [m.version for m in agent_db.MIGRATIONS]
     # The pre-upgrade entries keep their names: the history is a record, not a sketch.
     assert rows[2]["name"] == "push_queue" and rows[3]["name"] == "dead_letter"
 
 
 def test_upgrade_is_idempotent_on_a_second_open(tmp_path, monkeypatch) -> None:
-    """`connect` runs on every agent start: opening an already-v7 db must be a no-op, not
-    a second rebuild that rewrites (or re-hashes) the backlog."""
+    """`connect` runs on every agent start: opening an already-current db must be a no-op,
+    not a second rebuild that rewrites (or re-hashes) the backlog."""
     path = tmp_path / "agent.sqlite3"
     conn = build_pre_upgrade_db(path, monkeypatch=monkeypatch)
     seed_backlog(conn, serial_nos=(5742,))
@@ -318,7 +324,7 @@ def test_upgrade_is_idempotent_on_a_second_open(tmp_path, monkeypatch) -> None:
         assert [tuple(row[c] for c in shared) for row in after] == [
             tuple(row[c] for c in shared) for row in before
         ], "the second open rewrote nothing"
-        assert agent_db.current_version(second) == 7
+        assert agent_db.current_version(second) == agent_db.MIGRATIONS[-1].version
     finally:
         second.close()
 

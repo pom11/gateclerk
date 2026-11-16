@@ -1,6 +1,6 @@
 """Card P2-05: alerts + park-on-bad-creds (acked 30-min re-probe; lockout on-site; nonce=info).
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2c (DECIDED verbatim 2026-10-19):
 
 * terminal 401 WITH challenge (wrong/rotated creds) -> CRITICAL + the device loop
   PARKS: no automatic re-probe; slow re-probe every 30 min ONLY after operator ack;

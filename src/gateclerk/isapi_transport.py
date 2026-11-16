@@ -8,8 +8,8 @@ verb. The verb comes from the closed registry, so the read-only guarantee
 test: there is no code path by which this client issues PUT/DELETE, and the only POST
 it will make is to one of the stateless search endpoints in `SEARCH_ENDPOINTS`.
 
-The rules this implementation encodes, each traceable to docs/DESIGN.md,
-docs/OBSERVED.md or docs/references/isapi-client-gotchas.md:
+The rules this implementation encodes, each traceable to docs/internal/DESIGN.md,
+docs/internal/OBSERVED.md or docs/internal/references/isapi-client-gotchas.md:
 
 * **Digest, one auth object per client, reused across calls** (card + gotchas §1.7a).
   `httpx.DigestAuth` keeps `_last_challenge` + `_nonce_count`; reusing them is what
@@ -29,7 +29,7 @@ docs/OBSERVED.md or docs/references/isapi-client-gotchas.md:
   margin has elapsed, or a conservative fallback when the body says nothing. That is
   the difference between "surface the failure" and "grind the admin account into a
   door-terminal lockout".
-* **…with ONE bounded exception for a retired nonce** (t_a3521d8a, docs/OBSERVED.md
+* **…with ONE bounded exception for a retired nonce** (t_a3521d8a, docs/internal/OBSERVED.md
   "Digest nonce use-cap"): a long backfill died with a 401 and the CORRECT password at
   the ~190th request, device unlocked. Offline, three candidate 401 shapes were driven
   through this client (tests/fakedevice.py `retire_after`); only one reproduces it —
@@ -595,7 +595,7 @@ class IsapiClient:
                 "permission (TCC) gate, not a device fault — curl may work while "
                 "python does not. Grant Local Network to the terminal app running "
                 "gateclerk (System Settings → Privacy & Security → Local Network) and "
-                "retry. (docs/OBSERVED.md, macOS note.)"
+                "retry."
             ) from exc
 
     def _check(self, name: str, expected: HttpMethod) -> Endpoint:

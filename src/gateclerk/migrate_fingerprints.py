@@ -1,13 +1,13 @@
 """E1-06b fingerprints phase: one-shot template port, ack-is-not-confirm, re-read verify.
 
-Design contract: docs/ENROLLMENT-MIGRATION.md — §5 step 2 (FP sits between cards and
+Design contract: docs/internal/ENROLLMENT-MIGRATION.md — §5 step 2 (FP sits between cards and
 faces), §5a (journal), §5b.1 (undo with no verb = REPORT-ONLY), §6 (read-back verify),
 §1 "fingerprints" row (READ proven; portability claimable ONLY inside one sensor
 family). Parent E1-04 owns the machinery this phase reuses — ``WriteJournal``,
 ``BudgetedWriteTransport``, ``classify_rejection``, ``person_hash``, the budget maths.
 Nothing here forks them.
 
-What bench A proved (docs/OBSERVED.md "E1 §5.0 WRITE-PATH CAPTURE"; the fixtures under
+What bench A proved (docs/internal/OBSERVED.md "E1 §5.0 WRITE-PATH CAPTURE"; the fixtures under
 ``tests/fixtures/recorded/site-a-ds-k1t341amf-s/enrollment/`` are the truth, this
 paragraph is a caption):
 
@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -97,6 +96,7 @@ from gateclerk.migrate_write import (
 
 __all__ = [
     "CAPTURED_FINGER_PRINT_ID",
+    "CAPTURED_FP_COND_KEYS",
     "CARD_READER_RECV_REJECTED",
     "FP_CAPACITY_WORDS",
     "FP_DOWNLOAD_PATH",
@@ -606,12 +606,14 @@ def _assert_capture_shape(body: dict[str, Any], write: FpWrite) -> None:
 
     `fpdownload_accept_request.json` is the contract; this proves the *shape* (key set,
     nesting, types) rather than the literal test-person bytes, so a drift in either
-    direction fails at build time. The expected shape is read from the committed
-    fixture, never re-typed as a dict literal — a renamed or deleted fixture breaks
-    this check instead of quietly becoming folklore (the fake's `_capture()` rule,
-    applied on the product side).
+    direction fails at build time. The expected shape is the embedded
+    ``CAPTURED_FP_COND_KEYS`` tuple, never a file read: this guard runs on the *installed*
+    product, and wheels, containers and zipapps do not ship ``tests/`` (GC-P02). The
+    fixture is still the authority — ``tests/test_gc_p02_fp_schema.py`` pins this tuple to
+    it, so a renamed or drifted capture breaks a test instead of quietly becoming
+    folklore (the fake's `_capture()` rule, applied on the product side).
     """
-    expected = _capture_shape()
+    expected = CAPTURED_FP_COND_KEYS
     cfg = body["FingerPrintCfg"]
     if set(cfg) != set(expected):
         raise FpShapeError(
@@ -628,38 +630,16 @@ def _assert_capture_shape(body: dict[str, Any], write: FpWrite) -> None:
         )
 
 
-_CAPTURE_NAME = "fpdownload_accept_request.json"
-_CAPTURE_SHAPE: dict[str, Any] | None = None
-
-
-def _capture_shape() -> Mapping[str, Any]:
-    """The captured body's key shape, read from the committed fixture (see above)."""
-    global _CAPTURE_SHAPE
-    if _CAPTURE_SHAPE is None:
-        path = (
-            Path(__file__).resolve().parents[2]
-            / "tests"
-            / "fixtures"
-            / "recorded"
-            / "site-a-ds-k1t341amf-s"
-            / "enrollment"
-            / _CAPTURE_NAME
-        )
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise FpShapeError(
-                f"the captured FP write shape is unreadable ({path}: {exc}); the write "
-                "path has no device truth without it and must not guess one (§9)"
-            ) from exc
-        cfg = payload.get("FingerPrintCfg")
-        if not isinstance(cfg, Mapping):
-            raise FpShapeError(
-                f"{path} does not carry a 'FingerPrintCfg' object — the capture this "
-                "module's shape rests on is not the shape this module read"
-            )
-        _CAPTURE_SHAPE = dict(cfg)
-    return _CAPTURE_SHAPE
+#: The captured FingerPrintCfg key set (fixture:
+#: tests/fixtures/recorded/site-a-ds-k1t341amf-s/enrollment/fpdownload_accept_request.json).
+#: Embedded, not read at runtime: wheels, containers and zipapps do not ship tests/.
+CAPTURED_FP_COND_KEYS: tuple[str, ...] = (
+    "employeeNo",
+    "enableCardReader",
+    "fingerPrintID",
+    "fingerType",
+    "fingerData",
+)
 
 
 # --- planning: sensor family first, then the one-shot read --------------------------------

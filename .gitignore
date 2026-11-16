@@ -30,3 +30,19 @@ htmlcov/
 # local-only sites config (real device hosts never in the public repo; P2 decision 2026-10-19)
 sites.toml
 !examples/sites.toml
+# operator-created deploy files. deploy/compose.yaml tells the operator to create these by
+# copying the tracked templates beside them and to keep the filled-in copies mode 0600 and
+# "out of git": gateclerk.env carries the site tokens, mnotify.toml the notify config. Named
+# as exact paths rather than `*.env` so this rule can never shadow a tracked template or a
+# future fixture; tests/test_deploy_templates.py pins both directions.
+deploy/gateclerk.env
+deploy/mnotify.toml
+# The mnotify secret files: deploy/compose.yaml:14 orders them "never committed" and
+# compose.yaml:61,89 bind-mounts the directory read-only at /run/secrets/mnotify, with
+# MICRO_NOTIFY_SECRETS=file pointing inside it. `secrets/` at the top of this file matches a
+# directory named exactly `secrets`, NOT this one. Anchored, and no trailing slash: a
+# trailing-slash rule still catches the directory and a file under it, but misses the symlink
+# an operator points at secrets stored elsewhere (measured — `git status` lists it). The
+# prefix form also swallows a per-site variant created beside it, and
+# tests/test_deploy_templates.py section 6 proves it shadows no tracked path.
+/deploy/mnotify-secrets*

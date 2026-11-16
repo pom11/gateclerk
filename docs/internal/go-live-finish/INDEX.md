@@ -174,7 +174,13 @@ were invented for them.
 
 1. **GC-07's batching half.** `agent_push.drain` still sends one HTTP POST per queue row;
    the plan's GC-P08 names only token refresh and permanent-4xx handling. The audit's
-   suggestion to batch multi-line JSONL is not covered.
+   suggestion to batch multi-line JSONL is not covered. Decided 2026-11-14 (card
+   t_f8754643) that it stays unbuilt, and why: the receiver answers a multi-line body with
+   ONE status for the whole body and no per-line verdict, so a batched send would hand the
+   whole pass — up to 200 rows — the failure of one unregistered terminal, which the
+   first-failure `400`/`422` rule then dead-letters. Evidence and the prerequisite (a
+   per-line verdict in the receiver's `200`) are in
+   `docs/internal/AUDIT-2026-11-13.md` section 5, `GC-07`.
 2. **GC-14's `push-ledger.jsonl` growth.** GC-P16a prunes `events`, but the append-only
    ledger is not compacted or replaced by a SQLite marker. The plan's retention card names
    the event store, results CSV and bundle TTL, not the ledger.

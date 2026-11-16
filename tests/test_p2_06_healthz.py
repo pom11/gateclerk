@@ -1,6 +1,6 @@
 """Card P2-06: /healthz + metrics — the spec §2e vocabulary, no new concepts.
 
-BINDING SPEC: docs/P2-SITE-AGENT.md §2e (DECIDED 2026-10-19: carry over ALL listed P1
+BINDING SPEC: docs/internal/P2-SITE-AGENT.md §2e (DECIDED 2026-10-19: carry over ALL listed P1
 observables; minimal vocabulary; no dashboard). This module is a STATE COLLECTOR +
 text/JSON builder — never a server (no socket is opened here; conftest.netoff would
 kill the test if one were), and every gauge is read from where P1/P2 already computes
@@ -388,7 +388,7 @@ def test_metrics_text_carries_every_name_with_value_and_source(tmp_path: Path) -
     for line in lines:
         assert "  # " in line, f"metric line without a source: {line!r}"
         assert line.split("  # ", 1)[1].strip()
-    # The rollout gate's two zeros (docs/P2-SITE-AGENT.md §5) visible as digits:
+    # The rollout gate's two zeros (docs/internal/P2-SITE-AGENT.md §5) visible as digits:
     assert re.search(r"^tz_offset_mismatch_warnings 0\b", text, re.M)
     assert re.search(r"^site_labeled_windows 0\b", text, re.M)
 

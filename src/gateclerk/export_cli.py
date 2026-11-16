@@ -1,6 +1,6 @@
 """`gateclerk export config` & `gateclerk export scans` (cards t_7b62b44c, t_5a0f39b2).
 
-Two exports, one module:
+Three exports, one module:
 
 1. `gateclerk export config` — projects `sites.toml` to CSV or JSONL using a HARD allowlist
    of columns (`CONFIG_EXPORT_COLUMNS`, deny-by-default):
@@ -13,6 +13,10 @@ Two exports, one module:
        `device_cred_env_var`, `device_cred_ref`, `ingest_token_keychain_service`,
        `ingest_token_env_var`, plus sink `token_env` / `token_keychain` validated via
        `sink_cli.token_ref_problem`)
+     * every sink field the parser honours: `type` (including the `mnotify` alert route),
+       `url`, `path`, `rotation`, `enabled`, `to`, `timeout_s`, `accepts_roster` and
+       `headers` as sorted `k=v` pairs — a reserved header name (`Authorization`,
+       `X-GateClerk-Site`) or a secret-shaped value drops the whole header table
      * unknown keys and stripped userinfo/secrets are DROPPED and counted in a
        `dropped_keys` summary on stderr.
 
@@ -28,6 +32,16 @@ Two exports, one module:
      * personal-data law: refuses on an interactive TTY unless `--output <path>` is
        given; `--redact` drops `employee_no`, `cardNo`, and `name` columns (and strips
        those keys inside `raw` / JSONL).
+3. `gateclerk export non-punches` (GC-P20 / E22) — the DISTINCT `fingerprint_hash` values of
+   the events this site's poller recorded as pushed (`push-ledger.jsonl`) that were NOT
+   granted punches, for BC-P30 to mark ignored and recalculate:
+     * one output column (`NON_PUNCH_EXPORT_COLUMNS`) and nothing else — no employee number,
+       name, card number or raw payload; the fingerprint goes out verbatim because it IS BC's
+       dedupe key;
+     * read-only by construction (`_open_read_only_store`): the store is opened `mode=ro`, the
+       ledger is read through `PushLedger`, and BC is never contacted;
+     * a missing ledger is an empty report with a note, not an error — nothing is known to be
+       pushed, and guessing is not this command's job.
 """
 
 from __future__ import annotations
@@ -47,6 +61,7 @@ from typing import Any, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
 from gateclerk import config as cfg
+from gateclerk.event_codes import NON_AUTH_VERIFY_MODES
 from gateclerk.exceptions import ConfigError, EventBoundsError, redact_b64
 from gateclerk.sink_cli import token_ref_problem
 from gateclerk.tz import DEFAULT_SITE_TZ, parse_user_timestamp
@@ -57,12 +72,14 @@ __all__ = [
     "CONFIG_EXPORT_COLUMNS",
     "DIRECTION_CHOICES",
     "EXPORT_FORMATS",
+    "NON_PUNCH_EXPORT_COLUMNS",
     "REDACTED_SCAN_FIELDS",
     "SCAN_EXPORT_CHUNK_SIZE",
     "SCAN_EXPORT_COLUMNS",
     "SCAN_EXPORT_REDACTED_COLUMNS",
     "ConfigExportResult",
     "export_config_file",
+    "export_non_punch_fingerprints",
     "export_scans_stream",
     "format_dropped_keys_summary",
     "project_sites_toml",
@@ -181,8 +198,21 @@ ALLOWED_SINK_KEYS: frozenset[str] = frozenset(
         "token_env",
         "token_keychain",
         "enabled",
+        # Real `SinkSpec` fields (sinks.py): dropping them told the operator the site had
+        # no alert route / no roster opt-out when it had both.
+        "to",
+        "timeout_s",
+        "headers",
+        "accepts_roster",
     }
 )
+
+#: The transport's own two header names. `sinks.py` refuses them in a configured
+#: `headers` table — `Authorization` holds the bearer token (which has exactly one home,
+#: the ref rungs) and `X-GateClerk-Site` confirms the site the token already determines.
+#: An inventory that printed either would put a credential the config was not allowed to
+#: hold into the export, so a table carrying one is dropped whole.
+RESERVED_SINK_HEADERS: frozenset[str] = frozenset({"authorization", "x-gateclerk-site"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +327,47 @@ def _safe_scalar_ident(raw: object, *, key_label: str, default: str = "") -> tup
     return text, []
 
 
+def _safe_recipient(raw: object) -> tuple[str, list[str]]:
+    """One mail address: text with `@`, no whitespace, no secret-shaped value.
+
+    The `mnotify` alert sink's only routing field. A malformed recipient is dropped and
+    counted rather than projected as if the site had a working alert route — the export is
+    what an operator signs off on before a cutover.
+    """
+    if raw is None:
+        return "", []
+    if not isinstance(raw, str) or raw.count("@") != 1 or any(c.isspace() for c in raw):
+        return "", ["sink.to"]
+    text = raw.strip()
+    return ("", ["sink.to"]) if redact_b64(text) != text else (text, [])
+
+
+def _safe_headers(raw: object) -> tuple[str, list[str]]:
+    """Sorted `k=v` pairs for inventory; a credential-carrying table is dropped whole.
+
+    A header value is config, not a secret — except under the two names `RESERVED_SINK_HEADERS`
+    lists, which is exactly why `sinks.py` refuses them in a config. Both the reserved name
+    and the secret-shape check drop the WHOLE table: a partial header set in the inventory
+    would be a second kind of lie.
+    """
+    if raw is None:
+        return "", []
+    if not isinstance(raw, dict):
+        return "", ["sink.headers"]
+    pairs: list[str] = []
+    for key, value in sorted(raw.items(), key=lambda item: str(item[0])):
+        if not isinstance(key, str) or not isinstance(value, str):
+            return "", ["sink.headers"]
+        if any(c in key + value for c in "\r\n"):
+            return "", ["sink.headers"]
+        if key.strip().lower() in RESERVED_SINK_HEADERS:
+            return "", ["sink.headers"]
+        if redact_b64(value) != value:
+            return "", ["sink.headers"]
+        pairs.append(f"{key}={value}")
+    return ";".join(pairs), []
+
+
 def _ingest_env_name(site_name: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9]", "_", site_name).strip("_").upper()
     return f"GATECLERK_INGEST_TOKEN_{sanitized}" if sanitized else ""
@@ -320,7 +391,7 @@ def _project_sink(
     sink_type = (
         str(raw_sink.get("type", "")).strip() if isinstance(raw_sink.get("type"), str) else ""
     )
-    if sink_type not in ("https", "csv", "jsonl", ""):
+    if sink_type not in ("https", "csv", "jsonl", "mnotify", ""):
         dropped.append("sink.type")
         sink_type = ""
 
@@ -359,6 +430,30 @@ def _project_sink(
     enabled_raw = raw_sink.get("enabled", True)
     enabled = enabled_raw if isinstance(enabled_raw, bool) else True
 
+    # The four remaining `SinkSpec` fields: the alert route (`to`, `timeout_s`), the
+    # roster opt-out (`accepts_roster`) and the extra request headers. Every one of them
+    # was previously reported as an unknown key, which hid the site's alert route.
+    to, d_to = _safe_recipient(raw_sink.get("to"))
+    dropped.extend(d_to)
+
+    timeout_raw = raw_sink.get("timeout_s")
+    timeout_ok = (
+        isinstance(timeout_raw, (int, float))
+        and not isinstance(timeout_raw, bool)
+        and timeout_raw > 0
+    )
+    timeout_s = timeout_raw if timeout_ok else None
+    if timeout_raw is not None and not timeout_ok:
+        dropped.append("sink.timeout_s")
+
+    accepts_raw = raw_sink.get("accepts_roster", True)
+    accepts_roster = accepts_raw if isinstance(accepts_raw, bool) else True
+    if not isinstance(accepts_raw, bool):
+        dropped.append("sink.accepts_roster")
+
+    headers, d_headers = _safe_headers(raw_sink.get("headers"))
+    dropped.extend(d_headers)
+
     return (
         {
             "name": name,
@@ -369,6 +464,10 @@ def _project_sink(
             "token_env": token_env,
             "token_keychain": token_kc,
             "enabled": enabled,
+            "to": to,
+            "timeout_s": timeout_s,
+            "headers": headers,
+            "accepts_roster": accepts_roster,
         },
         dropped,
     )
@@ -1040,6 +1139,250 @@ def export_scans_stream(
                 f"cannot write scan export file {out_file}: {exc.strerror or exc}"
             ) from exc
         return total, f"wrote {total} scan row(s) to {out_file}"
+
+    target_stream = sys.stdout if dest_stream is None else dest_stream
+    total = _stream_into(target_stream)
+    return total, ""
+
+
+# --- `gateclerk export non-punches` (GC-P20 / E22) -------------------------------------------
+
+#: The whole column set of the non-punch report — one name, and that is the design.
+#:
+#: `fingerprint_hash` is the key BC dedupes on (`model.fingerprint_key_hash`: the
+#: `(employee_no, event_time_local, minor)` guard), so it is emitted VERBATIM; a second hash
+#: would join to nothing on the other side. Every other column `events` has stays behind:
+#: `employee_no`, `name` and `raw` are punch data BC already holds, and a diagnostics file
+#: carrying them is a second, un-governed copy of them (R1: BC remains the store — this report
+#: is a repair input for BC-P30, not a second record).
+NON_PUNCH_EXPORT_COLUMNS: tuple[str, ...] = ("fingerprint",)
+
+#: Ledger ids staged per `executemany`. The ledger is append-only and gains a line per pushed
+#: event (GC-P16a), so a year of backlog is a year of ids: the insert cannot assume they all
+#: fit in one statement.
+_PUSHED_ID_CHUNK_ROWS = 1000
+
+#: One `?` per non-auth verify mode — the modes themselves travel as bound parameters and are
+#: typed exactly once, in `event_codes` (the same shape `agent_cli._PUNCH_CANDIDATE_SQL` uses).
+_NON_PUNCH_MODE_MARKS = ", ".join("?" for _ in sorted(NON_AUTH_VERIFY_MODES))
+
+#: GC-P01's punch rule read from the other side (E22): a scan that reached BC and was NOT a
+#: granted authentication pass is what BC-P30 has to mark ignored.
+#:
+#: `COALESCE(<arms>, 0) = 0` rather than the plain `NOT (...)`, and the difference is
+#: three-valued logic: with a bare NOT, a row whose `major`, `outcome` or `unknown_code` is
+#: NULL makes the arm UNKNOWN, `NOT UNKNOWN` is UNKNOWN, and the row silently disappears from
+#: the one report whose job is to name everything BC was handed. NULL in any punch arm means
+#: "not provably a punch", which is a non-punch and belongs on the list — and it is also
+#: exactly what the queue does with that row, since `_PUNCH_CANDIDATE_SQL` needs the arms TRUE
+#: to queue it. Report and queue therefore stay complementary for EVERY row, NULLs included.
+#: Pinned from both sides by
+#: `tests/test_gc_p20_non_punch_report.py::test_report_is_the_complement_of_the_queue_rule`.
+#:
+#: Not an injection surface: the only interpolated text is `_NON_PUNCH_MODE_MARKS`, built once
+#: at import from the frozen `NON_AUTH_VERIFY_MODES`; no caller-supplied value reaches the
+#: query text (S608 reads the statement's text and cannot see that).
+_NON_PUNCH_FINGERPRINT_SQL = f"""
+SELECT DISTINCT fingerprint_hash
+  FROM events
+ WHERE id IN (SELECT event_id FROM temp.pushed_events)
+   AND COALESCE(
+         major = 5 AND outcome = 'granted' AND unknown_code = 0
+     AND employee_no IS NOT NULL AND employee_no <> ''
+     AND verify_mode IS NOT NULL
+     AND lower(trim(verify_mode)) NOT IN ({_NON_PUNCH_MODE_MARKS})
+   , 0) = 0
+ ORDER BY fingerprint_hash
+"""  # noqa: S608 - static query text; the only interpolation is the import-time placeholder list
+
+
+def _open_read_only_store(db_path: Path | str) -> sqlite3.Connection:
+    """The store, opened so that writing it is impossible rather than merely unintended.
+
+    `mode=ro` rather than `PRAGMA query_only`, measured on this fleet's SQLite 3.50:
+    `query_only` refuses TEMP tables too, and the ledger ids have to land in a TEMP table for
+    the report to stay one streaming SELECT (the same trick `PushLedger.apply_exclusion` uses,
+    for the same reason). A read-only URI keeps both halves: `UPDATE`/`DELETE` against the
+    store raise `OperationalError`, `CREATE TEMP TABLE` / `INSERT` succeed — the temp database
+    is not the store. And the store FILE is provably untouched: mtime, size and checksum all
+    unmoved (`test_report_reads_the_store_without_writing`).
+
+    What is NOT claimed: a WAL-mode store still grows its `-wal`/`-shm` sidecars while any
+    reader is open, and a read-only one leaves them behind at close (measured: a 0-byte `-wal`
+    and a 32 KiB `-shm`, neither carrying a committed byte of the store). A read-write reader
+    would checkpoint them away and rewrite the store file in the process — which is precisely
+    the incidental write this guard exists to refuse.
+
+    The URI comes from `Path.as_uri()`, which percent-encodes `#`, `?`, `%` and spaces.
+    Hand-concatenating the path would let one of those characters retarget the open silently
+    (to another file, or to none) instead of failing loudly.
+    """
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _create_pushed_events_table(conn: sqlite3.Connection) -> None:
+    """Empty TEMP holder for the ledger ids. It dies with this connection and never touches disk."""
+    conn.execute("DROP TABLE IF EXISTS temp.pushed_events")
+    conn.execute("CREATE TABLE temp.pushed_events (event_id INTEGER NOT NULL PRIMARY KEY)")
+
+
+def _insert_pushed_event_ids_one_at_a_time(
+    conn: sqlite3.Connection, chunk: Sequence[tuple[int, ...]]
+) -> None:
+    """The bounded fallback: one INSERT per row, inside one transaction.
+
+    A transaction that writes only TEMP tables is legal on a read-only store connection
+    (measured: BEGIN/COMMIT both succeed), and it keeps a 100-row chunk from becoming 100
+    commits.
+    """
+    conn.execute("BEGIN")
+    try:
+        for row in chunk:
+            conn.execute("INSERT OR IGNORE INTO temp.pushed_events VALUES (?)", row)
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _insert_pushed_event_ids(conn: sqlite3.Connection, event_ids: Sequence[int]) -> None:
+    """Stage the ledger's ids into the TEMP table, in chunks, with a bounded fallback.
+
+    Chunked because the ledger is unbounded by design. The fallback is for the one failure
+    worth absorbing: a SQLite built with a small `SQLITE_MAX_VARIABLE_NUMBER` reporting the
+    parameter limit. Any other `OperationalError` — a locked or corrupt file — is re-raised,
+    because quietly switching to one-row-at-a-time would turn a real fault into a slow hang and
+    hide the reason from the operator.
+    """
+    rows: list[tuple[int, ...]] = [(int(event_id),) for event_id in event_ids]
+    for start in range(0, len(rows), _PUSHED_ID_CHUNK_ROWS):
+        chunk = rows[start : start + _PUSHED_ID_CHUNK_ROWS]
+        try:
+            conn.executemany("INSERT OR IGNORE INTO temp.pushed_events VALUES (?)", chunk)
+        except sqlite3.OperationalError as exc:
+            if "parameter" not in str(exc).lower():
+                raise
+            _insert_pushed_event_ids_one_at_a_time(conn, chunk)
+
+
+def _open_non_punch_cursor(conn: sqlite3.Connection, event_ids: Sequence[int]) -> sqlite3.Cursor:
+    """Seam: the one statement of the report, with the ledger ids staged first.
+
+    Separate for the same reason `_open_scan_cursor` is — a test can watch the real statement
+    rather than a paraphrase of it.
+    """
+    _create_pushed_events_table(conn)
+    _insert_pushed_event_ids(conn, event_ids)
+    return conn.execute(_NON_PUNCH_FINGERPRINT_SQL, tuple(sorted(NON_AUTH_VERIFY_MODES)))
+
+
+def export_non_punch_fingerprints(
+    *,
+    config_path: Path | str = cfg.DEFAULT_SITES_FILE,
+    site: str | None = None,
+    state_root: Path | str | None = None,
+    fmt: str = "csv",
+    output_path: Path | str | None = None,
+    dest_stream: TextIO | None = None,
+    is_tty: bool | None = None,
+) -> tuple[int, str]:
+    """Write DISTINCT fingerprints of pushed non-punch events; no PII columns.
+
+    Answers one operator question — "which scans did this poller already hand to BC that were
+    never granted punches?" — so BC-P30 can mark them ignored and recalculate. Everything
+    comes from the local store; nothing is written anywhere (`_open_read_only_store` makes that
+    structural, not a promise) and BC is never contacted: R1, BC remains the store.
+
+    Two inputs decide the answer, and only those two:
+
+    * the poller's own ledger (`PushLedger.sent_event_ids`, across every endpoint and sink,
+      `gone` counting as pushed) — an event the ledger does not name is not known to have left
+      the building, so it is not in the report. A missing ledger is therefore NOT "nothing was
+      a punch" and NOT an error: it is "(0, here is why nothing is known)", exit 0.
+    * the punch rule, negated (`_NON_PUNCH_FINGERPRINT_SQL`) — granted major-5 passes by a
+      named employee with a real verify mode are punches and stay out.
+
+    Streaming like `export scans` (`fetchmany` chunks, never `fetchall`). The TTY rule is the
+    same rule with a different reason: `export scans` refuses an interactive terminal because
+    scans are personal data; this report has none, and still refuses, because a repair input
+    meant for another system belongs in a file and this command never invents a path.
+    """
+    tty = _stdout_is_tty() if is_tty is None else is_tty
+    if output_path is None and tty:
+        raise ConfigError(
+            "stdout is a TTY: this report feeds BC-P30 — pass --output <path> (or -o <path>) "
+            "to write it to a file, or pipe stdout (never invents a file path)."
+        )
+
+    norm_fmt = fmt.strip().lower()
+    if norm_fmt == "json":
+        norm_fmt = "jsonl"
+    if norm_fmt not in EXPORT_FORMATS:
+        raise ConfigError(
+            f"unsupported export format {fmt!r} (expected one of: {', '.join(EXPORT_FORMATS)})"
+        )
+
+    # Local import: `agent_cli` pulls in the transport/poller stack, and this export needs two
+    # names from it — the ledger's file name and the one accessor that answers "already
+    # pushed?". Same precedent as agent_cli's own `make_console` import.
+    from gateclerk import agent_cli
+
+    _site, _site_tz, resolved_db = resolve_scan_store_path(
+        config_path=config_path, site=site, state_root=state_root
+    )
+    ledger_path = Path(resolved_db).parent / agent_cli.PUSH_LEDGER_FILE_NAME
+    if not ledger_path.is_file():
+        # Not a failure: a site that has never pushed simply has nothing to account for.
+        return (
+            0,
+            f"no {agent_cli.PUSH_LEDGER_FILE_NAME} at {ledger_path.parent}; "
+            "nothing is known to be pushed",
+        )
+    event_ids = sorted(agent_cli.PushLedger(ledger_path).sent_event_ids())
+
+    def _stream_into(writer_stream: TextIO) -> int:
+        count = 0
+        csv_writer = csv.writer(writer_stream, lineterminator="\n") if norm_fmt == "csv" else None
+        if csv_writer is not None:
+            csv_writer.writerow(NON_PUNCH_EXPORT_COLUMNS)
+        conn = _open_read_only_store(resolved_db)
+        try:
+            cursor = _open_non_punch_cursor(conn, event_ids)
+            for batch in _iter_scan_chunks(cursor):
+                if csv_writer is not None:
+                    for row in batch:
+                        csv_writer.writerow((row["fingerprint_hash"],))
+                        count += 1
+                else:
+                    lines = [
+                        json.dumps(
+                            {"fingerprint": row["fingerprint_hash"]},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        for row in batch
+                    ]
+                    writer_stream.write("\n".join(lines) + "\n")
+                    count += len(batch)
+                writer_stream.flush()
+        finally:
+            conn.close()
+        return count
+
+    if output_path is not None:
+        out_file = Path(output_path)
+        try:
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            with out_file.open("w", encoding="utf-8", newline="") as fh:
+                total = _stream_into(fh)
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot write non-punch report file {out_file}: {exc.strerror or exc}"
+            ) from exc
+        return total, f"wrote {total} fingerprint(s) to {out_file}"
 
     target_stream = sys.stdout if dest_stream is None else dest_stream
     total = _stream_into(target_stream)

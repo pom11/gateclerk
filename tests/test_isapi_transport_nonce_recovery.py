@@ -1,12 +1,12 @@
 """Nonce-retirement recovery in the 401 path (card t_a3521d8a).
 
-The live symptom (docs/OBSERVED.md "Digest nonce use-cap", owner run 2026-10-17): a
+The live symptom (docs/internal/OBSERVED.md "Digest nonce use-cap", owner run 2026-10-17): a
 long `--chunk 1h` backfill died with **401 and the CORRECT password** at the ~190th
 request, exit 3, device still unlocked. The mechanism was never captured on the wire, so
 these tests drive all three candidate 401 shapes through the real client over
 `FakeDevice` and pin what the transport does about each.
 
-The shape map (docs/FINDINGS-t_a3521d8a.md F1, established offline against the PRE-fix
+The shape map (docs/internal/FINDINGS-t_a3521d8a.md F1, established offline against the PRE-fix
 client; the two stale shapes are still pinned separately so that "we survive both
 spellings" is a tested claim and not an assumption):
 

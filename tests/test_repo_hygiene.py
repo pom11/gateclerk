@@ -1,6 +1,6 @@
 """Repo hygiene: nothing in the offline test surface may name a real device.
 
-The hard rule from docs/DESIGN.md is that fixtures and tests are synthetic — a recorded
+The hard rule from docs/internal/DESIGN.md is that fixtures and tests are synthetic — a recorded
 response shape is fine, a recorded *address or credential* is not. Enforced
 mechanically and generically, so this test never has to repeat a real address in order
 to ban it, and keeps catching the mistake after the first live smoke run.

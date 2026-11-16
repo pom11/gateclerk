@@ -8,7 +8,7 @@ stall, no terminal 401, tz_offset_mismatch warning-count 0, site_labeled_windows
 then sites B and C ONE AT A TIME, each gated on a read-only §5 probe card that first
 needs the operator's host + keychain item. Push target stays ABSTRACT: cards build
 against a local stub ingest + JSONL — never invent a real endpoint. Where this file and
-docs/OBSERVED.md disagree about device behaviour, OBSERVED.md wins (it was read off
+docs/internal/OBSERVED.md disagree about device behaviour, OBSERVED.md wins (it was read off
 the box). Every device-behaviour claim below cites OBSERVED.md or DESIGN.md — no
 invented device facts.
 
@@ -132,7 +132,10 @@ Two different failure channels — keep them separate:
   - clock skew over threshold → warning (DESIGN.md "Time handling": log, not
     auto-fix; `tz.compute_skew` + `SKEW_WARN_SECONDS` carry over).
   - checkpoint stall / oldest-seen serialNo rising → **critical**: the ring has
-    started rolling and punches are being lost (DESIGN.md open question 4).
+    started rolling and punches are being lost (DESIGN.md open question 4). One
+    exception, decided with GC-P16a's retention prune: a rise the agent accounted for
+    at the moment it deleted is its own housekeeping, not a loss — and only up to the
+    floor that delete left behind. Any other rise pages as it always did.
 
 #### Alert routing: journald or mnotify (one route)
 

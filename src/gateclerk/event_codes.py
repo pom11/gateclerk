@@ -10,7 +10,7 @@ Two authorities, deliberately separate (this is the whole design of the module):
 * **`gateclerk.capabilities` decides what is *queryable*.** The device's advertised
   `minorEvent/minorAlarm/minorOperation/...` sets mark a code `not_advertised`.
 * **The table here decides what a code *means*.** Names come from the vendor hex-named
-  tables cross-checked in docs/references/acs-event-codes.md §3, which the same brief
+  tables cross-checked in docs/internal/references/acs-event-codes.md §3, which the same brief
   shows disagreeing with a circulating "best-practices" table — that one labels minor 38
   "card authentication success" and it is wrong (38 = 0x26 fingerprint pass; the valid
   **card** pass is minor 1). So the table is curated, cited, and never extended by
@@ -29,7 +29,7 @@ tests/test_event_codes.py:
 
 * no row may exist without a `src`, and no row may carry a `src` the fixtures contradict;
 * every (major, minor) we name must appear in the generated tables of
-  docs/references/acs-event-codes.md §3.1 (the test reads that .md as a data file);
+  docs/internal/references/acs-event-codes.md §3.1 (the test reads that .md as a data file);
 * where our `outcome` differs from the outcome the doc records for the same code, the
   row must be listed in that doc's deviation table §3.2, with the reason.
 
@@ -99,7 +99,7 @@ class Outcome(StrEnum):
 
 
 #: The only major that carries authentication events on this firmware family
-#: (docs/references/acs-event-codes.md §3: major 5 = MAJOR_EVENT, "the T&A payload").
+#: (docs/internal/references/acs-event-codes.md §3: major 5 = MAJOR_EVENT, "the T&A payload").
 PUNCH_MAJOR = 5
 
 #: major -> vendor class name (references §3), kept for the human table + audit.
@@ -140,12 +140,12 @@ _D = Outcome.DENIED
 _I = Outcome.INFO
 
 #: Curated name table. Every row cites the catalog it came from in `src`; the codes and
-#: outcomes are reproduced verbatim in docs/references/acs-event-codes.md §3.1, which is
+#: outcomes are reproduced verbatim in docs/internal/references/acs-event-codes.md §3.1, which is
 #: what tests/test_event_codes.py checks this table against (a code that no catalog names
 #: is not given a plausible name — it stays `info + unknown_code`).
 #:
 #: Site-a advertises minors 1..28, 29..39, 49, 51, 75, 76, 80, 104, 105, 112..116, 142,
-#: 151..155, 193 (docs/OBSERVED.md), and has only ever emitted 75/21/22 — so renaming a
+#: 151..155, 193 (docs/internal/OBSERVED.md), and has only ever emitted 75/21/22 — so renaming a
 #: row never changes a recorded event, and the only rows whose outcome move changes punch
 #: eligibility are (5,34) and (5,105), both catalog-named passes the box has never sent.
 EVENT_CODE_TABLE: dict[tuple[int, int], CodeInfo] = {
@@ -185,7 +185,7 @@ EVENT_CODE_TABLE: dict[tuple[int, int], CodeInfo] = {
     # Passes. `1` is the valid CARD pass and `38` the FINGERPRINT pass: a circulating
     # "best-practices" table labels 38 as card success and 113 as fingerprint, which is
     # wrong against the vendor hex table (38 = 0x26, 113 = 0x71 blacklist) — see
-    # docs/references/acs-event-codes.md §3 "Note on a circulating error".
+    # docs/internal/references/acs-event-codes.md §3 "Note on a circulating error".
     (5, 1): _c(
         "CARD_PASS", _G, "nr+mmi:MINOR_LEGAL_CARD_PASS", "valid card, right OK — the CARD pass"
     ),

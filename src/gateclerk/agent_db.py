@@ -1,6 +1,6 @@
 """sqlite connection seam for the P2 site agent: pragmas + forward-only migrations.
 
-Card P2-02 (docs/P2-SITE-AGENT.md §1 seams 1-3, §2b, SIGNED OFF 2026-10-19). This is
+Card P2-02 (docs/internal/P2-SITE-AGENT.md §1 seams 1-3, §2b, SIGNED OFF 2026-10-19). This is
 the *connection* half of the store; the semantics (events UPSERT, completed-only
 checkpoint, watermark) live in `gateclerk.agent_store`. stdlib `sqlite3` only — the
 agent box gets one dependency fewer to rot, and the store is a handful of tables.
@@ -343,6 +343,52 @@ CREATE INDEX dead_letter_endpoint ON dead_letter (endpoint);
 CREATE INDEX dead_letter_sink ON dead_letter (sink_name);
 """
 
+# --- GC-P15 follow-up appends here (v8: the quiet-tick reset probe's audit trail) ----------
+#
+# `DeviceLoop._probe_newest_serial` answers one question on a quiet tick — "is the newest
+# serial the device still holds below our checkpoint, i.e. was the terminal swapped?" — and
+# until now threw the answer away. The only durable trace of a probe was
+# `agent_store.reset_checkpoint`, which runs ONLY when the probe CONFIRMED a reset, so an
+# operator reading the db could not tell "we never looked" from "we looked and the ring is
+# quiet", and `RESET_PROBE_INTERVAL_S` lived in `DeviceLoop.__init__` — one page per hour
+# became one page per restart.
+#
+# This table is that missing answer: what the probe ASKED (the window, as a UTC pair) and
+# what it COST (the AcsEvent POSTs it sent). It is written on every COMPLETED read, the
+# NO MATCH one included — the empty answer is the one `check_stall` needs (P2-05).
+#
+# Why a purpose-built table rather than columns on an existing one: there is no `probe`
+# table in this schema (`checkpoint`, `events`, `push_queue`, `dead_letter` are the whole
+# history), and `checkpoint` is one row per device whose `updated_at` means "the
+# checkpoint moved" — a read that changes nothing must never touch that row, because
+# P2-05's stall arm reads it as the age of the last accepted event.
+#
+# Why `kind` is IN the primary key: the device ring-floor read (`DeviceLoop
+# .probe_ring_floor`) is a different question with a different direction on the wire
+# (`tests/test_ring_floor_probe.py::_probe_conditions` separates the two by
+# `timeReverseOrder`), and the two must not vouch for each other. With `kind` in the key a
+# future ring-floor row can neither overwrite the reset probe's row nor satisfy its budget.
+_PROBE_AUDIT_V8 = """
+CREATE TABLE probe_audit (
+    device_serial TEXT NOT NULL,
+    -- Which question this row answers: 'reset' = the quiet-tick newest-first page
+    -- (agent_loop.RESET_PROBE_*). The vocabulary lives with the writer,
+    -- agent_store.PROBE_KINDS — a kind nobody reads would silently fork the budget.
+    kind TEXT NOT NULL,
+    -- The window the probe ASKED for, as UTC ISO written by agent_store._now_iso (the
+    -- one stamp format every clock column in this db uses). `window_to_utc` doubles as
+    -- the instant the probe ran: it is the loop's own `now` at the moment of the read,
+    -- which is what the hourly budget is measured from — a second "probed_at" column
+    -- would only be able to disagree with it.
+    window_from_utc TEXT NOT NULL,
+    window_to_utc TEXT NOT NULL,
+    -- AcsEvent POSTs the probe actually sent. NOT the rows it got back: "what did this
+    -- cost" is the question an operator reads this column to answer.
+    reads INTEGER NOT NULL DEFAULT 0 CHECK (reads >= 0),
+    PRIMARY KEY (device_serial, kind)
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -372,6 +418,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     # the current epoch and the firmware it was written under — the evidence pair the
     # loop compares before it allows a rewind (agent_store.reset_checkpoint).
     Migration(version=7, name="serial_epoch", sql=_SERIAL_EPOCH_V7),
+    # GC-P15 follow-up: the quiet-tick reset probe's audit trail (see _PROBE_AUDIT_V8).
+    # Additive: a fresh CREATE of an empty table, no copy, no rebuild, no existing row
+    # touched — the loop starts recording on its next probe.
+    Migration(version=8, name="probe_audit", sql=_PROBE_AUDIT_V8),
 )
 
 

@@ -14,7 +14,7 @@ spells it this way; superseded spellings keep working as hidden aliases.
 
 | verb     | means                                                   | command |
 |----------|---------------------------------------------------------|---------|
-| `list`   | enumerate records; no identifying argument               | `users list`, `agent deadletter list`, `sink list` |
+| `list`   | enumerate records; no identifying argument               | `users list`, `agent deadletter list`, `agent probe list`, `sink list` |
 | `get`    | read one named thing                                     | (see exception 1) |
 | `status` | report the condition of something that is running        | `status` |
 | `test`   | answer "does this resolve / work", with no side effect   | `creds test`, `sink test` |
@@ -47,11 +47,25 @@ shadow a command and a typo still exits 2.
 
 2. **A domain pipeline keeps its stage names, and a process command keeps its process
    verb.** `migrate probe|export|diff|apply|undo` are the five steps of
-   `docs/ENROLLMENT-MIGRATION.md` §7 *in order*, and `agent run` / `demo device serve` start
+   `docs/internal/ENROLLMENT-MIGRATION.md` §7 *in order*, and `agent run` / `demo device serve` start
    a long-lived process rather than reading or writing a record — neither is a generic CRUD
    verb, so neither is renamed to one. Calling `apply` "add" would cost the operator the §7
    numbering that the docs, the `apply --apply` review gate and the undo journal all refer
    to. The vocabulary governs generic verbs; it does not rename a domain's own nouns.
+   `migrate clean` (GC-P16c) is a sixth verb in that group and is deliberately not one of
+   the five stages — it is the retention step GC-14 asks for once a hardware swap has been
+   verified. It keeps a stage-shaped name rather than the generic `remove` because it takes
+   no object to remove: what it may touch (two directories under the private root, and
+   never `probes/`) is the whole safety property, and that is stated in the command, not in
+   a vocabulary word.
+   `agent deadletter replay` (GC-07 follow-up) is the same exception in a shorter form: it is
+   the third act of §2b's dead-letter triage — `list` finds a row, `replay` re-queues it,
+   `remove` gives up on it — and `replay` is §2b's own word for the act: that section says
+   "Replay = re-push existing rows; UPSERT makes it safe", and the function the command routes
+   to is `agent_push.replay_dead_letter`. It is deliberately NOT a row in the table above: it
+   creates no record, so it is not `add`, and the group already owns `remove`. Listing it there
+   would advertise a generic verb that `cli_conventions.VERBS` does not declare — the
+   disagreement this page's own header says makes the page the bug.
 
 `remove` is canonical over `delete` for a reason beyond taste: this connector must
 never grow a write surface, and that rule is enforced by a test that forbids the word
