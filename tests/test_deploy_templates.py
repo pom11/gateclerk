@@ -49,19 +49,14 @@ UNIT_TEMPLATE = DEPLOY / "gateclerk-agent@.service"
 PLIST_TEMPLATE = DEPLOY / "gateclerk-agent.plist"
 README = DEPLOY / "README.md"
 
-#: The whole surface this card owns. The first three are the systemd/launchd install;
-#: the container story (Dockerfile, compose, healthcheck, env example, doc) is the
-#: alternative install and is scanned by the same hygiene rules.
+#: The whole surface this card owns: the systemd/launchd install and the two templates an
+#: operator copies, all scanned by the same hygiene rules.
 OWNED_FILES = (
     UNIT_TEMPLATE,
     PLIST_TEMPLATE,
     README,
-    DEPLOY / "Dockerfile",
-    DEPLOY / "compose.yaml",
-    DEPLOY / "container_healthcheck.sh",
     DEPLOY / "gateclerk.env.example",
     DEPLOY / "mnotify.toml.example",
-    DEPLOY / "CONTAINER.md",
 )
 
 #: The device hosts used anywhere in the deploy surface must be documentation-range
@@ -224,11 +219,7 @@ def test_deploy_dir_holds_only_the_documented_artifacts() -> None:
     assert DEPLOY.is_dir(), "deploy/ must exist (this card owns it)"
     found = sorted(p.name for p in DEPLOY.iterdir() if p.is_file())
     assert found == [
-        "CONTAINER.md",
-        "Dockerfile",
         "README.md",
-        "compose.yaml",
-        "container_healthcheck.sh",
         "gateclerk-agent.plist",
         "gateclerk-agent@.service",
         "gateclerk.env.example",
@@ -604,36 +595,6 @@ def test_readme_points_at_the_command_the_unit_runs(readme: str) -> None:
     )
 
 
-# --- 5. container story: one default site, opt-in second, pinned notify build --------
-
-
-def test_compose_starts_only_site_a_by_default_and_gates_site_b() -> None:
-    """Production has one site: a bare `compose up -d` must not start site-b."""
-    text = deploy_text(DEPLOY / "compose.yaml")
-    site_a = text[text.index("  site-a:") : text.index("  # A second site")]
-    site_b = text[text.index("  site-b:") : text.index("\nvolumes:")]
-    assert "profiles:" not in site_a, "site-a must be in the default profile"
-    assert 'profiles: ["second-site"]' in site_b, (
-        "site-b must be opt-in; otherwise compose up starts a site nobody configured"
-    )
-
-
-def test_dockerfile_defaults_to_alerts_and_keeps_an_alertless_target() -> None:
-    text = deploy_text(DEPLOY / "Dockerfile")
-    pin = re.search(r"^ARG MICRO_NOTIFY_SHA=([0-9a-f]{40})$", text, re.MULTILINE)
-    assert pin, "micro-notify must be pinned by a full commit SHA build arg"
-    assert 'ARG GATECLERK_SITES="site-a site-b site-c"' in text, (
-        "every documented site's state dir must exist in the image so named volumes "
-        "inherit uid 10001 instead of Docker's root-owned mount point"
-    )
-    assert "FROM runtime AS alerts" in text, "the default (last) stage must include alerts"
-    alerts = text[text.index("FROM runtime AS alerts") :]
-    assert "COPY --from=mnotify-build /opt/mnotify /opt/mnotify" in alerts
-    assert "MICRO_NOTIFY_SECRETS=file" in alerts
-    assert "MICRO_NOTIFY_SECRETS_DIR=/run/secrets/mnotify" in alerts
-    assert "MICRO_NOTIFY_CONFIG=/etc/mnotify/config.toml" in alerts
-
-
 # --- 5. hygiene scan over the whole deploy surface (card rule: no real hosts/IPs) -------
 
 
@@ -684,12 +645,11 @@ def test_files_are_utf8_and_newline_terminated(path: Path) -> None:
     raw.decode("utf-8")  # a template with a stray byte is a broken unit file
 
 
-# --- 6. the operator files compose.yaml orders out of git --------------------------------
+# --- 6. the operator files that stay out of git --------------------------------
 
-#: The paths `deploy/compose.yaml`'s setup note tells the operator to create from a tracked
-#: template (or from nothing) and to keep out of git. `gateclerk.env` is the `env_file:` at
-#: compose.yaml:28 and carries the site tokens; `mnotify.toml` is bind-mounted read-only at
-#: compose.yaml:60,88 and carries the notify config; `sites.toml` names the device hosts.
+#: The paths an operator creates from a tracked template (or from nothing) and keeps out of
+#: git. `gateclerk.env` carries the site tokens; `mnotify.toml` carries the notify config;
+#: `sites.toml` names the device hosts.
 #: Each has a tracked counterpart that must stay committable — the two `*.example` templates
 #: and `examples/sites.toml`, the copies an operator `cp`s from.
 OPERATOR_PATHS = (
@@ -703,10 +663,8 @@ TEMPLATE_PATHS = (
     "examples/sites.toml",
 )
 
-#: The fourth path in that same compose.yaml sentence ("put the mnotify secret files in
-#: ./mnotify-secrets ... never committed"), and the most sensitive of the four:
-#: MICRO_NOTIFY_SECRETS=file reads one file per account out of this directory, which
-#: compose.yaml:61,89 bind-mounts read-only at /run/secrets/mnotify. Unlike the three above
+#: The fourth path, and the most sensitive of the four: MICRO_NOTIFY_SECRETS=file reads one
+#: file per account out of this directory. Unlike the three above
 #: it is not a copy of a template — there is no tracked counterpart to shadow — so it is not
 #: in `OPERATOR_PATHS`; it is measured on a tree that exists (see
 #: `_git_ignored_secrets_tree`) and joins the same set-equality assertion as its own path
@@ -716,8 +674,7 @@ TEMPLATE_PATHS = (
 SECRETS_DIR = "deploy/mnotify-secrets"
 
 #: A symlink of the same shape, which is what an operator reaches for when the secrets live
-#: outside the checkout: compose.yaml binds `./mnotify-secrets` read-only and does not care
-#: whether the source is a directory. Measured: a trailing-slash rule (`/deploy/mnotify-secrets*/`)
+#: outside the checkout. Measured: a trailing-slash rule (`/deploy/mnotify-secrets*/`)
 #: matches the directory, the directory-with-slash spelling and a file under it, but NOT this
 #: symlink — `git status` still lists it, and `git add -A` commits it as a mode-120000 blob.
 #: It is pinned here so the prefix form is not quietly "tidied" into a directory-only rule.
@@ -756,7 +713,7 @@ def _git_ignored_secrets_tree() -> set[str]:
     ever written into it.
 
     Four spellings go in, because a rule can answer one and not another: the directory as
-    compose.yaml names it, that path with a trailing slash, a file under it, and the symlink
+    the operator names it, that path with a trailing slash, a file under it, and the symlink
     form. The last one is what a trailing-slash rule silently misses (see `SECRETS_LINK`).
 
     Nothing here may touch a path that already exists. A developer checkout on the deploy
@@ -792,12 +749,10 @@ def _git_ignored_secrets_tree() -> set[str]:
 def test_operator_deploy_files_are_gitignored() -> None:
     """The filled-in files that carry the real tokens cannot be swept up by `git add -A`.
 
-    The Run block in `deploy/CONTAINER.md` tells an operator to `cp` the two templates to
-    their real names and fill them in, and to provision `deploy/mnotify-secrets/` with one
-    secret file per account. Before `.gitignore` named those paths, the only thing standing
-    between them and the public repo was a sentence in `deploy/compose.yaml` ("keep it mode
-    0600 and out of git" / "never committed") — an instruction, not a policy, and one
-    `git add -A` away from committing live tokens. The pin therefore checks git's own answer
+    An operator `cp`s the two templates to their real names and fills them in, and
+    provisions `deploy/mnotify-secrets/` with one secret file per account. Without
+    `.gitignore` naming those paths, each is one `git add -A` away from committing live
+    tokens. The pin therefore checks git's own answer
     for all four operator paths and all three templates in one assertion, because both
     directions break an operator: a dropped rule leaks tokens, a broadened one hides the
     template a fresh clone is supposed to copy.
