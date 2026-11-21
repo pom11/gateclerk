@@ -91,7 +91,7 @@ $ gateclerk doctor --config ~/gateclerk/sites.toml --state-root ~/gateclerk --si
 │ site-a   │ device      │ pass   │ 0         │ reachable (model=[REDACTED-MODEL] serial=[REDACTED-SERIAL]); clock skew -0.9s (within    │
 │          │             │        │           │ 120s)                                                                                     │
 │ site-a   │ sinks       │ pass   │ 0         │ legacy:https([REDACTED-INGEST-HOST]:443, TLSv1.3 cert verified)                          │
-│ site-a   │ db          │ warn   │ 0         │ no store yet at ~/gateclerk/gateclerk-site-a.sqlite3                           │
+│ site-a   │ db          │ warn   │ 0         │ no store yet at ~/gateclerk/gateclerk-site-a.sqlite3                                      │
 └──────────┴─────────────┴────────┴───────────┴───────────────────────────────────────────────────────────────────────────────────────────┘
 EXIT=0
 ```
